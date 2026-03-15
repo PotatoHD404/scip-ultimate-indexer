@@ -6,7 +6,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
-from typing import Iterable
+from typing import Callable, Iterable
 
 from .constants import MAX_AVG_LINE_LENGTH, MAX_CHUNK_CHARS, SUPPORTED_EXTENSIONS, get_language_from_extension
 from .models import ChunkRecord, EdgeRecord, FileRecord, SymbolRecord
@@ -265,6 +265,7 @@ def build_fallback_bundle(
     import_weight: float,
     max_chunk_lines: int,
     chunk_overlap: int,
+    progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> FallbackBundle:
     file_records: list[FileRecord] = []
     symbols: list[SymbolRecord] = []
@@ -273,10 +274,13 @@ def build_fallback_bundle(
     module_symbol_ids: dict[str, str] = {}
     file_payloads: dict[str, tuple[str, str]] = {}
 
-    for path in files:
+    pending_files = [
+        path for path in files
+        if path.relative_to(project_root).as_posix() not in covered_paths
+    ]
+
+    for index, path in enumerate(pending_files, start=1):
         relative_path = path.relative_to(project_root).as_posix()
-        if relative_path in covered_paths:
-            continue
         content = path.read_text(encoding="utf-8", errors="ignore")
         language = get_language_from_extension(path.suffix.lower())
         file_symbol_id = f"file::{relative_path}"
@@ -385,6 +389,8 @@ def build_fallback_bundle(
                     content_hash=sha256(chunk_content.encode("utf-8")).hexdigest(),
                 )
             )
+        if progress_callback is not None:
+            progress_callback(index, len(pending_files), relative_path)
 
     lookup: dict[str, list[str]] = defaultdict(list)
     for relative_path in module_symbol_ids:

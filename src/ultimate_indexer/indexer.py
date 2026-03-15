@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from hashlib import sha256
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 from .constants import MAX_FILE_BYTES, SPECIAL_FILES, get_language_from_extension, is_indexable_filename
 from .config import Settings
@@ -15,7 +15,7 @@ from .embeddings import (
 )
 from .fallback import build_fallback_bundle
 from .ignore_rules import create_ignore_matcher
-from .models import ChunkRecord, EdgeRecord, FileRecord, IndexSummary, SymbolRecord
+from .models import ChunkRecord, EdgeRecord, FileRecord, IndexProgress, IndexSummary, SymbolRecord
 from .pagerank import weighted_pagerank
 from .python_scip import emit_python_scip
 from .query import QueryEngine
@@ -24,6 +24,18 @@ from .scip_runner import run_scip_indexers
 from .socraticode import ingest_socraticode_artifacts
 from .storage import Storage
 from .visuals import write_query_visualization
+
+
+INDEX_STAGES = (
+    "discover",
+    "scip",
+    "artifacts",
+    "fallback",
+    "chunks",
+    "embed",
+    "store",
+    "pagerank",
+)
 
 
 def _discover_code_files(project_root: Path, extra_extensions: set[str]) -> list[Path]:
@@ -151,27 +163,87 @@ class UltimateIndexer:
             self._provider = HashEmbeddingProvider()
             return self._provider
 
-    def _embed_chunks(self, chunks: list[ChunkRecord]) -> list[ChunkRecord]:
+    def _emit_progress(
+        self,
+        callback: Callable[[IndexProgress], None] | None,
+        stage: str,
+        completed: int = 0,
+        total: int = 0,
+        unit: str = "items",
+        detail: str = "",
+    ) -> None:
+        if callback is None:
+            return
+        try:
+            stage_index = INDEX_STAGES.index(stage) + 1
+        except ValueError:
+            stage_index = len(INDEX_STAGES)
+        callback(
+            IndexProgress(
+                stage=stage,
+                stage_index=stage_index,
+                stage_total=len(INDEX_STAGES),
+                completed=completed,
+                total=total,
+                unit=unit,
+                detail=detail,
+            )
+        )
+
+    def _embed_chunks(
+        self,
+        chunks: list[ChunkRecord],
+        progress_callback: Callable[[IndexProgress], None] | None = None,
+    ) -> list[ChunkRecord]:
         provider = self._provider_instance()
         pending_indices: list[int] = []
         pending_texts: list[str] = []
+        cached_count = 0
         for index, chunk in enumerate(chunks):
             embedding_text = prepare_document_text(chunk.content, chunk.relative_path)
             cached = self.storage.get_or_create_embedding(provider.model_id, embedding_text)
             if cached is not None:
                 chunk.embedding = cached.astype("float32").tobytes()
                 chunk.embedding_dim = int(cached.shape[0])
+                cached_count += 1
                 continue
             pending_indices.append(index)
             pending_texts.append(embedding_text)
+        self._emit_progress(
+            progress_callback,
+            stage="embed",
+            completed=cached_count,
+            total=max(len(chunks), 1),
+            unit="chunks",
+            detail=f"Embedding chunks with {provider.model_id}",
+        )
         if pending_texts:
-            vectors = generate_embeddings(provider, pending_texts)
+            vectors = generate_embeddings(
+                provider,
+                pending_texts,
+                on_batch_complete=lambda processed, total: self._emit_progress(
+                    progress_callback,
+                    stage="embed",
+                    completed=cached_count + processed,
+                    total=max(len(chunks), 1),
+                    unit="chunks",
+                    detail=f"Embedding chunks with {provider.model_id}",
+                ),
+            )
             for list_index, vector in enumerate(vectors):
                 chunk = chunks[pending_indices[list_index]]
                 embedding_text = pending_texts[list_index]
                 self.storage.store_embedding(provider.model_id, embedding_text, vector)
                 chunk.embedding = vector.astype("float32").tobytes()
                 chunk.embedding_dim = int(vector.shape[0])
+        self._emit_progress(
+            progress_callback,
+            stage="embed",
+            completed=max(len(chunks), 1),
+            total=max(len(chunks), 1),
+            unit="chunks",
+            detail=f"Embedded {len(chunks)} chunks",
+        )
         return chunks
 
     def _global_ranks(self) -> None:
@@ -189,8 +261,22 @@ class UltimateIndexer:
         ranks = weighted_pagerank(nodes=symbol_ids, edges=edges, alpha=0.85)
         self.storage.set_global_ranks(self.project_id, ranks)
 
-    def index(self, scip_path: Path | None = None, force: bool = False) -> IndexSummary:
+    def index(
+        self,
+        scip_path: Path | None = None,
+        force: bool = False,
+        progress_callback: Callable[[IndexProgress], None] | None = None,
+    ) -> IndexSummary:
+        self._emit_progress(progress_callback, stage="discover", detail="Scanning project files")
         code_files = _discover_code_files(self.settings.project_root, self.settings.extra_extensions)
+        self._emit_progress(
+            progress_callback,
+            stage="discover",
+            completed=max(len(code_files), 1),
+            total=max(len(code_files), 1),
+            unit="files",
+            detail=f"Discovered {len(code_files)} indexable files",
+        )
         signature = _project_signature(
             code_files,
             self.settings.project_root,
@@ -202,6 +288,14 @@ class UltimateIndexer:
             self.settings.chunk_overlap,
         )
         if not force and self.storage.get_project_signature(self.project_id) == signature:
+            self._emit_progress(
+                progress_callback,
+                stage="pagerank",
+                completed=1,
+                total=1,
+                unit="status",
+                detail="Index is up to date; reusing cached data",
+            )
             top_count = len(self.storage.get_symbol_rows(self.project_id))
             return IndexSummary(
                 project_id=self.project_id,
@@ -218,6 +312,7 @@ class UltimateIndexer:
         parsed_edges: list[EdgeRecord] = []
         python_files = [path for path in code_files if get_language_from_extension(path.suffix.lower()) == "python"]
 
+        self._emit_progress(progress_callback, stage="scip", detail="Collecting SCIP data")
         if scip_path is not None:
             parsed = parse_scip_index(
                 project_id=self.project_id,
@@ -228,8 +323,27 @@ class UltimateIndexer:
             parsed_files.extend(parsed.files)
             parsed_symbols.extend(parsed.symbols)
             parsed_edges.extend(parsed.edges)
+            self._emit_progress(
+                progress_callback,
+                stage="scip",
+                completed=1,
+                total=1,
+                unit="indexes",
+                detail=f"Parsed SCIP index {scip_path.name}",
+            )
         else:
             scip_results = run_scip_indexers(self.settings.project_root, code_files, self.settings.cache_dir)
+            total_scip_steps = len(scip_results) + (1 if python_files else 0)
+            completed_scip_steps = 0
+            if total_scip_steps == 0:
+                self._emit_progress(
+                    progress_callback,
+                    stage="scip",
+                    completed=1,
+                    total=1,
+                    unit="indexes",
+                    detail="No external SCIP indexes were available",
+                )
             for result in scip_results:
                 parsed = parse_scip_index(
                     project_id=self.project_id,
@@ -240,6 +354,15 @@ class UltimateIndexer:
                 parsed_files.extend(parsed.files)
                 parsed_symbols.extend(parsed.symbols)
                 parsed_edges.extend(parsed.edges)
+                completed_scip_steps += 1
+                self._emit_progress(
+                    progress_callback,
+                    stage="scip",
+                    completed=completed_scip_steps,
+                    total=total_scip_steps,
+                    unit="indexes",
+                    detail=f"Parsed {result.language} SCIP index",
+                )
             if python_files:
                 parsed_paths = {record.relative_path for record in parsed_files}
                 python_only = [path for path in python_files if path.relative_to(self.settings.project_root).as_posix() not in parsed_paths]
@@ -254,12 +377,41 @@ class UltimateIndexer:
                     parsed_files.extend(parsed.files)
                     parsed_symbols.extend(parsed.symbols)
                     parsed_edges.extend(parsed.edges)
+                    completed_scip_steps += 1
+                    self._emit_progress(
+                        progress_callback,
+                        stage="scip",
+                        completed=completed_scip_steps,
+                        total=total_scip_steps,
+                        unit="indexes",
+                        detail=f"Built Python SCIP for {len(python_only)} files",
+                    )
+                elif total_scip_steps > 0:
+                    completed_scip_steps += 1
+                    self._emit_progress(
+                        progress_callback,
+                        stage="scip",
+                        completed=completed_scip_steps,
+                        total=total_scip_steps,
+                        unit="indexes",
+                        detail="Python files were already covered by external SCIP",
+                    )
 
         parsed = ParsedScip(files=parsed_files, symbols=parsed_symbols, edges=parsed_edges)
 
+        self._emit_progress(progress_callback, stage="artifacts", detail="Loading SocratiCode artifacts")
         artifact_bundle = ingest_socraticode_artifacts(self.project_id, self.settings.project_root)
+        self._emit_progress(
+            progress_callback,
+            stage="artifacts",
+            completed=max(len(artifact_bundle.files), 1),
+            total=max(len(artifact_bundle.files), 1),
+            unit="artifacts",
+            detail=f"Ingested {len(artifact_bundle.files)} artifact files",
+        )
         covered_paths = {record.relative_path for record in parsed.files}
         covered_paths.update(record.relative_path for record in artifact_bundle.files)
+        self._emit_progress(progress_callback, stage="fallback", detail="Building fallback index coverage")
         fallback_bundle = build_fallback_bundle(
             project_id=self.project_id,
             project_root=self.settings.project_root,
@@ -269,7 +421,24 @@ class UltimateIndexer:
             import_weight=self.settings.edge_weights["imports"],
             max_chunk_lines=self.settings.max_chunk_lines,
             chunk_overlap=self.settings.chunk_overlap,
+            progress_callback=lambda completed, total, relative_path: self._emit_progress(
+                progress_callback,
+                stage="fallback",
+                completed=completed,
+                total=total,
+                unit="files",
+                detail=f"Processing fallback file {relative_path}",
+            ),
         )
+        if not fallback_bundle.files:
+            self._emit_progress(
+                progress_callback,
+                stage="fallback",
+                completed=1,
+                total=1,
+                unit="files",
+                detail="No fallback files needed",
+            )
         files: list[FileRecord] = [*parsed.files, *fallback_bundle.files, *artifact_bundle.files]
         symbols: list[SymbolRecord] = [*parsed.symbols, *fallback_bundle.symbols, *artifact_bundle.symbols]
         edges = [*parsed.edges, *fallback_bundle.edges, *artifact_bundle.edges]
@@ -279,6 +448,7 @@ class UltimateIndexer:
             symbols_by_file.setdefault(symbol.relative_path, []).append(symbol)
 
         chunks: list[ChunkRecord] = [*artifact_bundle.chunks, *fallback_bundle.chunks]
+        self._emit_progress(progress_callback, stage="chunks", detail="Assembling query chunks")
         for file_symbols in symbols_by_file.values():
             file_symbols.sort(key=lambda item: (item.start_line, item.display_name))
             if file_symbols and file_symbols[0].source_kind == "artifact":
@@ -317,10 +487,37 @@ class UltimateIndexer:
                     )
                 )
 
-        self._embed_chunks(chunks)
+        self._emit_progress(
+            progress_callback,
+            stage="chunks",
+            completed=max(len(chunks), 1),
+            total=max(len(chunks), 1),
+            unit="chunks",
+            detail=f"Prepared {len(chunks)} chunks",
+        )
+
+        self._embed_chunks(chunks, progress_callback=progress_callback)
+        self._emit_progress(progress_callback, stage="store", detail="Writing index to SQLite")
         self.storage.replace_project_contents(self.project_id, files, symbols, edges, chunks)
         self.storage.upsert_project(self.project_id, self.project_id, signature)
+        self._emit_progress(
+            progress_callback,
+            stage="store",
+            completed=1,
+            total=1,
+            unit="projects",
+            detail="Stored indexed data",
+        )
+        self._emit_progress(progress_callback, stage="pagerank", detail="Computing global ranks")
         self._global_ranks()
+        self._emit_progress(
+            progress_callback,
+            stage="pagerank",
+            completed=1,
+            total=1,
+            unit="projects",
+            detail="Finished indexing",
+        )
         return IndexSummary(
             project_id=self.project_id,
             indexed_files=len(files),

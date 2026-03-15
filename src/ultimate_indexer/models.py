@@ -105,3 +105,14 @@ class IndexSummary:
     indexed_chunks: int
     reused_files: int
     artifact_files: int
+
+
+@dataclass(slots=True)
+class IndexProgress:
+    stage: str
+    stage_index: int
+    stage_total: int
+    completed: int = 0
+    total: int = 0
+    unit: str = "items"
+    detail: str = ""

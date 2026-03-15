@@ -4,6 +4,7 @@ from pathlib import Path
 
 from ultimate_indexer.formatter import format_groups, format_top_symbols
 from ultimate_indexer.indexer import UltimateIndexer
+from ultimate_indexer.models import IndexProgress
 
 
 def test_index_query_and_cache(fixture_project: Path, monkeypatch) -> None:
@@ -55,5 +56,18 @@ def test_socraticode_artifact_query(fixture_project: Path, monkeypatch) -> None:
         rendered = format_groups(indexer.storage, indexer.project_id, groups)
         assert "// docs/schema.md" in rendered
         assert "database-schema" in rendered or "Database and architecture context" in rendered
+    finally:
+        indexer.close()
+
+
+def test_index_reports_progress(fixture_project: Path, monkeypatch) -> None:
+    monkeypatch.setenv("ULTIMATE_INDEXER_EMBEDDING_BACKEND", "hash")
+    events: list[IndexProgress] = []
+    indexer = UltimateIndexer(fixture_project)
+    try:
+        indexer.index(progress_callback=events.append)
+        assert any(event.stage == "discover" for event in events)
+        assert any(event.stage == "embed" and event.total > 0 for event in events)
+        assert events[-1].stage == "pagerank"
     finally:
         indexer.close()

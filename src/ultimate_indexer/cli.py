@@ -4,15 +4,69 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn, TimeElapsedColumn
 from rich.table import Table
 
 from .formatter import format_groups, format_top_symbols
 from .indexer import UltimateIndexer
 from .mcp_server import run_mcp
+from .models import IndexProgress
 
 
 app = typer.Typer(add_completion=False)
 console = Console()
+
+
+class _IndexProgressDisplay:
+    def __init__(self, *, enabled: bool) -> None:
+        self.enabled = enabled
+        self.progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[bold cyan]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TimeElapsedColumn(),
+            console=console,
+            transient=True,
+            disable=not enabled,
+        )
+        self._overall_task: int | None = None
+        self._detail_task: int | None = None
+
+    def __enter__(self) -> "_IndexProgressDisplay":
+        self.progress.start()
+        self._overall_task = self.progress.add_task("Indexing", total=1)
+        self._detail_task = self.progress.add_task("Preparing", total=None)
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.progress.stop()
+
+    def update(self, event: IndexProgress) -> None:
+        if self._overall_task is None or self._detail_task is None:
+            return
+        detail = event.detail or event.stage.replace("-", " ").title()
+        if event.total > 0:
+            stage_fraction = event.completed / event.total
+            detail_total: float | None = float(event.total)
+            detail_completed = min(float(event.completed), float(event.total))
+        else:
+            stage_fraction = 0.0
+            detail_total = None
+            detail_completed = 0.0
+        overall_completed = (event.stage_index - 1) + stage_fraction
+        self.progress.update(
+            self._overall_task,
+            total=float(event.stage_total),
+            completed=overall_completed,
+            description=f"Indexing ({event.stage_index}/{event.stage_total})",
+        )
+        self.progress.update(
+            self._detail_task,
+            total=detail_total,
+            completed=detail_completed,
+            description=detail,
+        )
 
 
 @app.command()
@@ -21,10 +75,16 @@ def index(
     force: bool = typer.Option(False, "--force"),
     scip_path: Path | None = typer.Option(None, "--scip-path"),
     embedding_backend: str = typer.Option("auto", "--embedding-backend"),
+    progress: bool = typer.Option(True, "--progress/--no-progress"),
 ) -> None:
     indexer = UltimateIndexer(project_path, embedding_backend=embedding_backend)
     try:
-        summary = indexer.index(scip_path=scip_path, force=force)
+        with _IndexProgressDisplay(enabled=progress and console.is_terminal) as display:
+            summary = indexer.index(
+                scip_path=scip_path,
+                force=force,
+                progress_callback=display.update if progress else None,
+            )
         table = Table(title="Index Summary")
         table.add_column("Files")
         table.add_column("Symbols")
