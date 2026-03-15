@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{ title }}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --panel: rgba(15, 23, 42, 0.82);
+      --border: rgba(255, 255, 255, 0.12);
+      --text: #f8fafc;
+      --muted: #94a3b8;
+      --accent: #818cf8;
+    }
+    body {
+      margin: 0;
+      font-family: 'Outfit', sans-serif;
+      background:
+        radial-gradient(at 0% 0%, rgba(99, 102, 241, 0.18), transparent 50%),
+        radial-gradient(at 100% 100%, rgba(14, 165, 233, 0.14), transparent 50%),
+        var(--bg);
+      color: var(--text);
+      overflow: hidden;
+    }
+    .header {
+      position: fixed;
+      top: 20px;
+      left: 20px;
+      right: 20px;
+      z-index: 10;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      backdrop-filter: blur(10px);
+      border-radius: 16px;
+      padding: 16px 20px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .title {
+      font-size: 1.1rem;
+      font-weight: 700;
+    }
+    .description {
+      font-size: 0.85rem;
+      color: var(--muted);
+      margin-top: 4px;
+    }
+    .stats {
+      color: var(--accent);
+      font-weight: 600;
+    }
+    #network {
+      width: 100vw;
+      height: 100vh;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div>
+      <div class="title">{{ title }}</div>
+      <div class="description">{{ description }}</div>
+    </div>
+    <div class="stats">Nodes: {{ node_count }} | Edges: {{ edge_count }}</div>
+  </div>
+  <div id="network"></div>
+  <script>
+    const nodes = new vis.DataSet({{ nodes_json | safe }});
+    const edges = new vis.DataSet({{ edges_json | safe }});
+    const container = document.getElementById("network");
+    new vis.Network(container, { nodes, edges }, {
+      nodes: {
+        shape: "dot",
+        size: 18,
+        borderWidth: 2,
+        font: { color: "#f8fafc", size: 12, face: "JetBrains Mono" }
+      },
+      edges: {
+        arrows: "to",
+        smooth: { type: "dynamic" },
+        color: { color: "#64748b", highlight: "#818cf8" },
+        font: { color: "#cbd5e1", size: 10 }
+      },
+      physics: {
+        solver: "forceAtlas2Based",
+        forceAtlas2Based: {
+          gravitationalConstant: -60,
+          centralGravity: 0.01,
+          springLength: 160,
+          springConstant: 0.08
+        },
+        stabilization: { iterations: 160 }
+      }
+    });
+  </script>
+</body>
+</html>

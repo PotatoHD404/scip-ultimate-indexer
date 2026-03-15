@@ -1,0 +1,9 @@
+{
+  "artifacts": [
+    {
+      "name": "database-schema",
+      "path": "docs",
+      "description": "Database and architecture context for the sample project."
+    }
+  ]
+}
