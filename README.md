@@ -28,8 +28,16 @@ The runtime defaults to a `llama.cpp` embedding backend and the LM Studio GGUF b
 - base model: `nomic-ai/nomic-embed-code`
 - GGUF repo used by `llama.cpp`: `lmstudio-community/nomic-embed-code-GGUF`
 - default file: `nomic-embed-code-Q4_K_M.gguf`
+- on macOS, the default runtime offloads all layers to Metal with `n_gpu_layers=-1`
+- the default context is `n_ctx=0`, which lets `llama.cpp` use the model's full trained context instead of the old `512` fallback
 
 For CI and tests, set `ULTIMATE_INDEXER_EMBEDDING_BACKEND=hash` to use a deterministic local embedding backend with no model download.
+
+Useful debug envs:
+
+- `ULTIMATE_INDEXER_LLAMA_VERBOSE=true` to expose backend/device logs
+- `ULTIMATE_INDEXER_LLAMA_SUPPRESS_LOGS=false` to stop silencing `llama.cpp` stderr/stdout
+- `ULTIMATE_INDEXER_LLAMA_N_GPU_LAYERS`, `ULTIMATE_INDEXER_LLAMA_N_CTX`, `ULTIMATE_INDEXER_LLAMA_N_BATCH`, and `ULTIMATE_INDEXER_LLAMA_N_UBATCH` to override runtime settings
 
 ## SCIP support
 
@@ -63,6 +71,8 @@ The indexer combines:
 - optional `.socraticodeignore`
 - optional upward `.cgcignore`
 - `IGNORE_DIRS` for extra directory-name exclusions
+
+It does not try to infer "unused" files semantically. If a path is not covered by those ignore sources, it is still eligible for indexing.
 
 Use `EXTRA_EXTENSIONS=.tpl,.blade` to include project-specific plaintext extensions in discovery and fallback indexing.
 
