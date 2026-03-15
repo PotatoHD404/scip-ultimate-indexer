@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import sys
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Protocol, Sequence
@@ -29,6 +32,16 @@ def cosine_similarity(query_vector: np.ndarray, matrix: np.ndarray) -> np.ndarra
     matrix_norms = np.linalg.norm(matrix, axis=1)
     safe_norms = np.where(matrix_norms == 0, 1.0, matrix_norms)
     return (matrix @ query_vector) / (safe_norms * query_norm)
+
+
+def _backend_log_guard(suppress_logs: bool):
+    if not suppress_logs:
+        return nullcontext()
+    try:
+        from llama_cpp._utils import suppress_stdout_stderr
+    except Exception:
+        return nullcontext()
+    return suppress_stdout_stderr(disable=False)
 
 
 class EmbeddingProvider(Protocol):
@@ -94,22 +107,35 @@ class HashEmbeddingProvider:
 class LlamaCppEmbeddingProvider:
     model_path: Path
     model_id: str
+    n_ctx: int = 0
+    n_batch: int = 1024
+    n_ubatch: int = 1024
+    n_gpu_layers: int = field(
+        default_factory=lambda: -1 if sys.platform == "darwin" else 0
+    )
+    verbose: bool = False
+    suppress_backend_logs: bool = True
     _llama: object | None = field(init=False, repr=False, default=None)
 
     def _client(self):
         if self._llama is None:
             from llama_cpp import Llama
 
-            self._llama = Llama(
-                model_path=str(self.model_path),
-                embedding=True,
-                pooling_type=1,
-                verbose=False,
-            )
+            with _backend_log_guard(self.suppress_backend_logs):
+                self._llama = Llama(
+                    model_path=str(self.model_path),
+                    embedding=True,
+                    n_ctx=self.n_ctx,
+                    n_batch=self.n_batch,
+                    n_ubatch=self.n_ubatch,
+                    n_gpu_layers=self.n_gpu_layers,
+                    verbose=self.verbose,
+                )
         return self._llama
 
     def _embed_one(self, text: str) -> np.ndarray:
-        response = self._client().create_embedding(text)
+        with _backend_log_guard(self.suppress_backend_logs):
+            response = self._client().create_embedding(text)
         vector = response["data"][0]["embedding"]
         return np.asarray(vector, dtype=np.float32)
 
@@ -139,6 +165,17 @@ def resolve_llama_cpp_provider(
     return LlamaCppEmbeddingProvider(
         model_path=model_path,
         model_id=f"{repo_id}:{filename}",
+        n_ctx=int(os.getenv("ULTIMATE_INDEXER_LLAMA_N_CTX", "0")),
+        n_batch=int(os.getenv("ULTIMATE_INDEXER_LLAMA_N_BATCH", "1024")),
+        n_ubatch=int(os.getenv("ULTIMATE_INDEXER_LLAMA_N_UBATCH", "1024")),
+        n_gpu_layers=int(
+            os.getenv(
+                "ULTIMATE_INDEXER_LLAMA_N_GPU_LAYERS",
+                "-1"
+            )
+        ),
+        verbose=os.getenv("ULTIMATE_INDEXER_LLAMA_VERBOSE", "false").lower() == "true",
+        suppress_backend_logs=os.getenv("ULTIMATE_INDEXER_LLAMA_SUPPRESS_LOGS", "true").lower() != "false",
     )
 
 

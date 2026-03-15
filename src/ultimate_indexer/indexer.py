@@ -215,7 +215,7 @@ class UltimateIndexer:
             completed=cached_count,
             total=max(len(chunks), 1),
             unit="chunks",
-            detail=f"Embedding chunks with {provider.model_id}",
+            detail="Embedding chunks",
         )
         if pending_texts:
             vectors = generate_embeddings(
@@ -227,7 +227,7 @@ class UltimateIndexer:
                     completed=cached_count + processed,
                     total=max(len(chunks), 1),
                     unit="chunks",
-                    detail=f"Embedding chunks with {provider.model_id}",
+                    detail="Embedding chunks",
                 ),
             )
             for list_index, vector in enumerate(vectors):
@@ -242,7 +242,7 @@ class UltimateIndexer:
             completed=max(len(chunks), 1),
             total=max(len(chunks), 1),
             unit="chunks",
-            detail=f"Embedded {len(chunks)} chunks",
+            detail="Embedded chunks",
         )
         return chunks
 
@@ -275,7 +275,7 @@ class UltimateIndexer:
             completed=max(len(code_files), 1),
             total=max(len(code_files), 1),
             unit="files",
-            detail=f"Discovered {len(code_files)} indexable files",
+            detail="Discovered indexable files",
         )
         signature = _project_signature(
             code_files,
@@ -342,7 +342,7 @@ class UltimateIndexer:
                     completed=1,
                     total=1,
                     unit="indexes",
-                    detail="No external SCIP indexes were available",
+                    detail="No external SCIP indexes available",
                 )
             for result in scip_results:
                 parsed = parse_scip_index(
@@ -361,7 +361,7 @@ class UltimateIndexer:
                     completed=completed_scip_steps,
                     total=total_scip_steps,
                     unit="indexes",
-                    detail=f"Parsed {result.language} SCIP index",
+                    detail=f"Parsed {result.language} SCIP",
                 )
             if python_files:
                 parsed_paths = {record.relative_path for record in parsed_files}
@@ -384,7 +384,7 @@ class UltimateIndexer:
                         completed=completed_scip_steps,
                         total=total_scip_steps,
                         unit="indexes",
-                        detail=f"Built Python SCIP for {len(python_only)} files",
+                        detail="Built Python SCIP",
                     )
                 elif total_scip_steps > 0:
                     completed_scip_steps += 1
@@ -394,7 +394,7 @@ class UltimateIndexer:
                         completed=completed_scip_steps,
                         total=total_scip_steps,
                         unit="indexes",
-                        detail="Python files were already covered by external SCIP",
+                        detail="Python already covered by external SCIP",
                     )
 
         parsed = ParsedScip(files=parsed_files, symbols=parsed_symbols, edges=parsed_edges)
@@ -407,7 +407,7 @@ class UltimateIndexer:
             completed=max(len(artifact_bundle.files), 1),
             total=max(len(artifact_bundle.files), 1),
             unit="artifacts",
-            detail=f"Ingested {len(artifact_bundle.files)} artifact files",
+            detail="Loaded artifact files",
         )
         covered_paths = {record.relative_path for record in parsed.files}
         covered_paths.update(record.relative_path for record in artifact_bundle.files)
@@ -427,7 +427,7 @@ class UltimateIndexer:
                 completed=completed,
                 total=total,
                 unit="files",
-                detail=f"Processing fallback file {relative_path}",
+                detail=f"Fallback: {relative_path}",
             ),
         )
         if not fallback_bundle.files:
@@ -493,7 +493,7 @@ class UltimateIndexer:
             completed=max(len(chunks), 1),
             total=max(len(chunks), 1),
             unit="chunks",
-            detail=f"Prepared {len(chunks)} chunks",
+            detail="Prepared chunks",
         )
 
         self._embed_chunks(chunks, progress_callback=progress_callback)

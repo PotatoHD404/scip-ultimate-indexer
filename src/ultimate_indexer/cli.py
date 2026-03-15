@@ -30,42 +30,32 @@ class _IndexProgressDisplay:
             transient=True,
             disable=not enabled,
         )
-        self._overall_task: int | None = None
-        self._detail_task: int | None = None
+        self._task: int | None = None
 
     def __enter__(self) -> "_IndexProgressDisplay":
         self.progress.start()
-        self._overall_task = self.progress.add_task("Indexing", total=1)
-        self._detail_task = self.progress.add_task("Preparing", total=None)
+        self._task = self.progress.add_task("Indexing 0/0", total=1)
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.progress.stop()
 
     def update(self, event: IndexProgress) -> None:
-        if self._overall_task is None or self._detail_task is None:
+        if self._task is None:
             return
         detail = event.detail or event.stage.replace("-", " ").title()
         if event.total > 0:
+            detail = f"{detail} ({min(event.completed, event.total)}/{event.total} {event.unit})"
+        if event.total > 0:
             stage_fraction = event.completed / event.total
-            detail_total: float | None = float(event.total)
-            detail_completed = min(float(event.completed), float(event.total))
         else:
             stage_fraction = 0.0
-            detail_total = None
-            detail_completed = 0.0
         overall_completed = (event.stage_index - 1) + stage_fraction
         self.progress.update(
-            self._overall_task,
+            self._task,
             total=float(event.stage_total),
             completed=overall_completed,
-            description=f"Indexing ({event.stage_index}/{event.stage_total})",
-        )
-        self.progress.update(
-            self._detail_task,
-            total=detail_total,
-            completed=detail_completed,
-            description=detail,
+            description=f"Indexing {event.stage_index}/{event.stage_total}: {detail}",
         )
 
 
