@@ -85,6 +85,7 @@ def _with_retry(
 class HashEmbeddingProvider:
     dim: int = 256
     model_id: str = "hash-256"
+    supports_batching: bool = True
 
     def _embed_one(self, text: str) -> np.ndarray:
         digest = hashlib.sha256(text.encode("utf-8")).digest()
@@ -107,6 +108,7 @@ class HashEmbeddingProvider:
 class LlamaCppEmbeddingProvider:
     model_path: Path
     model_id: str
+    supports_batching: bool = False
     n_ctx: int = 0
     n_batch: int = 1024
     n_ubatch: int = 1024
@@ -166,8 +168,8 @@ def resolve_llama_cpp_provider(
         model_path=model_path,
         model_id=f"{repo_id}:{filename}",
         n_ctx=int(os.getenv("ULTIMATE_INDEXER_LLAMA_N_CTX", "0")),
-        n_batch=int(os.getenv("ULTIMATE_INDEXER_LLAMA_N_BATCH", "1024")),
-        n_ubatch=int(os.getenv("ULTIMATE_INDEXER_LLAMA_N_UBATCH", "1024")),
+        n_batch=int(os.getenv("ULTIMATE_INDEXER_LLAMA_N_BATCH", "64")),
+        n_ubatch=int(os.getenv("ULTIMATE_INDEXER_LLAMA_N_UBATCH", "64")),
         n_gpu_layers=int(
             os.getenv(
                 "ULTIMATE_INDEXER_LLAMA_N_GPU_LAYERS",
@@ -189,14 +191,15 @@ def generate_embeddings(
     if not texts:
         return []
     results: list[np.ndarray] = []
+    effective_batch_size = max(1, batch_size if getattr(provider, "supports_batching", True) else 1)
     batch_delay_ms = PROVIDER_BATCH_DELAY_MS.get(provider.model_id, 0)
-    for start in range(0, len(texts), batch_size):
+    for start in range(0, len(texts), effective_batch_size):
         if start > 0 and batch_delay_ms > 0:
             sleep_fn(batch_delay_ms / 1000.0)
-        batch = texts[start : start + batch_size]
+        batch = texts[start : start + effective_batch_size]
         embeddings = _with_retry(
             lambda: provider.embed(batch),
-            label=f"Embedding batch {(start // batch_size) + 1}",
+            label=f"Embedding batch {(start // effective_batch_size) + 1}",
             sleep_fn=sleep_fn,
         )
         assert isinstance(embeddings, list)

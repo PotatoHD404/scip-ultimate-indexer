@@ -33,7 +33,7 @@ def _language_command(language: str, binary: str, output_file: Path) -> list[str
     if language == "go":
         return [binary, "--output", out]
     if language == "rust":
-        return [binary, "index", "--output", out]
+        return [binary, "scip", ".", "--output", out]
     if language == "java":
         return [binary, "index", "--output", out]
     if language == "cpp":
@@ -65,18 +65,96 @@ class ScipRunResult:
     index_path: Path
 
 
-def run_scip_indexers(project_root: Path, files: list[Path], cache_dir: Path) -> list[ScipRunResult]:
+@dataclass(slots=True)
+class ScipRequirement:
+    language: str
+    binary_name: str
+    install_hint: str
+    files: tuple[str, ...]
+
+
+@dataclass(slots=True)
+class ScipRunFailure:
+    language: str
+    binary_name: str
+    install_hint: str
+    command: tuple[str, ...]
+    detail: str
+
+
+@dataclass(slots=True)
+class ScipRunReport:
+    results: list[ScipRunResult]
+    missing: list[ScipRequirement]
+    failed: list[ScipRunFailure]
+
+
+class StructuredIndexingRequiredError(RuntimeError):
+    def __init__(self, missing: list[ScipRequirement], failed: list[ScipRunFailure]) -> None:
+        self.missing = missing
+        self.failed = failed
+        super().__init__(self.render_message())
+
+    def render_message(self) -> str:
+        lines = [
+            "Structured parsing is available for detected languages, so fallback indexing was skipped.",
+        ]
+        for requirement in self.missing:
+            lines.append("")
+            lines.append(
+                f"{requirement.language}: `{requirement.binary_name}` is not installed."
+            )
+            lines.append(f"Install it with: {requirement.install_hint}")
+            if requirement.files:
+                lines.append(f"Detected files: {', '.join(requirement.files[:5])}")
+        for failure in self.failed:
+            lines.append("")
+            lines.append(
+                f"{failure.language}: `{failure.binary_name}` failed while building the SCIP index."
+            )
+            lines.append(f"Command: {' '.join(failure.command)}")
+            lines.append(f"Details: {failure.detail}")
+        lines.append("")
+        lines.append("Then rerun indexing, or pass a ready-made index with `--scip-path`.")
+        return "\n".join(lines)
+
+
+def _language_tooling(language: str, files: list[Path]) -> ScipRequirement | None:
+    binary_name = None
+    install_hint = "unknown"
+    for extension, (mapped_language, mapped_binary, hint) in SCIP_EXTENSION_MAP.items():
+        if _normalize_scip_language(mapped_language) != language:
+            continue
+        binary_name = mapped_binary
+        install_hint = hint
+        break
+    if binary_name is None:
+        return None
+    matching_files = tuple(
+        path.as_posix()
+        for path in files
+        if _normalize_scip_language(SCIP_EXTENSION_MAP.get(path.suffix.lower(), ("", "", ""))[0]) == language
+    )
+    return ScipRequirement(
+        language=language,
+        binary_name=binary_name,
+        install_hint=install_hint,
+        files=matching_files,
+    )
+
+
+def run_scip_indexers(project_root: Path, files: list[Path], cache_dir: Path) -> ScipRunReport:
     results: list[ScipRunResult] = []
-    for language in detect_scip_languages(files):
-        binary = None
-        install_hint = "unknown"
-        for _, (mapped_language, mapped_binary, hint) in SCIP_EXTENSION_MAP.items():
-            if _normalize_scip_language(mapped_language) == language:
-                binary = shutil.which(mapped_binary)
-                install_hint = hint
-                if binary:
-                    break
+    missing: list[ScipRequirement] = []
+    failed: list[ScipRunFailure] = []
+    detected_languages = detect_scip_languages(files)
+    for language in detected_languages:
+        requirement = _language_tooling(language, files)
+        if requirement is None:
+            continue
+        binary = shutil.which(requirement.binary_name)
         if binary is None:
+            missing.append(requirement)
             continue
 
         output_file = cache_dir / f"{language}.scip"
@@ -91,10 +169,28 @@ def run_scip_indexers(project_root: Path, files: list[Path], cache_dir: Path) ->
                 text=True,
                 timeout=300,
             )
-        except Exception:
+        except Exception as exc:
+            failed.append(
+                ScipRunFailure(
+                    language=language,
+                    binary_name=requirement.binary_name,
+                    install_hint=requirement.install_hint,
+                    command=tuple(command),
+                    detail=str(exc),
+                )
+            )
             continue
         if completed.returncode != 0 or not output_file.exists():
-            _ = install_hint
+            detail = completed.stderr.strip() or completed.stdout.strip() or "SCIP command did not produce an index."
+            failed.append(
+                ScipRunFailure(
+                    language=language,
+                    binary_name=requirement.binary_name,
+                    install_hint=requirement.install_hint,
+                    command=tuple(command),
+                    detail=detail,
+                )
+            )
             continue
         results.append(ScipRunResult(language=language, index_path=output_file))
-    return results
+    return ScipRunReport(results=results, missing=missing, failed=failed)

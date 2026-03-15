@@ -5,7 +5,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Callable, Iterable
 
-from .constants import MAX_FILE_BYTES, SPECIAL_FILES, get_language_from_extension, is_indexable_filename
+from .constants import MAX_FILE_BYTES, SPECIAL_FILES, is_indexable_filename
 from .config import Settings
 from .embeddings import (
     HashEmbeddingProvider,
@@ -17,10 +17,9 @@ from .fallback import build_fallback_bundle
 from .ignore_rules import create_ignore_matcher
 from .models import ChunkRecord, EdgeRecord, FileRecord, IndexProgress, IndexSummary, SymbolRecord
 from .pagerank import weighted_pagerank
-from .python_scip import emit_python_scip
 from .query import QueryEngine
 from .scip_parser import ParsedScip, parse_scip_index
-from .scip_runner import run_scip_indexers
+from .scip_runner import StructuredIndexingRequiredError, run_scip_indexers
 from .socraticode import ingest_socraticode_artifacts
 from .storage import Storage
 from .visuals import write_query_visualization
@@ -195,6 +194,14 @@ class UltimateIndexer:
         chunks: list[ChunkRecord],
         progress_callback: Callable[[IndexProgress], None] | None = None,
     ) -> list[ChunkRecord]:
+        self._emit_progress(
+            progress_callback,
+            stage="embed",
+            completed=0,
+            total=1,
+            unit="model",
+            detail="Loading embedding model",
+        )
         provider = self._provider_instance()
         pending_indices: list[int] = []
         pending_texts: list[str] = []
@@ -310,8 +317,6 @@ class UltimateIndexer:
         parsed_files: list[FileRecord] = []
         parsed_symbols: list[SymbolRecord] = []
         parsed_edges: list[EdgeRecord] = []
-        python_files = [path for path in code_files if get_language_from_extension(path.suffix.lower()) == "python"]
-
         self._emit_progress(progress_callback, stage="scip", detail="Collecting SCIP data")
         if scip_path is not None:
             parsed = parse_scip_index(
@@ -332,8 +337,11 @@ class UltimateIndexer:
                 detail=f"Parsed SCIP index {scip_path.name}",
             )
         else:
-            scip_results = run_scip_indexers(self.settings.project_root, code_files, self.settings.cache_dir)
-            total_scip_steps = len(scip_results) + (1 if python_files else 0)
+            scip_report = run_scip_indexers(self.settings.project_root, code_files, self.settings.cache_dir)
+            if scip_report.missing or scip_report.failed:
+                raise StructuredIndexingRequiredError(scip_report.missing, scip_report.failed)
+            scip_results = scip_report.results
+            total_scip_steps = len(scip_results)
             completed_scip_steps = 0
             if total_scip_steps == 0:
                 self._emit_progress(
@@ -363,40 +371,6 @@ class UltimateIndexer:
                     unit="indexes",
                     detail=f"Parsed {result.language} SCIP",
                 )
-            if python_files:
-                parsed_paths = {record.relative_path for record in parsed_files}
-                python_only = [path for path in python_files if path.relative_to(self.settings.project_root).as_posix() not in parsed_paths]
-                if python_only:
-                    python_scip_path = emit_python_scip(self.settings.project_root, python_only, self.settings.scip_cache_path)
-                    parsed = parse_scip_index(
-                        project_id=self.project_id,
-                        project_root=self.settings.project_root,
-                        index_path=python_scip_path,
-                        edge_weights=self.settings.edge_weights,
-                    )
-                    parsed_files.extend(parsed.files)
-                    parsed_symbols.extend(parsed.symbols)
-                    parsed_edges.extend(parsed.edges)
-                    completed_scip_steps += 1
-                    self._emit_progress(
-                        progress_callback,
-                        stage="scip",
-                        completed=completed_scip_steps,
-                        total=total_scip_steps,
-                        unit="indexes",
-                        detail="Built Python SCIP",
-                    )
-                elif total_scip_steps > 0:
-                    completed_scip_steps += 1
-                    self._emit_progress(
-                        progress_callback,
-                        stage="scip",
-                        completed=completed_scip_steps,
-                        total=total_scip_steps,
-                        unit="indexes",
-                        detail="Python already covered by external SCIP",
-                    )
-
         parsed = ParsedScip(files=parsed_files, symbols=parsed_symbols, edges=parsed_edges)
 
         self._emit_progress(progress_callback, stage="artifacts", detail="Loading SocratiCode artifacts")

@@ -46,7 +46,7 @@ The built-in SCIP runner supports the same external toolchain family that CodeGr
 - `scip-python` for Python
 - `scip-typescript` for TypeScript and JavaScript
 - `scip-go` for Go
-- `scip-rust` for Rust
+- `rust-analyzer` for Rust
 - `scip-java` for Java
 - `scip-clang` for C and C++
 

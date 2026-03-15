@@ -11,6 +11,7 @@ from .formatter import format_groups, format_top_symbols
 from .indexer import UltimateIndexer
 from .mcp_server import run_mcp
 from .models import IndexProgress
+from .scip_runner import StructuredIndexingRequiredError
 
 
 app = typer.Typer(add_completion=False)
@@ -56,6 +57,7 @@ class _IndexProgressDisplay:
             total=float(event.stage_total),
             completed=overall_completed,
             description=f"Indexing {event.stage_index}/{event.stage_total}: {detail}",
+            refresh=True,
         )
 
 
@@ -69,12 +71,16 @@ def index(
 ) -> None:
     indexer = UltimateIndexer(project_path, embedding_backend=embedding_backend)
     try:
-        with _IndexProgressDisplay(enabled=progress and console.is_terminal) as display:
-            summary = indexer.index(
-                scip_path=scip_path,
-                force=force,
-                progress_callback=display.update if progress else None,
-            )
+        try:
+            with _IndexProgressDisplay(enabled=progress and console.is_terminal) as display:
+                summary = indexer.index(
+                    scip_path=scip_path,
+                    force=force,
+                    progress_callback=display.update if progress else None,
+                )
+        except StructuredIndexingRequiredError as exc:
+            console.print(f"[red]{exc.render_message()}[/red]")
+            raise typer.Exit(code=1) from exc
         table = Table(title="Index Summary")
         table.add_column("Files")
         table.add_column("Symbols")

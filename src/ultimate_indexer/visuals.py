@@ -45,6 +45,33 @@ def generate_visualization_html(nodes: list[dict], edges: list[dict], title: str
     )
 
 
+def _qualified_label(symbol_rows: dict[str, dict], symbol_id: str) -> str:
+    row = symbol_rows.get(symbol_id)
+    if row is None:
+        return symbol_id
+    relative_path = str(row["relative_path"])
+    if str(row["kind"]) == "File":
+        return relative_path
+
+    parts: list[str] = []
+    current_id = symbol_id
+    seen: set[str] = set()
+    while current_id and current_id not in seen:
+        seen.add(current_id)
+        current = symbol_rows.get(current_id)
+        if current is None:
+            break
+        if str(current["kind"]) == "File":
+            break
+        display_name = str(current["display_name"]).strip()
+        if display_name:
+            parts.append(display_name)
+        parent_id = current["enclosing_symbol_id"]
+        current_id = str(parent_id) if parent_id else ""
+    qualified_name = ".".join(reversed(parts))
+    return f"{relative_path}::{qualified_name}" if qualified_name else relative_path
+
+
 def write_query_visualization(
     storage: Storage,
     project_id: str,
@@ -77,7 +104,7 @@ def write_query_visualization(
         nodes.append(
             {
                 "id": symbol_id,
-                "label": str(row["display_name"]),
+                "label": _qualified_label(symbol_rows, symbol_id),
                 "group": str(row["kind"]),
                 "title": f"{row['kind']}\\n{row['relative_path']}",
                 "color": color,

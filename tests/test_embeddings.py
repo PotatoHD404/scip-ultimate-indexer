@@ -57,3 +57,31 @@ def test_generate_embeddings_retries_once() -> None:
     assert provider.calls == 2
     assert sleeps == [0.5]
     assert len(vectors) == 2
+
+
+def test_generate_embeddings_non_batching_provider_updates_per_item() -> None:
+    class NonBatchingProvider:
+        model_id = "non-batching"
+        supports_batching = False
+
+        def __init__(self) -> None:
+            self.calls: list[list[str]] = []
+
+        def embed(self, texts):
+            self.calls.append(list(texts))
+            return [np.asarray([1.0, 2.0], dtype=np.float32) for _ in texts]
+
+        def embed_query(self, text: str):
+            return np.asarray([1.0, 2.0], dtype=np.float32)
+
+    provider = NonBatchingProvider()
+    progress: list[tuple[int, int]] = []
+    vectors = generate_embeddings(
+        provider,
+        ["a", "b", "c"],
+        on_batch_complete=lambda processed, total: progress.append((processed, total)),
+    )
+
+    assert len(vectors) == 3
+    assert provider.calls == [["a"], ["b"], ["c"]]
+    assert progress == [(1, 3), (2, 3), (3, 3)]

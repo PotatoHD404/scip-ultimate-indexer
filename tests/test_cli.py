@@ -5,6 +5,7 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from ultimate_indexer.cli import app
+from ultimate_indexer.python_scip import emit_python_scip
 
 
 runner = CliRunner()
@@ -12,10 +13,14 @@ runner = CliRunner()
 
 def test_cli_end_to_end(fixture_project: Path, monkeypatch) -> None:
     monkeypatch.setenv("ULTIMATE_INDEXER_EMBEDDING_BACKEND", "hash")
+    python_files = sorted(fixture_project.rglob("*.py"))
+    scip_path = fixture_project / ".ultimate_indexer" / "cache" / "fixture.scip"
+    scip_path.parent.mkdir(parents=True, exist_ok=True)
+    emit_python_scip(fixture_project, python_files, scip_path)
 
     index_result = runner.invoke(
         app,
-        ["index", str(fixture_project), "--embedding-backend", "hash"],
+        ["index", str(fixture_project), "--embedding-backend", "hash", "--scip-path", str(scip_path)],
     )
     assert index_result.exit_code == 0, index_result.stdout
     assert "Index Summary" in index_result.stdout
