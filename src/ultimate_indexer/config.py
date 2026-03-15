@@ -30,6 +30,12 @@ class Settings:
     model_repo_id: str = field(
         default_factory=lambda: os.getenv(
             "ULTIMATE_INDEXER_MODEL_REPO_ID",
+            "nomic-ai/CodeRankEmbed",
+        )
+    )
+    llama_model_repo_id: str = field(
+        default_factory=lambda: os.getenv(
+            "ULTIMATE_INDEXER_LLAMA_MODEL_REPO_ID",
             "lmstudio-community/nomic-embed-code-GGUF",
         )
     )

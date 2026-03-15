@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import sys
 import time
 from contextlib import nullcontext
@@ -17,6 +18,7 @@ BATCH_SIZE = 32
 PROVIDER_BATCH_DELAY_MS = {
     "hash-256": 0,
 }
+CODERANK_QUERY_PREFIX = "Represent this query for searching relevant code: "
 
 
 def hash_text(text: str) -> str:
@@ -58,6 +60,13 @@ def prepare_document_text(content: str, file_path: str) -> str:
     return f"search_document: {file_path}\n{content}"
 
 
+def _provider_prepare_document_text(provider: EmbeddingProvider, content: str, file_path: str) -> str:
+    formatter = getattr(provider, "prepare_document_text", None)
+    if callable(formatter):
+        return str(formatter(content, file_path))
+    return prepare_document_text(content, file_path)
+
+
 def _with_retry(
     operation: Callable[[], np.ndarray | list[np.ndarray] | str],
     label: str,
@@ -79,6 +88,25 @@ def _with_retry(
             sleep_fn(delay_ms / 1000.0)
     assert last_error is not None
     raise last_error
+
+
+def _remote_dependency_install_hint(model_name: str, exc: ImportError) -> str | None:
+    message = str(exc)
+    packages: list[str] = []
+    quoted_module = re.search(r"No module named ['\"]([^'\"]+)['\"]", message)
+    if quoted_module:
+        packages = [quoted_module.group(1)]
+    else:
+        match = re.search(r"packages that were not found in your environment: ([^.]+)\.", message)
+        if match:
+            packages = [item.strip() for item in match.group(1).split(",") if item.strip()]
+    if not packages:
+        return None
+    package_list = " ".join(packages)
+    return (
+        f"`{model_name}` requires additional packages: {', '.join(packages)}. "
+        f"Install them with `poetry add {package_list}` or `pip install {package_list}`."
+    )
 
 
 @dataclass(slots=True)
@@ -148,6 +176,74 @@ class LlamaCppEmbeddingProvider:
         return self._embed_one(f"search_query: {text}")
 
 
+@dataclass(slots=True)
+class SentenceTransformerEmbeddingProvider:
+    model_name: str
+    cache_dir: Path
+    model_id: str
+    device: str
+    batch_size: int = 64
+    use_fp16: bool = False
+    normalize_embeddings: bool = True
+    supports_batching: bool = True
+    _model: object | None = field(init=False, repr=False, default=None)
+
+    def prepare_document_text(self, content: str, file_path: str) -> str:
+        return f"{file_path}\n{content}"
+
+    def prepare_query_text(self, text: str) -> str:
+        return f"{CODERANK_QUERY_PREFIX}{text}"
+
+    def _client(self):
+        if self._model is None:
+            if self.device == "mps":
+                os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+            try:
+                import torch
+                from sentence_transformers import SentenceTransformer
+
+                if hasattr(torch, "set_float32_matmul_precision"):
+                    torch.set_float32_matmul_precision("high")
+                self._model = SentenceTransformer(
+                    self.model_name,
+                    cache_folder=str(self.cache_dir),
+                    trust_remote_code=True,
+                    device=self.device,
+                )
+                if self.use_fp16:
+                    try:
+                        self._model.half()
+                    except Exception:
+                        pass
+            except ImportError as exc:
+                hint = _remote_dependency_install_hint(self.model_name, exc)
+                if hint is None:
+                    raise
+                raise RuntimeError(hint) from exc
+        return self._model
+
+    def embed(self, texts: Sequence[str]) -> list[np.ndarray]:
+        if not texts:
+            return []
+        import torch
+
+        with torch.inference_mode():
+            encoded = self._client().encode(
+                list(texts),
+                batch_size=self.batch_size,
+                show_progress_bar=False,
+                convert_to_numpy=True,
+                normalize_embeddings=self.normalize_embeddings,
+            )
+        matrix = np.asarray(encoded, dtype=np.float32)
+        if matrix.ndim == 1:
+            return [matrix]
+        return [row for row in matrix]
+
+    def embed_query(self, text: str) -> np.ndarray:
+        return self.embed([self.prepare_query_text(text)])[0]
+
+
 def resolve_llama_cpp_provider(
     model_cache_dir: Path,
     repo_id: str,
@@ -178,6 +274,41 @@ def resolve_llama_cpp_provider(
         ),
         verbose=os.getenv("ULTIMATE_INDEXER_LLAMA_VERBOSE", "false").lower() == "true",
         suppress_backend_logs=os.getenv("ULTIMATE_INDEXER_LLAMA_SUPPRESS_LOGS", "true").lower() != "false",
+    )
+
+
+def _detect_sentence_transformer_device() -> str:
+    device_override = os.getenv("ULTIMATE_INDEXER_ST_DEVICE")
+    if device_override:
+        return device_override
+    import torch
+
+    if torch.cuda.is_available():
+        return "cuda"
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def resolve_sentence_transformer_provider(
+    model_cache_dir: Path,
+    model_name: str,
+) -> SentenceTransformerEmbeddingProvider:
+    device = _detect_sentence_transformer_device()
+    use_fp16_env = os.getenv("ULTIMATE_INDEXER_ST_USE_FP16")
+    use_fp16 = (
+        use_fp16_env.lower() == "true"
+        if use_fp16_env is not None
+        else device in {"cuda", "mps"}
+    )
+    return SentenceTransformerEmbeddingProvider(
+        model_name=model_name,
+        cache_dir=model_cache_dir,
+        model_id=model_name,
+        device=device,
+        batch_size=int(os.getenv("ULTIMATE_INDEXER_ST_BATCH_SIZE", "96")),
+        use_fp16=use_fp16,
+        normalize_embeddings=os.getenv("ULTIMATE_INDEXER_ST_NORMALIZE", "true").lower() != "false",
     )
 
 

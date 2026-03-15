@@ -10,8 +10,9 @@ from .config import Settings
 from .embeddings import (
     HashEmbeddingProvider,
     generate_embeddings,
-    prepare_document_text,
+    _provider_prepare_document_text,
     resolve_llama_cpp_provider,
+    resolve_sentence_transformer_provider,
 )
 from .fallback import build_fallback_bundle
 from .ignore_rules import create_ignore_matcher
@@ -73,6 +74,7 @@ def _project_signature(
     project_root: Path,
     embedding_backend: str,
     model_repo_id: str,
+    llama_model_repo_id: str,
     model_filename: str,
     extra_extensions: set[str],
     max_chunk_lines: int,
@@ -84,6 +86,7 @@ def _project_signature(
         payload.append(f"{relative}:{path.stat().st_mtime_ns}:{path.stat().st_size}")
     payload.append(f"embedding-backend:{embedding_backend}")
     payload.append(f"model-repo:{model_repo_id}")
+    payload.append(f"llama-model-repo:{llama_model_repo_id}")
     payload.append(f"model-file:{model_filename}")
     payload.append(f"extra-extensions:{','.join(sorted(extra_extensions))}")
     payload.append(f"respect-gitignore:{os.getenv('RESPECT_GITIGNORE', 'true')}")
@@ -159,17 +162,31 @@ class UltimateIndexer:
             self._provider = HashEmbeddingProvider()
             return self._provider
         try:
-            self._provider = resolve_llama_cpp_provider(
-                model_cache_dir=self.settings.model_cache_dir,
-                repo_id=self.settings.model_repo_id,
-                filename=self.settings.model_filename,
-            )
+            if backend in {"auto", "sentence-transformers"}:
+                self._provider = resolve_sentence_transformer_provider(
+                    model_cache_dir=self.settings.model_cache_dir,
+                    model_name=self.settings.model_repo_id,
+                )
+            else:
+                self._provider = resolve_llama_cpp_provider(
+                    model_cache_dir=self.settings.model_cache_dir,
+                    repo_id=self.settings.llama_model_repo_id,
+                    filename=self.settings.model_filename,
+                )
             return self._provider
         except Exception:
-            if backend == "llama-cpp":
+            if backend in {"llama-cpp", "sentence-transformers"}:
                 raise
-            self._provider = HashEmbeddingProvider()
-            return self._provider
+            try:
+                self._provider = resolve_llama_cpp_provider(
+                    model_cache_dir=self.settings.model_cache_dir,
+                    repo_id=self.settings.llama_model_repo_id,
+                    filename=self.settings.model_filename,
+                )
+                return self._provider
+            except Exception:
+                self._provider = HashEmbeddingProvider()
+                return self._provider
 
     def _emit_progress(
         self,
@@ -216,7 +233,7 @@ class UltimateIndexer:
         pending_texts: list[str] = []
         cached_count = 0
         for index, chunk in enumerate(chunks):
-            embedding_text = prepare_document_text(chunk.content, chunk.relative_path)
+            embedding_text = _provider_prepare_document_text(provider, chunk.content, chunk.relative_path)
             cached = self.storage.get_or_create_embedding(provider.model_id, embedding_text)
             if cached is not None:
                 chunk.embedding = cached.astype("float32").tobytes()
@@ -299,6 +316,7 @@ class UltimateIndexer:
             self.settings.project_root,
             self.settings.embedding_backend,
             self.settings.model_repo_id,
+            self.settings.llama_model_repo_id,
             self.settings.model_filename,
             self.settings.extra_extensions,
             self.settings.max_chunk_lines,

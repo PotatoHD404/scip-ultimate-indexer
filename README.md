@@ -23,20 +23,24 @@ poetry run ultimate-indexer mcp
 
 ## Embeddings
 
-The runtime defaults to a `llama.cpp` embedding backend and the LM Studio GGUF build of the requested Nomic model:
+The runtime now defaults to `sentence-transformers` with [`nomic-ai/CodeRankEmbed`](https://huggingface.co/nomic-ai/CodeRankEmbed).
 
-- base model: `nomic-ai/nomic-embed-code`
-- GGUF repo used by `llama.cpp`: `lmstudio-community/nomic-embed-code-GGUF`
-- default file: `nomic-embed-code-Q4_K_M.gguf`
-- on macOS, the default runtime offloads all layers to Metal with `n_gpu_layers=-1`
-- the default context is `n_ctx=0`, which lets `llama.cpp` use the model's full trained context instead of the old `512` fallback
+- on Apple Silicon, `auto` prefers the PyTorch `mps` device so inference runs on the Metal GPU
+- the query side uses the model's required prefix: `Represent this query for searching relevant code:`
+- batching is enabled by default for faster indexing throughput
+- `llama.cpp` remains available as a fallback/backend override
 
 For CI and tests, set `ULTIMATE_INDEXER_EMBEDDING_BACKEND=hash` to use a deterministic local embedding backend with no model download.
 
 Useful debug envs:
 
+- `ULTIMATE_INDEXER_ST_DEVICE` to force `mps`, `cuda`, or `cpu`
+- `ULTIMATE_INDEXER_ST_BATCH_SIZE` to tune throughput
+- `ULTIMATE_INDEXER_ST_USE_FP16=true|false` to control half precision on GPU backends
+- `ULTIMATE_INDEXER_ST_NORMALIZE=false` to disable normalized embeddings
 - `ULTIMATE_INDEXER_LLAMA_VERBOSE=true` to expose backend/device logs
 - `ULTIMATE_INDEXER_LLAMA_SUPPRESS_LOGS=false` to stop silencing `llama.cpp` stderr/stdout
+- `ULTIMATE_INDEXER_LLAMA_MODEL_REPO_ID` to override the GGUF repo for the fallback `llama.cpp` backend
 - `ULTIMATE_INDEXER_LLAMA_N_GPU_LAYERS`, `ULTIMATE_INDEXER_LLAMA_N_CTX`, `ULTIMATE_INDEXER_LLAMA_N_BATCH`, and `ULTIMATE_INDEXER_LLAMA_N_UBATCH` to override runtime settings
 
 ## SCIP support
