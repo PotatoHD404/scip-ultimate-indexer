@@ -95,6 +95,10 @@ def index(
             str(summary.artifact_files),
         )
         console.print(table)
+        if summary.warnings:
+            console.print("[yellow]SCIP warnings; fallback coverage was used where needed:[/yellow]")
+            for warning in summary.warnings:
+                console.print(f"[yellow]- {warning}[/yellow]")
     finally:
         indexer.close()
 

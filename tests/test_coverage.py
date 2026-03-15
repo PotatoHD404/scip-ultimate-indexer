@@ -36,6 +36,7 @@ def test_unsupported_language_fallback_is_searchable(tmp_path: Path, monkeypatch
 
 def test_supported_language_without_scip_tool_exits(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("ULTIMATE_INDEXER_EMBEDDING_BACKEND", "hash")
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
     project = tmp_path / "project"
     project.mkdir()
     (project / "src").mkdir()

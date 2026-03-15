@@ -105,6 +105,7 @@ class IndexSummary:
     indexed_chunks: int
     reused_files: int
     artifact_files: int
+    warnings: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)

@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 
 from .constants import SCIP_EXTENSION_MAP, SCIP_RUN_ORDER
@@ -63,6 +64,7 @@ def detect_scip_languages(files: list[Path]) -> list[str]:
 class ScipRunResult:
     language: str
     index_path: Path
+    source_root: Path
 
 
 @dataclass(slots=True)
@@ -78,6 +80,7 @@ class ScipRunFailure:
     language: str
     binary_name: str
     install_hint: str
+    working_directory: str
     command: tuple[str, ...]
     detail: str
 
@@ -112,6 +115,7 @@ class StructuredIndexingRequiredError(RuntimeError):
             lines.append(
                 f"{failure.language}: `{failure.binary_name}` failed while building the SCIP index."
             )
+            lines.append(f"Working directory: {failure.working_directory}")
             lines.append(f"Command: {' '.join(failure.command)}")
             lines.append(f"Details: {failure.detail}")
         lines.append("")
@@ -143,11 +147,64 @@ def _language_tooling(language: str, files: list[Path]) -> ScipRequirement | Non
     )
 
 
+SCIP_PROJECT_MARKERS: dict[str, tuple[str, ...]] = {
+    "typescript": ("tsconfig.json", "jsconfig.json"),
+    "go": ("go.mod",),
+    "rust": ("Cargo.toml",),
+    "java": ("pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts"),
+}
+
+
+def _files_for_language(files: list[Path], language: str) -> list[Path]:
+    matched: list[Path] = []
+    for path in files:
+        mapping = SCIP_EXTENSION_MAP.get(path.suffix.lower())
+        if mapping is None:
+            continue
+        if _normalize_scip_language(mapping[0]) == language:
+            matched.append(path)
+    return matched
+
+
+def _nearest_project_root(path: Path, project_root: Path, markers: tuple[str, ...]) -> Path | None:
+    current = path.parent
+    resolved_root = project_root.resolve()
+    while True:
+        if any((current / marker).exists() for marker in markers):
+            return current
+        if current == resolved_root:
+            return None
+        parent = current.parent
+        if parent == current:
+            return None
+        current = parent
+
+
+def _group_invocation_roots(project_root: Path, language: str, files: list[Path]) -> list[Path]:
+    markers = SCIP_PROJECT_MARKERS.get(language)
+    if not markers:
+        return [project_root]
+
+    roots: set[Path] = set()
+    for path in _files_for_language(files, language):
+        root = _nearest_project_root(path.resolve(), project_root.resolve(), markers)
+        if root is not None:
+            roots.add(root)
+    return sorted(roots)
+
+
+def _output_file_for_root(cache_dir: Path, language: str, invocation_root: Path, project_root: Path) -> Path:
+    relative_root = invocation_root.resolve().relative_to(project_root.resolve()).as_posix()
+    suffix = "root" if relative_root == "." else sha256(relative_root.encode("utf-8")).hexdigest()[:12]
+    return cache_dir / f"{language}-{suffix}.scip"
+
+
 def run_scip_indexers(project_root: Path, files: list[Path], cache_dir: Path) -> ScipRunReport:
     results: list[ScipRunResult] = []
     missing: list[ScipRequirement] = []
     failed: list[ScipRunFailure] = []
     detected_languages = detect_scip_languages(files)
+    available_binaries: dict[str, tuple[ScipRequirement, str]] = {}
     for language in detected_languages:
         requirement = _language_tooling(language, files)
         if requirement is None:
@@ -156,41 +213,55 @@ def run_scip_indexers(project_root: Path, files: list[Path], cache_dir: Path) ->
         if binary is None:
             missing.append(requirement)
             continue
+        available_binaries[language] = (requirement, binary)
+    if missing:
+        return ScipRunReport(results=results, missing=missing, failed=failed)
 
-        output_file = cache_dir / f"{language}.scip"
-        command = _language_command(language, binary, output_file)
-        if command is None:
+    for language in detected_languages:
+        available = available_binaries.get(language)
+        if available is None:
             continue
-        try:
-            completed = subprocess.run(
-                command,
-                cwd=str(project_root),
-                capture_output=True,
-                text=True,
-                timeout=300,
-            )
-        except Exception as exc:
-            failed.append(
-                ScipRunFailure(
-                    language=language,
-                    binary_name=requirement.binary_name,
-                    install_hint=requirement.install_hint,
-                    command=tuple(command),
-                    detail=str(exc),
+        requirement, binary = available
+        invocation_roots = _group_invocation_roots(project_root, language, files)
+        if not invocation_roots:
+            continue
+        for invocation_root in invocation_roots:
+            output_file = _output_file_for_root(cache_dir, language, invocation_root, project_root)
+            command = _language_command(language, binary, output_file)
+            if command is None:
+                continue
+            try:
+                completed = subprocess.run(
+                    command,
+                    cwd=str(invocation_root),
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
                 )
-            )
-            continue
-        if completed.returncode != 0 or not output_file.exists():
-            detail = completed.stderr.strip() or completed.stdout.strip() or "SCIP command did not produce an index."
-            failed.append(
-                ScipRunFailure(
-                    language=language,
-                    binary_name=requirement.binary_name,
-                    install_hint=requirement.install_hint,
-                    command=tuple(command),
-                    detail=detail,
+            except Exception as exc:
+                failed.append(
+                    ScipRunFailure(
+                        language=language,
+                        binary_name=requirement.binary_name,
+                        install_hint=requirement.install_hint,
+                        working_directory=str(invocation_root),
+                        command=tuple(command),
+                        detail=str(exc),
+                    )
                 )
-            )
-            continue
-        results.append(ScipRunResult(language=language, index_path=output_file))
+                continue
+            if completed.returncode != 0 or not output_file.exists():
+                detail = completed.stderr.strip() or completed.stdout.strip() or "SCIP command did not produce an index."
+                failed.append(
+                    ScipRunFailure(
+                        language=language,
+                        binary_name=requirement.binary_name,
+                        install_hint=requirement.install_hint,
+                        working_directory=str(invocation_root),
+                        command=tuple(command),
+                        detail=detail,
+                    )
+                )
+                continue
+            results.append(ScipRunResult(language=language, index_path=output_file, source_root=invocation_root))
     return ScipRunReport(results=results, missing=missing, failed=failed)

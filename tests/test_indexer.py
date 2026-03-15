@@ -6,6 +6,7 @@ from ultimate_indexer.formatter import format_groups, format_top_symbols
 from ultimate_indexer.indexer import UltimateIndexer
 from ultimate_indexer.models import IndexProgress
 from ultimate_indexer.python_scip import emit_python_scip
+from ultimate_indexer.scip_runner import ScipRunFailure, ScipRunReport
 
 
 def _python_scip_path(project_root: Path) -> Path:
@@ -79,5 +80,44 @@ def test_index_reports_progress(fixture_project: Path, monkeypatch) -> None:
         assert any(event.stage == "embed" and event.total > 0 for event in events)
         assert any(event.stage == "embed" and event.detail == "Loading embedding model" for event in events)
         assert events[-1].stage == "pagerank"
+    finally:
+        indexer.close()
+
+
+def test_index_continues_with_fallback_when_scip_root_fails(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("ULTIMATE_INDEXER_EMBEDDING_BACKEND", "hash")
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "src").mkdir()
+    target = project / "src" / "auth.ts"
+    target.write_text("export function buildToken(userId: string) { return `token:${userId}` }\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "ultimate_indexer.indexer.run_scip_indexers",
+        lambda project_root, files, cache_dir: ScipRunReport(
+            results=[],
+            missing=[],
+            failed=[
+                ScipRunFailure(
+                    language="typescript",
+                    binary_name="scip-typescript",
+                    install_hint="npm install -g @sourcegraph/scip-typescript",
+                    working_directory=str(project / "src"),
+                    command=("scip-typescript", "index"),
+                    detail="missing tsconfig.json",
+                )
+            ],
+        ),
+    )
+
+    indexer = UltimateIndexer(project)
+    try:
+        summary = indexer.index(force=True)
+        assert summary.warnings
+        assert "typescript at src" in summary.warnings[0]
+        groups = indexer.query("buildToken token", limit=5)
+        rendered = format_groups(indexer.storage, indexer.project_id, groups)
+        assert "// src/auth.ts" in rendered
+        assert "buildToken" in rendered
     finally:
         indexer.close()

@@ -68,8 +68,10 @@ def parse_scip_index(
     project_root: Path,
     index_path: Path,
     edge_weights: dict[str, float] | None = None,
+    source_root: Path | None = None,
 ) -> ParsedScip:
     edge_weights = edge_weights or DEFAULT_EDGE_WEIGHTS
+    source_root = source_root or project_root
     index = scip_pb2.Index()
     index.ParseFromString(index_path.read_bytes())
 
@@ -81,8 +83,12 @@ def parse_scip_index(
     def_ranges: dict[str, list[tuple[tuple[int, int, int, int], str]]] = {}
 
     for document in index.documents:
-        relative_path = document.relative_path
-        abs_path = str((project_root / relative_path).resolve())
+        document_relative_path = document.relative_path
+        abs_path = str((source_root / document_relative_path).resolve())
+        try:
+            relative_path = Path(abs_path).resolve().relative_to(project_root.resolve()).as_posix()
+        except ValueError:
+            relative_path = document_relative_path
         content = document.text or Path(abs_path).read_text(encoding="utf-8")
         files.append(
             FileRecord(
@@ -168,7 +174,12 @@ def parse_scip_index(
     seen_edges: set[tuple[str, str, str]] = {(edge.source_symbol_id, edge.target_symbol_id, edge.edge_type) for edge in edges}
 
     for document in index.documents:
-        definitions = def_ranges[document.relative_path]
+        abs_path = str((source_root / document.relative_path).resolve())
+        try:
+            normalized_relative_path = Path(abs_path).resolve().relative_to(project_root.resolve()).as_posix()
+        except ValueError:
+            normalized_relative_path = document.relative_path
+        definitions = def_ranges[normalized_relative_path]
         occurrences = [occ for occ in document.occurrences if not occ.symbol.startswith("local ")]
         for occurrence in occurrences:
             role = getattr(occurrence, "symbol_roles", getattr(occurrence, "role", 0))
@@ -176,7 +187,7 @@ def parse_scip_index(
                 continue
             if occurrence.symbol not in symbols_by_key:
                 continue
-            source_symbol_id = f"file::{document.relative_path}"
+            source_symbol_id = f"file::{normalized_relative_path}"
             position = tuple(occurrence.enclosing_range or occurrence.range or [0, 0, 0, 0])
             best_span = None
             for full_range, symbol_id in definitions:

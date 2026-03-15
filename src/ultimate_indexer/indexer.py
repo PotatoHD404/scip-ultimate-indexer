@@ -19,7 +19,7 @@ from .models import ChunkRecord, EdgeRecord, FileRecord, IndexProgress, IndexSum
 from .pagerank import weighted_pagerank
 from .query import QueryEngine
 from .scip_parser import ParsedScip, parse_scip_index
-from .scip_runner import StructuredIndexingRequiredError, run_scip_indexers
+from .scip_runner import ScipRunFailure, StructuredIndexingRequiredError, run_scip_indexers
 from .socraticode import ingest_socraticode_artifacts
 from .storage import Storage
 from .visuals import write_query_visualization
@@ -127,6 +127,15 @@ def _overview_chunk(project_id: str, file_symbol: SymbolRecord, symbols: list[Sy
         content=content,
         content_hash=sha256(content.encode("utf-8")).hexdigest(),
     )
+
+
+def _render_scip_warning(failure: ScipRunFailure, project_root: Path) -> str:
+    try:
+        rel_root = Path(failure.working_directory).resolve().relative_to(project_root.resolve()).as_posix()
+    except ValueError:
+        rel_root = failure.working_directory
+    detail = " ".join(failure.detail.split())
+    return f"{failure.language} at {rel_root}: {detail}"
 
 
 class UltimateIndexer:
@@ -274,6 +283,7 @@ class UltimateIndexer:
         force: bool = False,
         progress_callback: Callable[[IndexProgress], None] | None = None,
     ) -> IndexSummary:
+        scip_warnings: list[str] = []
         self._emit_progress(progress_callback, stage="discover", detail="Scanning project files")
         code_files = _discover_code_files(self.settings.project_root, self.settings.extra_extensions)
         self._emit_progress(
@@ -312,6 +322,7 @@ class UltimateIndexer:
                 indexed_chunks=len(self.storage.load_chunk_vectors(self.project_id)[1]),
                 reused_files=len(code_files),
                 artifact_files=0,
+                warnings=[],
             )
 
         parsed_files: list[FileRecord] = []
@@ -338,8 +349,12 @@ class UltimateIndexer:
             )
         else:
             scip_report = run_scip_indexers(self.settings.project_root, code_files, self.settings.cache_dir)
-            if scip_report.missing or scip_report.failed:
-                raise StructuredIndexingRequiredError(scip_report.missing, scip_report.failed)
+            if scip_report.missing:
+                raise StructuredIndexingRequiredError(scip_report.missing, [])
+            scip_warnings = [
+                _render_scip_warning(failure, self.settings.project_root)
+                for failure in scip_report.failed
+            ]
             scip_results = scip_report.results
             total_scip_steps = len(scip_results)
             completed_scip_steps = 0
@@ -350,7 +365,7 @@ class UltimateIndexer:
                     completed=1,
                     total=1,
                     unit="indexes",
-                    detail="No external SCIP indexes available",
+                    detail="No external SCIP indexes available" if not scip_warnings else "SCIP failed; using fallback coverage",
                 )
             for result in scip_results:
                 parsed = parse_scip_index(
@@ -358,6 +373,7 @@ class UltimateIndexer:
                     project_root=self.settings.project_root,
                     index_path=result.index_path,
                     edge_weights=self.settings.edge_weights,
+                    source_root=result.source_root,
                 )
                 parsed_files.extend(parsed.files)
                 parsed_symbols.extend(parsed.symbols)
@@ -500,6 +516,7 @@ class UltimateIndexer:
             indexed_chunks=len(chunks),
             reused_files=0,
             artifact_files=len(artifact_bundle.files),
+            warnings=scip_warnings,
         )
 
     def query(self, text: str, limit: int = 10):

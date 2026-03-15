@@ -44,12 +44,15 @@ def _load_nested_gitignore_patterns(project_root: Path) -> list[str]:
         ".vercel",
         ".ultimate_indexer",
     }
-    for gitignore in project_root.rglob(".gitignore"):
-        if gitignore.parent == project_root:
+    for current_root, dirs, filenames in os.walk(project_root):
+        dirs[:] = [dirname for dirname in dirs if dirname.lower() not in skip_dirs]
+        root_path = Path(current_root)
+        if root_path == project_root:
             continue
-        if any(part in skip_dirs for part in gitignore.parent.parts):
+        if ".gitignore" not in filenames:
             continue
-        rel_dir = gitignore.parent.relative_to(project_root).as_posix()
+        gitignore = root_path / ".gitignore"
+        rel_dir = root_path.relative_to(project_root).as_posix()
         for line in _read_lines(gitignore):
             trimmed = line.strip()
             if not trimmed or trimmed.startswith("#"):
