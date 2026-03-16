@@ -26,6 +26,7 @@ poetry run ultimate-indexer mcp
 The runtime now defaults to `sentence-transformers` with [`nomic-ai/CodeRankEmbed`](https://huggingface.co/nomic-ai/CodeRankEmbed).
 
 - on Apple Silicon, `auto` prefers the PyTorch `mps` device so inference runs on the Metal GPU
+- on Apple Silicon, the default embedding path also uses a smaller batch size and caps sequence length to `512` tokens to keep Metal memory stable
 - the query side uses the model's required prefix: `Represent this query for searching relevant code:`
 - batching is enabled by default for faster indexing throughput
 - `llama.cpp` remains available as a fallback/backend override
@@ -36,6 +37,7 @@ Useful debug envs:
 
 - `ULTIMATE_INDEXER_ST_DEVICE` to force `mps`, `cuda`, or `cpu`
 - `ULTIMATE_INDEXER_ST_BATCH_SIZE` to tune throughput
+- `ULTIMATE_INDEXER_ST_MAX_SEQ_LENGTH` to trade context length against speed and memory use
 - `ULTIMATE_INDEXER_ST_USE_FP16=true|false` to control half precision on GPU backends
 - `ULTIMATE_INDEXER_ST_NORMALIZE=false` to disable normalized embeddings
 - `ULTIMATE_INDEXER_LLAMA_VERBOSE=true` to expose backend/device logs

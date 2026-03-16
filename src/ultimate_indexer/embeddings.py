@@ -109,6 +109,50 @@ def _remote_dependency_install_hint(model_name: str, exc: ImportError) -> str | 
     )
 
 
+def _sentence_transformer_batch_size(device: str) -> int:
+    if device == "cuda":
+        return 32
+    if device == "mps":
+        return 8
+    return 16
+
+
+def _sentence_transformer_max_seq_length(device: str) -> int:
+    if device == "mps":
+        return 512
+    if device == "cuda":
+        return 1024
+    return 1024
+
+
+def _apply_sentence_transformer_limits(model: object, max_seq_length: int) -> None:
+    if max_seq_length <= 0:
+        return
+    current = getattr(model, "max_seq_length", None)
+    if current is None:
+        setattr(model, "max_seq_length", max_seq_length)
+    else:
+        setattr(model, "max_seq_length", min(int(current), max_seq_length))
+
+    tokenizer = getattr(model, "tokenizer", None)
+    if tokenizer is None:
+        return
+    tokenizer_limit = getattr(tokenizer, "model_max_length", None)
+    if tokenizer_limit is None:
+        setattr(tokenizer, "model_max_length", max_seq_length)
+    else:
+        setattr(tokenizer, "model_max_length", min(int(tokenizer_limit), max_seq_length))
+
+
+def _mps_memory_hint(model_name: str) -> str:
+    return (
+        f"`{model_name}` exhausted Apple GPU memory on `mps`. "
+        "Retry with `ULTIMATE_INDEXER_ST_BATCH_SIZE=2` and/or "
+        "`ULTIMATE_INDEXER_ST_MAX_SEQ_LENGTH=256`, or force CPU with "
+        "`ULTIMATE_INDEXER_ST_DEVICE=cpu`."
+    )
+
+
 @dataclass(slots=True)
 class HashEmbeddingProvider:
     dim: int = 256
@@ -183,6 +227,7 @@ class SentenceTransformerEmbeddingProvider:
     model_id: str
     device: str
     batch_size: int = 64
+    max_seq_length: int = 0
     use_fp16: bool = False
     normalize_embeddings: bool = True
     supports_batching: bool = True
@@ -210,6 +255,7 @@ class SentenceTransformerEmbeddingProvider:
                     trust_remote_code=True,
                     device=self.device,
                 )
+                _apply_sentence_transformer_limits(self._model, self.max_seq_length)
                 if self.use_fp16:
                     try:
                         self._model.half()
@@ -227,14 +273,20 @@ class SentenceTransformerEmbeddingProvider:
             return []
         import torch
 
-        with torch.inference_mode():
-            encoded = self._client().encode(
-                list(texts),
-                batch_size=self.batch_size,
-                show_progress_bar=False,
-                convert_to_numpy=True,
-                normalize_embeddings=self.normalize_embeddings,
-            )
+        try:
+            with torch.inference_mode():
+                encoded = self._client().encode(
+                    list(texts),
+                    batch_size=self.batch_size,
+                    show_progress_bar=False,
+                    convert_to_numpy=True,
+                    normalize_embeddings=self.normalize_embeddings,
+                )
+        except RuntimeError as exc:
+            message = str(exc)
+            if self.device == "mps" and any(marker in message for marker in ("Invalid buffer size", "out of memory", "MPS")):
+                raise RuntimeError(_mps_memory_hint(self.model_name)) from exc
+            raise
         matrix = np.asarray(encoded, dtype=np.float32)
         if matrix.ndim == 1:
             return [matrix]
@@ -295,6 +347,8 @@ def resolve_sentence_transformer_provider(
     model_name: str,
 ) -> SentenceTransformerEmbeddingProvider:
     device = _detect_sentence_transformer_device()
+    default_batch_size = _sentence_transformer_batch_size(device)
+    default_max_seq_length = _sentence_transformer_max_seq_length(device)
     use_fp16_env = os.getenv("ULTIMATE_INDEXER_ST_USE_FP16")
     use_fp16 = (
         use_fp16_env.lower() == "true"
@@ -306,7 +360,8 @@ def resolve_sentence_transformer_provider(
         cache_dir=model_cache_dir,
         model_id=model_name,
         device=device,
-        batch_size=int(os.getenv("ULTIMATE_INDEXER_ST_BATCH_SIZE", "96")),
+        batch_size=int(os.getenv("ULTIMATE_INDEXER_ST_BATCH_SIZE", str(default_batch_size))),
+        max_seq_length=int(os.getenv("ULTIMATE_INDEXER_ST_MAX_SEQ_LENGTH", str(default_max_seq_length))),
         use_fp16=use_fp16,
         normalize_embeddings=os.getenv("ULTIMATE_INDEXER_ST_NORMALIZE", "true").lower() != "false",
     )
@@ -322,7 +377,11 @@ def generate_embeddings(
     if not texts:
         return []
     results: list[np.ndarray] = []
-    effective_batch_size = max(1, batch_size if getattr(provider, "supports_batching", True) else 1)
+    provider_batch_size = getattr(provider, "batch_size", batch_size)
+    effective_batch_size = max(
+        1,
+        min(batch_size, int(provider_batch_size)) if getattr(provider, "supports_batching", True) else 1,
+    )
     batch_delay_ms = PROVIDER_BATCH_DELAY_MS.get(provider.model_id, 0)
     for start in range(0, len(texts), effective_batch_size):
         if start > 0 and batch_delay_ms > 0:
