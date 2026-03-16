@@ -1,0 +1,33 @@
+from __future__ import annotations
+
+from ultimate_indexer.ranking_rules import clean_symbol_display_name, is_generated_path, is_rankable_symbol
+
+
+def test_is_generated_path_detects_generated_outputs() -> None:
+    assert is_generated_path("services/app/.next/types/routes.d.ts")
+    assert is_generated_path("services/app/proto/zitadel/object.ts")
+    assert is_generated_path("apps/billing/payments-connector/proto/gen/go/payment.pb.go")
+    assert is_generated_path("sdk/python/generated/payment_pb2.pyi")
+    assert not is_generated_path("services/app/lib/router.ts")
+
+
+def test_is_rankable_symbol_rejects_unknown_module_and_generated() -> None:
+    assert not is_rankable_symbol("services/app/lib/router.ts", "Unknown")
+    assert not is_rankable_symbol("services/app/lib/router.ts", "Module")
+    assert not is_rankable_symbol("services/app/proto/zitadel/object.ts", "Interface")
+    assert is_rankable_symbol("services/app/lib/router.ts", "Function")
+
+
+def test_clean_symbol_display_name_prefers_docstring_and_symbol_tail() -> None:
+    assert clean_symbol_display_name(
+        symbol="scip-typescript npm demo 1.0 lib/`router.ts`/ROUTING.",
+        display_name="",
+        docstring="```ts\nconst ROUTING: Record<string, string>\n```",
+        relative_path="lib/router.ts",
+    ) == "ROUTING"
+    assert clean_symbol_display_name(
+        symbol="scip-typescript npm demo 1.0 lib/`i18n.ts`/getDictionary().",
+        display_name="",
+        docstring="",
+        relative_path="lib/i18n.ts",
+    ) == "getDictionary()"

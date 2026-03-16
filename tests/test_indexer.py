@@ -213,3 +213,219 @@ def test_index_dedupes_overlapping_scip_results(tmp_path: Path, monkeypatch) -> 
         assert "scip-typescript npm demo 1.0 `auth.ts`/token." in rows
     finally:
         indexer.close()
+
+
+def test_generated_and_unknown_symbols_are_excluded_from_ranking_and_query(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("ULTIMATE_INDEXER_EMBEDDING_BACKEND", "hash")
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "src").mkdir()
+    (project / "proto").mkdir()
+
+    regular_file_path = project / "src" / "service.ts"
+    generated_file_path = project / "proto" / "generated.ts"
+    unknown_file_path = project / "src" / "unknown.ts"
+    regular_file_path.write_text("export function handleAuth() { return 'ok' }\n", encoding="utf-8")
+    generated_file_path.write_text("export interface GeneratedRecord { value: string }\n", encoding="utf-8")
+    unknown_file_path.write_text("export const secretFlag = true\n", encoding="utf-8")
+
+    scip_path = project / ".ultimate_indexer" / "cache" / "fixture.scip"
+    scip_path.parent.mkdir(parents=True, exist_ok=True)
+    scip_path.write_bytes(b"")
+
+    regular_file = FileRecord(
+        project_id=str(project),
+        relative_path="src/service.ts",
+        abs_path=str(regular_file_path),
+        language="ts",
+        content_hash="regular-file",
+        content=regular_file_path.read_text(encoding="utf-8"),
+    )
+    generated_file = FileRecord(
+        project_id=str(project),
+        relative_path="proto/generated.ts",
+        abs_path=str(generated_file_path),
+        language="ts",
+        content_hash="generated-file",
+        content=generated_file_path.read_text(encoding="utf-8"),
+    )
+    unknown_file = FileRecord(
+        project_id=str(project),
+        relative_path="src/unknown.ts",
+        abs_path=str(unknown_file_path),
+        language="ts",
+        content_hash="unknown-file",
+        content=unknown_file_path.read_text(encoding="utf-8"),
+    )
+
+    regular_file_symbol = SymbolRecord(
+        project_id=str(project),
+        symbol_id="file::src/service.ts",
+        scip_symbol="file::src/service.ts",
+        display_name="service.ts",
+        kind="File",
+        relative_path="src/service.ts",
+        start_line=1,
+        end_line=1,
+        signature="src/service.ts",
+        docstring="",
+        snippet="export function handleAuth() { return 'ok' }",
+    )
+    generated_file_symbol = SymbolRecord(
+        project_id=str(project),
+        symbol_id="file::proto/generated.ts",
+        scip_symbol="file::proto/generated.ts",
+        display_name="generated.ts",
+        kind="File",
+        relative_path="proto/generated.ts",
+        start_line=1,
+        end_line=1,
+        signature="proto/generated.ts",
+        docstring="",
+        snippet="export interface GeneratedRecord { value: string }",
+    )
+    unknown_file_symbol = SymbolRecord(
+        project_id=str(project),
+        symbol_id="file::src/unknown.ts",
+        scip_symbol="file::src/unknown.ts",
+        display_name="unknown.ts",
+        kind="File",
+        relative_path="src/unknown.ts",
+        start_line=1,
+        end_line=1,
+        signature="src/unknown.ts",
+        docstring="",
+        snippet="export const secretFlag = true",
+    )
+
+    regular_symbol = SymbolRecord(
+        project_id=str(project),
+        symbol_id="regular::handleAuth",
+        scip_symbol="regular::handleAuth",
+        display_name="handleAuth",
+        kind="Function",
+        relative_path="src/service.ts",
+        start_line=1,
+        end_line=1,
+        signature="function handleAuth(): string",
+        docstring="",
+        snippet="export function handleAuth() { return 'ok' }",
+        enclosing_symbol_id="file::src/service.ts",
+    )
+    generated_symbol = SymbolRecord(
+        project_id=str(project),
+        symbol_id="generated::GeneratedRecord",
+        scip_symbol="generated::GeneratedRecord",
+        display_name="GeneratedRecord",
+        kind="Interface",
+        relative_path="proto/generated.ts",
+        start_line=1,
+        end_line=1,
+        signature="interface GeneratedRecord",
+        docstring="",
+        snippet="export interface GeneratedRecord { value: string }",
+        enclosing_symbol_id="file::proto/generated.ts",
+    )
+    unknown_symbol = SymbolRecord(
+        project_id=str(project),
+        symbol_id="unknown::secretFlag",
+        scip_symbol="unknown::secretFlag",
+        display_name="secretFlag",
+        kind="Unknown",
+        relative_path="src/unknown.ts",
+        start_line=1,
+        end_line=1,
+        signature="const secretFlag: boolean",
+        docstring="",
+        snippet="export const secretFlag = true",
+        enclosing_symbol_id="file::src/unknown.ts",
+    )
+
+    edges = [
+        EdgeRecord(
+            project_id=str(project),
+            source_symbol_id="file::src/service.ts",
+            target_symbol_id="regular::handleAuth",
+            edge_type="contains",
+            weight=0.55,
+        ),
+        EdgeRecord(
+            project_id=str(project),
+            source_symbol_id="file::proto/generated.ts",
+            target_symbol_id="generated::GeneratedRecord",
+            edge_type="contains",
+            weight=0.55,
+        ),
+        EdgeRecord(
+            project_id=str(project),
+            source_symbol_id="file::src/unknown.ts",
+            target_symbol_id="unknown::secretFlag",
+            edge_type="contains",
+            weight=0.55,
+        ),
+        EdgeRecord(
+            project_id=str(project),
+            source_symbol_id="regular::handleAuth",
+            target_symbol_id="generated::GeneratedRecord",
+            edge_type="uses",
+            weight=0.75,
+        ),
+        EdgeRecord(
+            project_id=str(project),
+            source_symbol_id="generated::GeneratedRecord",
+            target_symbol_id="generated::GeneratedRecord",
+            edge_type="uses",
+            weight=0.75,
+        ),
+        EdgeRecord(
+            project_id=str(project),
+            source_symbol_id="unknown::secretFlag",
+            target_symbol_id="regular::handleAuth",
+            edge_type="uses",
+            weight=0.75,
+        ),
+    ]
+
+    monkeypatch.setattr(
+        "ultimate_indexer.indexer.run_scip_indexers",
+        lambda project_root, files, cache_dir: ScipRunReport(
+            results=[ScipRunResult(language="typescript", index_path=scip_path, source_root=project)],
+            missing=[],
+            failed=[],
+        ),
+    )
+    monkeypatch.setattr(
+        "ultimate_indexer.indexer.parse_scip_index",
+        lambda project_id, project_root, index_path, edge_weights, source_root=None: ParsedScip(
+            files=[regular_file, generated_file, unknown_file],
+            symbols=[
+                regular_file_symbol,
+                generated_file_symbol,
+                unknown_file_symbol,
+                regular_symbol,
+                generated_symbol,
+                unknown_symbol,
+            ],
+            edges=edges,
+        ),
+    )
+
+    indexer = UltimateIndexer(project)
+    try:
+        indexer.index(force=True)
+        top_rows = indexer.top_symbols(limit=10)
+        top_ids = {str(row["symbol_id"]) for row in top_rows}
+        assert "regular::handleAuth" in top_ids
+        assert "generated::GeneratedRecord" not in top_ids
+        assert "unknown::secretFlag" not in top_ids
+
+        regular_groups = indexer.query("handleAuth", limit=5)
+        assert regular_groups
+        assert regular_groups[0].relative_path == "src/service.ts"
+
+        generated_groups = indexer.query("GeneratedRecord", limit=5)
+        unknown_groups = indexer.query("secretFlag", limit=5)
+        assert all(group.relative_path != "proto/generated.ts" for group in generated_groups)
+        assert all(group.relative_path != "src/unknown.ts" for group in unknown_groups)
+    finally:
+        indexer.close()

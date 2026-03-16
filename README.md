@@ -31,6 +31,8 @@ The runtime now defaults to `sentence-transformers` with [`nomic-ai/CodeRankEmbe
 - batching is enabled by default for faster indexing throughput
 - `llama.cpp` remains available as a fallback/backend override
 
+Ranking and query scoring exclude low-signal generated artifacts such as `.next` outputs, protobuf-generated `proto/*` code, `*.pb.go`, and `*_pb2.*` files. Those files are still stored for inspection, but they no longer dominate `top-symbols` or semantic query results.
+
 For CI and tests, set `ULTIMATE_INDEXER_EMBEDDING_BACKEND=hash` to use a deterministic local embedding backend with no model download.
 
 Useful debug envs:

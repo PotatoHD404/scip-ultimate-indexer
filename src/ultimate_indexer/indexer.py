@@ -19,6 +19,7 @@ from .ignore_rules import create_ignore_matcher
 from .models import ChunkRecord, EdgeRecord, FileRecord, IndexProgress, IndexSummary, SymbolRecord
 from .pagerank import weighted_pagerank
 from .query import QueryEngine
+from .ranking_rules import is_rankable_symbol
 from .scip_parser import ParsedScip, parse_scip_index
 from .scip_runner import ScipRunFailure, StructuredIndexingRequiredError, run_scip_indexers
 from .socraticode import ingest_socraticode_artifacts
@@ -36,6 +37,7 @@ INDEX_STAGES = (
     "store",
     "pagerank",
 )
+INDEX_FORMAT_VERSION = 4
 
 
 def _discover_code_files(project_root: Path, extra_extensions: set[str]) -> list[Path]:
@@ -85,6 +87,7 @@ def _project_signature(
         relative = path.relative_to(project_root)
         payload.append(f"{relative}:{path.stat().st_mtime_ns}:{path.stat().st_size}")
     payload.append(f"embedding-backend:{embedding_backend}")
+    payload.append(f"index-format-version:{INDEX_FORMAT_VERSION}")
     payload.append(f"model-repo:{model_repo_id}")
     payload.append(f"llama-model-repo:{llama_model_repo_id}")
     payload.append(f"model-file:{model_filename}")
@@ -305,9 +308,15 @@ class UltimateIndexer:
         return chunks
 
     def _global_ranks(self) -> None:
-        symbol_ids = list(self.storage.get_symbol_rows(self.project_id).keys())
+        symbol_rows = self.storage.get_symbol_rows(self.project_id)
+        symbol_ids = [
+            symbol_id
+            for symbol_id, row in symbol_rows.items()
+            if is_rankable_symbol(str(row["relative_path"]), str(row["kind"]))
+        ]
         if not symbol_ids:
             return
+        rankable_ids = set(symbol_ids)
         edges = [
             (
                 str(edge["source_symbol_id"]),
@@ -315,6 +324,7 @@ class UltimateIndexer:
                 float(edge["weight"]),
             )
             for edge in self.storage.get_edges(self.project_id)
+            if str(edge["source_symbol_id"]) in rankable_ids and str(edge["target_symbol_id"]) in rankable_ids
         ]
         ranks = weighted_pagerank(nodes=symbol_ids, edges=edges, alpha=0.85)
         self.storage.set_global_ranks(self.project_id, ranks)

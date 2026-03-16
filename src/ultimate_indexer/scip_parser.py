@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 
 from .config import DEFAULT_EDGE_WEIGHTS
 from .embeddings import hash_text
 from .models import EdgeRecord, FileRecord, SymbolRecord
+from .ranking_rules import clean_symbol_display_name
 from . import scip_pb2
 
 
@@ -41,7 +43,67 @@ def _kind_name(value: int) -> str:
         name = scip_pb2.SymbolInformation.Kind.Name(value)
     except ValueError:
         return "Unknown"
-    return name.replace("Unspecified", "").replace("Method", "Method") or "Unknown"
+    if name == "UnspecifiedKind":
+        return "Unknown"
+    return name
+
+
+def _first_symbol_doc_line(docstring: str, signature: str) -> str:
+    for source in (docstring, signature):
+        for raw_line in source.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("```"):
+                continue
+            return line
+    return ""
+
+
+def _infer_kind(symbol: str, docstring: str, signature: str, snippet: str) -> str:
+    line = _first_symbol_doc_line(docstring, signature)
+    lowered = line.lower()
+    if lowered.startswith("func ") or lowered.startswith("function "):
+        return "Function"
+    if lowered.startswith("method "):
+        return "Method"
+    if lowered.startswith("interface "):
+        return "Interface"
+    if lowered.startswith("class "):
+        return "Class"
+    if lowered.startswith("enum "):
+        return "Enum"
+    if lowered.startswith("type "):
+        return "TypeAlias"
+    if lowered.startswith("struct field ") or lowered.startswith("(property) "):
+        return "Field"
+    if lowered.startswith("(parameter) "):
+        return "Parameter"
+    if lowered.startswith("const "):
+        return "Constant"
+    if lowered.startswith("var ") or lowered.startswith("let "):
+        return "Variable"
+    if lowered.startswith("module "):
+        return "Module"
+
+    snippet_line = next((item.strip() for item in snippet.splitlines() if item.strip()), "")
+    if re.match(r"^(?:export\s+)?(?:async\s+)?function\b", snippet_line):
+        return "Function"
+    if re.match(r"^(?:export\s+)?(?:const|let|var)\b", snippet_line):
+        return "Variable"
+    if re.match(r"^(?:export\s+)?interface\b", snippet_line):
+        return "Interface"
+    if re.match(r"^(?:export\s+)?type\b", snippet_line):
+        return "TypeAlias"
+
+    tail = symbol.rsplit("/", 1)[-1]
+    if tail.endswith("()."):
+        return "Function"
+    if "#" in tail and tail.endswith("."):
+        return "Field"
+    if tail.endswith("#"):
+        return "TypeAlias"
+    if tail.endswith("/"):
+        return "Module"
+    return "Unknown"
 
 
 def _range_to_lines(rng: list[int]) -> tuple[int, int]:
@@ -149,12 +211,20 @@ def parse_scip_index(
             signature = info.signature_documentation.text or info.display_name or info.symbol
             docstring = "\n".join(part for part in info.documentation if part)
             snippet = _slice_snippet(content, start_line, end_line) or signature
+            kind = _kind_name(info.kind)
+            if kind == "Unknown":
+                kind = _infer_kind(info.symbol, docstring, signature, snippet)
             record = SymbolRecord(
                 project_id=project_id,
                 symbol_id=normalized_symbol_id,
                 scip_symbol=info.symbol,
-                display_name=info.display_name or info.symbol.split(":")[-1],
-                kind=_kind_name(info.kind),
+                display_name=clean_symbol_display_name(
+                    symbol=info.symbol,
+                    display_name=info.display_name,
+                    docstring=docstring,
+                    relative_path=relative_path,
+                ),
+                kind=kind,
                 relative_path=relative_path,
                 start_line=start_line,
                 end_line=end_line,

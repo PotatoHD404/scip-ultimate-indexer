@@ -9,6 +9,7 @@ import numpy as np
 from .embeddings import EmbeddingProvider, cosine_similarity, generate_query_embedding
 from .models import FileGroup, QueryChunkHit, RankedSymbol
 from .pagerank import weighted_pagerank
+from .ranking_rules import is_queryable_symbol
 from .storage import Storage
 
 
@@ -120,14 +121,28 @@ class QueryEngine:
         if cached is not None:
             return self._deserialize_groups(cached)
 
-        bm25_hits = self.storage.search_bm25(project_id, query, max(limit * 5, 20))
-        dense_hits = self._dense_hits(project_id, query, max(limit * 5, 20))
+        symbol_rows = self.storage.get_symbol_rows(project_id)
+        rankable_symbol_ids = {
+            symbol_id
+            for symbol_id, row in symbol_rows.items()
+            if is_queryable_symbol(str(row["relative_path"]), str(row["kind"]))
+        }
+
+        bm25_hits = [
+            hit
+            for hit in self.storage.search_bm25(project_id, query, max(limit * 5, 20))
+            if hit.symbol_id in rankable_symbol_ids
+        ]
+        dense_hits = [
+            hit
+            for hit in self._dense_hits(project_id, query, max(limit * 5, 20))
+            if hit.symbol_id in rankable_symbol_ids
+        ]
         fused = _rrf_scores(bm25_hits) | {}
         for chunk_id, value in _rrf_scores(dense_hits).items():
             fused[chunk_id] = fused.get(chunk_id, 0.0) + value
 
         chunk_by_id = {item.chunk_id: item for item in [*bm25_hits, *dense_hits]}
-        symbol_rows = self.storage.get_symbol_rows(project_id)
         seed_scores: dict[str, float] = defaultdict(float)
         for chunk_id, score in fused.items():
             chunk = chunk_by_id[chunk_id]
@@ -139,7 +154,7 @@ class QueryEngine:
             personalization = {
                 key: value / personalization_total
                 for key, value in seed_scores.items()
-                if key in symbol_rows
+                if key in rankable_symbol_ids
             }
 
         reverse_edges = [
@@ -149,10 +164,11 @@ class QueryEngine:
                 float(edge["weight"]),
             )
             for edge in self.storage.get_edges(project_id)
+            if str(edge["target_symbol_id"]) in rankable_symbol_ids and str(edge["source_symbol_id"]) in rankable_symbol_ids
         ]
         ppr_scores = (
             weighted_pagerank(
-                nodes=list(symbol_rows.keys()),
+                nodes=sorted(rankable_symbol_ids),
                 edges=reverse_edges,
                 alpha=0.85,
                 personalization=personalization,
@@ -163,7 +179,7 @@ class QueryEngine:
 
         ranked: list[RankedSymbol] = []
         for symbol_id, row in symbol_rows.items():
-            if row["kind"] == "File":
+            if symbol_id not in rankable_symbol_ids:
                 continue
             final_score = (
                 0.45 * seed_scores.get(symbol_id, 0.0)

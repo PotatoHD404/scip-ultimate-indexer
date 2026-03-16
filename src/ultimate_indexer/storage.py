@@ -438,7 +438,9 @@ class Storage:
             """
             SELECT *
             FROM symbols
-            WHERE project_id = ? AND kind NOT IN ('File', 'Artifact', 'Section')
+            WHERE project_id = ?
+              AND kind NOT IN ('File', 'Artifact', 'Section', 'Module', 'Unknown')
+              AND global_rank > 0
             ORDER BY global_rank DESC, display_name ASC
             LIMIT ?
             """,
