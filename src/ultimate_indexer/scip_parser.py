@@ -30,6 +30,12 @@ class ParsedScip:
     edges: list[EdgeRecord]
 
 
+def _normalize_symbol_id(relative_path: str, symbol: str) -> str:
+    if symbol.startswith("local "):
+        return f"local::{relative_path}::{symbol}"
+    return symbol
+
+
 def _kind_name(value: int) -> str:
     try:
         name = scip_pb2.SymbolInformation.Kind.Name(value)
@@ -79,7 +85,6 @@ def parse_scip_index(
     symbols: list[SymbolRecord] = []
     edges: list[EdgeRecord] = []
     symbols_by_key: dict[str, SymbolRecord] = {}
-    info_by_symbol: dict[str, scip_pb2.SymbolInformation] = {}
     def_ranges: dict[str, list[tuple[tuple[int, int, int, int], str]]] = {}
 
     for document in index.documents:
@@ -116,28 +121,27 @@ def parse_scip_index(
         symbols.append(file_symbol)
         symbols_by_key[file_symbol.symbol_id] = file_symbol
 
-        for info in document.symbols:
-            info_by_symbol[info.symbol] = info
-
         defs: list[tuple[tuple[int, int, int, int], str]] = []
-        occurrences = [occ for occ in document.occurrences if not occ.symbol.startswith("local ")]
+        occurrences = list(document.occurrences)
         for occurrence in occurrences:
             role = getattr(occurrence, "symbol_roles", getattr(occurrence, "role", 0))
             if role & scip_pb2.Definition:
                 full_range = tuple(occurrence.enclosing_range or occurrence.range or [0, 0, 0, 0])
-                defs.append((full_range, occurrence.symbol))
+                defs.append((full_range, _normalize_symbol_id(relative_path, occurrence.symbol)))
         def_ranges[relative_path] = defs
 
         for info in document.symbols:
             if info.symbol.startswith("file::"):
                 continue
-            if info.symbol in symbols_by_key:
+            normalized_symbol_id = _normalize_symbol_id(relative_path, info.symbol)
+            if normalized_symbol_id in symbols_by_key:
                 continue
             occurrence = next(
                 (
                     occ
                     for occ in occurrences
-                    if occ.symbol == info.symbol and (getattr(occ, "symbol_roles", 0) & scip_pb2.Definition)
+                    if _normalize_symbol_id(relative_path, occ.symbol) == normalized_symbol_id
+                    and (getattr(occ, "symbol_roles", 0) & scip_pb2.Definition)
                 ),
                 None,
             )
@@ -147,7 +151,7 @@ def parse_scip_index(
             snippet = _slice_snippet(content, start_line, end_line) or signature
             record = SymbolRecord(
                 project_id=project_id,
-                symbol_id=info.symbol,
+                symbol_id=normalized_symbol_id,
                 scip_symbol=info.symbol,
                 display_name=info.display_name or info.symbol.split(":")[-1],
                 kind=_kind_name(info.kind),
@@ -157,7 +161,11 @@ def parse_scip_index(
                 signature=signature,
                 docstring=docstring,
                 snippet=snippet,
-                enclosing_symbol_id=info.enclosing_symbol or f"file::{relative_path}",
+                enclosing_symbol_id=(
+                    _normalize_symbol_id(relative_path, info.enclosing_symbol)
+                    if info.enclosing_symbol
+                    else f"file::{relative_path}"
+                ),
             )
             symbols.append(record)
             symbols_by_key[record.symbol_id] = record
@@ -180,12 +188,13 @@ def parse_scip_index(
         except ValueError:
             normalized_relative_path = document.relative_path
         definitions = def_ranges[normalized_relative_path]
-        occurrences = [occ for occ in document.occurrences if not occ.symbol.startswith("local ")]
+        occurrences = list(document.occurrences)
         for occurrence in occurrences:
             role = getattr(occurrence, "symbol_roles", getattr(occurrence, "role", 0))
             if role & scip_pb2.Definition:
                 continue
-            if occurrence.symbol not in symbols_by_key:
+            target_symbol_id = _normalize_symbol_id(normalized_relative_path, occurrence.symbol)
+            if target_symbol_id not in symbols_by_key:
                 continue
             source_symbol_id = f"file::{normalized_relative_path}"
             position = tuple(occurrence.enclosing_range or occurrence.range or [0, 0, 0, 0])
@@ -203,7 +212,7 @@ def parse_scip_index(
             if best_span is not None:
                 source_symbol_id = best_span[1]
             edge_type = _classify_edge(occurrence.syntax_kind)
-            edge_key = (source_symbol_id, occurrence.symbol, edge_type)
+            edge_key = (source_symbol_id, target_symbol_id, edge_type)
             if edge_key in seen_edges:
                 continue
             seen_edges.add(edge_key)
@@ -211,7 +220,7 @@ def parse_scip_index(
                 EdgeRecord(
                     project_id=project_id,
                     source_symbol_id=source_symbol_id,
-                    target_symbol_id=occurrence.symbol,
+                    target_symbol_id=target_symbol_id,
                     edge_type=edge_type,
                     weight=edge_weights.get(edge_type, 0.5),
                 )
