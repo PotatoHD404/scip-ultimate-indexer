@@ -141,6 +141,31 @@ def _render_scip_warning(failure: ScipRunFailure, project_root: Path) -> str:
     return f"{failure.language} at {rel_root}: {detail}"
 
 
+def _dedupe_parsed_scip(parsed: ParsedScip) -> ParsedScip:
+    file_by_path: dict[str, FileRecord] = {}
+    for record in parsed.files:
+        file_by_path.setdefault(record.relative_path, record)
+
+    symbol_by_id: dict[str, SymbolRecord] = {}
+    for record in parsed.symbols:
+        symbol_by_id.setdefault(record.symbol_id, record)
+
+    unique_edges: list[EdgeRecord] = []
+    seen_edges: set[tuple[str, str, str]] = set()
+    for edge in parsed.edges:
+        edge_key = (edge.source_symbol_id, edge.target_symbol_id, edge.edge_type)
+        if edge_key in seen_edges:
+            continue
+        seen_edges.add(edge_key)
+        unique_edges.append(edge)
+
+    return ParsedScip(
+        files=list(file_by_path.values()),
+        symbols=list(symbol_by_id.values()),
+        edges=unique_edges,
+    )
+
+
 class UltimateIndexer:
     def __init__(self, project_root: Path, embedding_backend: str | None = None) -> None:
         self.settings = Settings(project_root=project_root)
@@ -405,7 +430,9 @@ class UltimateIndexer:
                     unit="indexes",
                     detail=f"Parsed {result.language} SCIP",
                 )
-        parsed = ParsedScip(files=parsed_files, symbols=parsed_symbols, edges=parsed_edges)
+        parsed = _dedupe_parsed_scip(
+            ParsedScip(files=parsed_files, symbols=parsed_symbols, edges=parsed_edges)
+        )
 
         self._emit_progress(progress_callback, stage="artifacts", detail="Loading SocratiCode artifacts")
         artifact_bundle = ingest_socraticode_artifacts(self.project_id, self.settings.project_root)
