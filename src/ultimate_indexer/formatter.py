@@ -145,24 +145,28 @@ def _render_function_block(
     comment_prefix: str,
     *,
     max_preview_lines: int = 4,
+    prefer_snippet_header: bool = True,
 ) -> list[str]:
     signature_line = signature.strip()
     snippet_lines = [line.rstrip() for line in snippet.splitlines() if line.strip()]
     if not snippet_lines:
         return [signature_line]
 
-    header_line = signature_line or snippet_lines[0].strip()
+    snippet_header = snippet_lines[0].strip()
+    if prefer_snippet_header and snippet_header and not _is_raw_symbol_text(snippet_header):
+        header_line = snippet_header
+        remaining_lines = snippet_lines[1:]
+    else:
+        header_line = signature_line or snippet_header
+        if snippet_lines and snippet_lines[0].strip() == header_line:
+            remaining_lines = snippet_lines[1:]
+        else:
+            remaining_lines = snippet_lines
     rows = [header_line]
 
     preview_budget = max(0, max_preview_lines - 1)
-    remaining_lines: list[str] = []
-    if len(snippet_lines) > 1:
-        remaining_lines = snippet_lines[1:]
-    elif snippet_lines[0].strip() != header_line:
-        remaining_lines = [snippet_lines[0]]
-
     rows.extend(remaining_lines[:preview_budget])
-    skipped = max(0, len(snippet_lines) - len(rows))
+    skipped = max(0, len(remaining_lines) - preview_budget)
     if skipped > 0:
         rows.append(f"{comment_prefix} skipped {skipped} rows")
     return rows
@@ -389,6 +393,7 @@ def format_groups(
                         signature=pretty_signature,
                         snippet=snippet,
                         comment_prefix=comment_prefix,
+                        prefer_snippet_header=not kind.startswith("Artifact"),
                     )
                 )
             lines.append("")
@@ -573,6 +578,7 @@ def _symbol_declaration_block(
                 signature=pretty_signature,
                 snippet=snippet,
                 comment_prefix=comment_prefix,
+                prefer_snippet_header=not kind.startswith("Artifact"),
             )
         )
     return lines
@@ -585,7 +591,7 @@ def format_search_symbols_codegraph(
     groups: list[FileGroup],
     *,
     max_results: int = 10,
-    max_chars: int = 4_000,
+    max_chars: int = 0,
 ) -> str:
     symbol_rows = storage.get_symbol_rows(project_id)
     symbol_map: dict[str, RankedSymbol] = {}
@@ -604,10 +610,8 @@ def format_search_symbols_codegraph(
         row = symbol_rows.get(symbol.symbol_id)
         kind = str(row["kind"]) if row is not None else symbol.kind
         relative_path = str(row["relative_path"]) if row is not None else symbol.relative_path
-        start_line = int(row["start_line"]) if row is not None else 0
         qualified = _qualified_display_name(symbol.symbol_id, symbol.display_name, symbol_rows)
-        location = f"{relative_path}:{start_line}" if start_line > 0 else relative_path
-        lines.append(f"// {qualified}  ({kind})  {location}  score={symbol.score:.4f}")
+        lines.append(f"// {qualified}  ({kind})  {relative_path}")
         include_members = kind in {"Class", "Struct", "Interface", "Trait", "Enum", "TypeAlias"}
         lines.extend(
             _symbol_declaration_block(
@@ -628,7 +632,7 @@ def format_important_symbols_codegraph(
     rows: list,
     *,
     metric: str = "pagerank",
-    max_chars: int = 4_000,
+    max_chars: int = 0,
 ) -> str:
     symbol_rows = storage.get_symbol_rows(project_id)
     lines = [f"// Top {len(rows)} symbols by {metric}", ""]
@@ -645,9 +649,7 @@ def format_important_symbols_codegraph(
             snippet=str(row["snippet"]),
         )
         qualified = _qualified_display_name(symbol_id, symbol.display_name, symbol_rows)
-        start_line = int(row["start_line"])
-        location = f"{symbol.relative_path}:{start_line}" if start_line > 0 else symbol.relative_path
-        lines.append(f"// #{index}  {qualified}  score={float(row['global_rank']):.4f}  {location}")
+        lines.append(f"// #{index}  {qualified}  ({symbol.kind})  {symbol.relative_path}")
         include_members = symbol.kind in {"Class", "Struct", "Interface", "Trait", "Enum", "TypeAlias"}
         lines.extend(
             _symbol_declaration_block(

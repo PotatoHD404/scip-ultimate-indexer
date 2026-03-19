@@ -62,10 +62,8 @@ def test_query_project_stays_connected_and_returns_compact_output(fixture_projec
                 assert second.content
                 assert first.content[0].type == "text"
                 assert second.content[0].type == "text"
-                assert len(first.content[0].text) <= 4_000
-                assert len(second.content[0].text) <= 4_000
                 assert "// Search: greeting service" in first.content[0].text
-                assert "score=" in first.content[0].text
+                assert "score=" not in first.content[0].text
                 assert any(path.name == "index.sqlite3" for path in (cache_dir / "indexes").rglob("index.sqlite3"))
 
                 listed = await session.call_tool(
@@ -85,7 +83,7 @@ def test_query_project_stays_connected_and_returns_compact_output(fixture_projec
                 )
                 assert top.isError is False
                 assert top.content
-                assert "score=" in top.content[0].text
+                assert "score=" not in top.content[0].text
 
                 overview = await session.call_tool(
                     "get_project_overview",

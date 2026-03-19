@@ -196,7 +196,7 @@ def build_mcp(
             query,
             groups,
             max_results=count,
-            max_chars=4_000,
+            max_chars=0,
         )
 
     @server.tool()
@@ -214,7 +214,7 @@ def build_mcp(
             indexer.project_id,
             rows,
             metric=metric,
-            max_chars=4_000,
+            max_chars=0,
         )
 
     @server.tool()

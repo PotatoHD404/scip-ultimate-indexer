@@ -74,7 +74,7 @@
     const nodes = new vis.DataSet({{ nodes_json | safe }});
     const edges = new vis.DataSet({{ edges_json | safe }});
     const container = document.getElementById("network");
-    new vis.Network(container, { nodes, edges }, {
+    const network = new vis.Network(container, { nodes, edges }, {
       nodes: {
         shape: "dot",
         size: 18,
@@ -83,20 +83,24 @@
       },
       edges: {
         arrows: "to",
-        smooth: { type: "dynamic" },
+        smooth: false,
         color: { color: "#64748b", highlight: "#818cf8" },
         font: { color: "#cbd5e1", size: 10 }
       },
       physics: {
-        solver: "forceAtlas2Based",
-        forceAtlas2Based: {
-          gravitationalConstant: -60,
-          centralGravity: 0.01,
-          springLength: 160,
-          springConstant: 0.08
+        solver: "barnesHut",
+        barnesHut: {
+          gravitationalConstant: -4200,
+          centralGravity: 0.06,
+          springLength: 120,
+          springConstant: 0.04,
+          damping: 0.15
         },
-        stabilization: { iterations: 160 }
+        stabilization: { iterations: 90, fit: true }
       }
+    });
+    network.once("stabilizationIterationsDone", () => {
+      network.setOptions({ physics: false });
     });
   </script>
 </body>

@@ -15,6 +15,8 @@ from .storage import Storage
 DEPENDENCY_EDGE_TYPES = {
     "calls",
     "imports",
+    "implements",
+    "inherits",
     "references",
     "type",
     "uses",
@@ -268,11 +270,14 @@ class QueryEngine:
             if parent is None:
                 return current_id
             parent_kind = str(parent["kind"])
-            if parent_kind in {"File", "Module", "Section", "Unknown"}:
-                return current_id
-            if kind == "Method" and parent_kind == "Interface":
+            if kind in {"ArtifactConfig", "ArtifactSection"} and parent_kind == "Artifact":
                 current_id = enclosing_symbol_id
                 continue
+            if kind == "Method" and parent_kind in {"Interface", "Struct", "Class", "TypeAlias", "Trait", "Enum"}:
+                current_id = enclosing_symbol_id
+                continue
+            if parent_kind in {"File", "Module", "Section", "Unknown"}:
+                return current_id
             if kind not in {"Field", "Parameter", "Variable"}:
                 return current_id
             current_id = enclosing_symbol_id
@@ -351,7 +356,7 @@ class QueryEngine:
             semantic = semantic_scores.get(symbol_id, 0.0)
             lexical = lexical_scores.get(symbol_id, 0.0)
             ppr = normalized_ppr_scores.get(symbol_id, 0.0)
-            score = semantic * 0.50 + lexical * 0.15 + ppr * 0.35
+            score = semantic * 0.50 + lexical * 0.10 + ppr * 0.40
             score = apply_kind_boost(row, score)
             if score > 0:
                 candidates[symbol_id] = score

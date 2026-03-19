@@ -347,6 +347,27 @@ def parse_scip_index(
                     weight=edge_weights["contains"],
                 )
             )
+            for relationship in info.relationships:
+                related_symbol = _normalize_symbol_id(relative_path, relationship.symbol)
+                if related_symbol not in declared_symbol_ids:
+                    continue
+                if bool(relationship.is_implementation):
+                    relation_type = "implements"
+                elif bool(relationship.is_type_definition):
+                    relation_type = "inherits"
+                elif bool(relationship.is_reference):
+                    relation_type = "references"
+                else:
+                    continue
+                edges.append(
+                    EdgeRecord(
+                        project_id=project_id,
+                        source_symbol_id=record.symbol_id,
+                        target_symbol_id=related_symbol,
+                        edge_type=relation_type,
+                        weight=edge_weights.get(relation_type, edge_weights.get("uses", 0.5)),
+                    )
+                )
 
     seen_edges: set[tuple[str, str, str]] = {(edge.source_symbol_id, edge.target_symbol_id, edge.edge_type) for edge in edges}
 

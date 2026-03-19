@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ultimate_indexer.formatter import _qualified_display_name
+from ultimate_indexer.formatter import _qualified_display_name, _render_function_block
 
 
 def test_qualified_display_name_keeps_module_context() -> None:
@@ -46,3 +46,13 @@ def test_qualified_display_name_falls_back_to_scip_symbol_when_parent_missing() 
     qualified = _qualified_display_name(symbol_id, "Validate", symbol_rows)
     assert qualified != "Validate"
     assert qualified.endswith("Table.Validate")
+
+
+def test_render_function_block_uses_snippet_header_without_duplicate_signature() -> None:
+    rows = _render_function_block(
+        signature="func (*AccumulationProcess).Audience() *Audience",
+        snippet="func (a *AccumulationProcess) Audience() *Audience {\n    return a.audience\n}",
+        comment_prefix="//",
+    )
+    assert rows[0] == "func (a *AccumulationProcess) Audience() *Audience {"
+    assert all("(*AccumulationProcess).Audience" not in row for row in rows[1:])

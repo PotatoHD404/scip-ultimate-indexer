@@ -310,3 +310,43 @@ def test_parse_scip_index_reference_source_prefers_function_over_local_on_tied_r
         and edge.edge_type == "calls"
         for edge in parsed.edges
     )
+
+
+def test_parse_scip_index_emits_implementation_relationship_edges(tmp_path: Path) -> None:
+    index = scip_pb2.Index()
+    document = index.documents.add()
+    document.language = "go"
+    document.relative_path = "service.go"
+    document.text = "package demo\n"
+
+    interface_symbol = "scip-go gomod demo `service`/Reader#"
+    implementation_symbol = "scip-go gomod demo `service`/DBReader#"
+
+    interface_info = document.symbols.add()
+    interface_info.symbol = interface_symbol
+    interface_info.display_name = "Reader"
+    interface_info.kind = scip_pb2.SymbolInformation.Interface
+
+    implementation_info = document.symbols.add()
+    implementation_info.symbol = implementation_symbol
+    implementation_info.display_name = "DBReader"
+    implementation_info.kind = scip_pb2.SymbolInformation.Struct
+    relationship = implementation_info.relationships.add()
+    relationship.symbol = interface_symbol
+    relationship.is_implementation = True
+
+    index_path = tmp_path / "fixture.scip"
+    index_path.write_bytes(index.SerializeToString())
+
+    parsed = parse_scip_index(
+        project_id=str(tmp_path),
+        project_root=tmp_path,
+        index_path=index_path,
+    )
+
+    assert any(
+        edge.source_symbol_id == implementation_symbol
+        and edge.target_symbol_id == interface_symbol
+        and edge.edge_type == "implements"
+        for edge in parsed.edges
+    )

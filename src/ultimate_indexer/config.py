@@ -13,6 +13,9 @@ DEFAULT_EDGE_WEIGHTS = {
     "uses": 0.75,
     "type": 1.15,
     "imports": 0.45,
+    "references": 0.70,
+    "implements": 0.95,
+    "inherits": 0.90,
 }
 
 

@@ -308,6 +308,121 @@ def test_query_renders_go_interface_members_inside_interface_block(tmp_path: Pat
         indexer.close()
 
 
+def test_query_collapses_method_hits_to_parent_struct(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+
+    source = project / "models" / "entity.go"
+    source.parent.mkdir()
+    source.write_text(
+        "package models\n\ntype Entity struct{}\n\nfunc (e *Entity) Audience() string { return \"\" }\n",
+        encoding="utf-8",
+    )
+
+    indexer = UltimateIndexer(project, embedding_backend="hash")
+    try:
+        project_id = indexer.project_id
+        relative_path = "models/entity.go"
+        file_symbol_id = f"file::{relative_path}"
+        type_symbol_id = "scip-go gomod example `models`/Entity#"
+        method_symbol_id = "scip-go gomod example `models`/Entity#Audience()."
+
+        indexer.storage.replace_project_contents(
+            project_id,
+            files=[
+                FileRecord(
+                    project_id=project_id,
+                    relative_path=relative_path,
+                    abs_path=str(source),
+                    language="go",
+                    content_hash="file-hash",
+                    content=source.read_text(encoding="utf-8"),
+                )
+            ],
+            symbols=[
+                SymbolRecord(
+                    project_id=project_id,
+                    symbol_id=file_symbol_id,
+                    scip_symbol=file_symbol_id,
+                    display_name="entity.go",
+                    kind="File",
+                    relative_path=relative_path,
+                    start_line=1,
+                    end_line=5,
+                    signature=relative_path,
+                    docstring="",
+                    snippet=source.read_text(encoding="utf-8"),
+                ),
+                SymbolRecord(
+                    project_id=project_id,
+                    symbol_id=type_symbol_id,
+                    scip_symbol=type_symbol_id,
+                    display_name="Entity",
+                    kind="Struct",
+                    relative_path=relative_path,
+                    start_line=3,
+                    end_line=3,
+                    signature="type Entity struct{}",
+                    docstring="type Entity struct",
+                    snippet="type Entity struct{}",
+                    enclosing_symbol_id=file_symbol_id,
+                ),
+                SymbolRecord(
+                    project_id=project_id,
+                    symbol_id=method_symbol_id,
+                    scip_symbol=method_symbol_id,
+                    display_name="Audience",
+                    kind="Method",
+                    relative_path=relative_path,
+                    start_line=5,
+                    end_line=5,
+                    signature="func (e *Entity) Audience() string",
+                    docstring="func (e *Entity) Audience() string",
+                    snippet='func (e *Entity) Audience() string { return "" }',
+                    enclosing_symbol_id=type_symbol_id,
+                ),
+            ],
+            edges=[],
+            chunks=[
+                ChunkRecord(
+                    project_id=project_id,
+                    chunk_id="method-chunk",
+                    relative_path=relative_path,
+                    symbol_id=method_symbol_id,
+                    symbol_name="Audience",
+                    artifact_name=None,
+                    chunk_kind="symbol",
+                    start_line=5,
+                    end_line=5,
+                    content="entity audience",
+                    content_hash="method-chunk-hash",
+                )
+            ],
+        )
+        indexer.storage.upsert_project(project_id, project_id, "sig")
+
+        engine = QueryEngine(indexer.storage, HashEmbeddingProvider())
+        indexer.storage.search_bm25 = lambda project_id, query, limit: [  # type: ignore[method-assign]
+            QueryChunkHit(
+                chunk_id="method-chunk",
+                relative_path=relative_path,
+                symbol_id=method_symbol_id,
+                symbol_name="Audience",
+                score=1.0,
+                content="entity audience",
+                start_line=5,
+                end_line=5,
+            )
+        ]
+        engine._dense_hits = lambda project_id, query, limit: []  # type: ignore[method-assign]
+
+        groups = engine.search(project_id, "entity audience", limit=5)
+        assert groups
+        assert groups[0].symbols[0].display_name == "Entity"
+    finally:
+        indexer.close()
+
+
 def test_query_renders_go_type_with_raw_signature_without_variable_noise(tmp_path: Path) -> None:
     project = tmp_path / "project"
     project.mkdir()

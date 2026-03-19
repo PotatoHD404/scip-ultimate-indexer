@@ -78,22 +78,48 @@ def write_query_visualization(
     groups: list[FileGroup],
     output_path: Path,
     title: str,
+    *,
+    max_nodes: int = 180,
 ) -> Path:
     symbol_rows = storage.get_symbol_rows(project_id)
     all_edges = storage.get_edges(project_id)
     selected_ids: set[str] = set()
+    core_ids: set[str] = set()
     for group in groups:
         for symbol in group.symbols[:3]:
             selected_ids.add(symbol.symbol_id)
+            core_ids.add(symbol.symbol_id)
             row = symbol_rows.get(symbol.symbol_id)
             if row and row["enclosing_symbol_id"]:
-                selected_ids.add(str(row["enclosing_symbol_id"]))
+                parent_id = str(row["enclosing_symbol_id"])
+                selected_ids.add(parent_id)
+                core_ids.add(parent_id)
     for edge in all_edges:
         source = str(edge["source_symbol_id"])
         target = str(edge["target_symbol_id"])
         if source in selected_ids or target in selected_ids:
             selected_ids.add(source)
             selected_ids.add(target)
+
+    if max_nodes > 0 and len(selected_ids) > max_nodes:
+        def _rank_value(symbol_id: str) -> float:
+            row = symbol_rows.get(symbol_id)
+            if row is None:
+                return 0.0
+            try:
+                return float(row["global_rank"])
+            except Exception:
+                return 0.0
+
+        ranked_ids = sorted(
+            selected_ids,
+            key=lambda symbol_id: (
+                symbol_id not in core_ids,
+                -_rank_value(symbol_id),
+                symbol_id,
+            ),
+        )
+        selected_ids = set(ranked_ids[:max_nodes])
 
     nodes = []
     for symbol_id in sorted(selected_ids):
