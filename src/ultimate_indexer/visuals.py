@@ -63,7 +63,7 @@ def generate_visualization_html(
     if dropped_edge_count > 0:
         notices.append(f"{dropped_edge_count} edges trimmed for browser performance.")
     if performance_mode:
-        notices.append("Performance mode enabled: simplified styling and chunked rendering are active.")
+        notices.append("Performance mode enabled: canvas force layout and lighter rendering are active.")
     return template.render(
         title=title,
         description=description,

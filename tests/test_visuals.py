@@ -115,6 +115,7 @@ def test_write_query_visualization_enables_performance_mode_for_large_graphs(tmp
     )
     html = output_path.read_text(encoding="utf-8")
     assert "Performance mode enabled" in html
+    assert "force-graph" in html
     assert "pkg/large.py::fn0" in html
     assert "pkg/large.py::fn1304" not in html
 
