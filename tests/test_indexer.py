@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import ultimate_indexer.indexer as indexer_module
 from ultimate_indexer.formatter import format_groups, format_top_symbols
 from ultimate_indexer.indexer import UltimateIndexer
 from ultimate_indexer.models import EdgeRecord, FileRecord, IndexProgress, SymbolRecord
@@ -81,6 +82,64 @@ def test_index_reports_progress(fixture_project: Path, monkeypatch) -> None:
         assert any(event.stage == "embed" and event.total > 0 for event in events)
         assert any(event.stage == "embed" and event.detail == "Loading embedding model" for event in events)
         assert events[-1].stage == "pagerank"
+    finally:
+        indexer.close()
+
+
+def test_reindex_only_reembeds_changed_chunks(fixture_project: Path, monkeypatch) -> None:
+    monkeypatch.setenv("ULTIMATE_INDEXER_EMBEDDING_BACKEND", "hash")
+    scip_path = _python_scip_path(fixture_project)
+    indexer = UltimateIndexer(fixture_project)
+    generate_calls: list[int] = []
+    original_generate_embeddings = indexer_module.generate_embeddings
+
+    def capture_generate_embeddings(provider, texts, on_batch_complete=None, batch_size=32, sleep_fn=None):
+        generate_calls.append(len(texts))
+        if sleep_fn is None:
+            from time import sleep as sleep_fn_value
+        else:
+            sleep_fn_value = sleep_fn
+        return original_generate_embeddings(
+            provider,
+            texts,
+            on_batch_complete=on_batch_complete,
+            batch_size=batch_size,
+            sleep_fn=sleep_fn_value,
+        )
+
+    monkeypatch.setattr("ultimate_indexer.indexer.generate_embeddings", capture_generate_embeddings)
+    try:
+        indexer.index(scip_path=scip_path, force=True)
+        first_embed_count = sum(generate_calls)
+        assert first_embed_count > 0
+
+        before_rows = indexer.storage.connection.execute(
+            "SELECT chunk_id, content_hash FROM chunks WHERE project_id = ?",
+            (indexer.project_id,),
+        ).fetchall()
+        before_hashes = {str(row["chunk_id"]): str(row["content_hash"]) for row in before_rows}
+
+        target = fixture_project / "pkg" / "services.py"
+        original = target.read_text(encoding="utf-8")
+        target.write_text(original.replace("Hello", "Greetings"), encoding="utf-8")
+
+        generate_calls.clear()
+        indexer.index(scip_path=_python_scip_path(fixture_project), force=True)
+        second_embed_count = sum(generate_calls)
+
+        after_rows = indexer.storage.connection.execute(
+            "SELECT chunk_id, content_hash FROM chunks WHERE project_id = ?",
+            (indexer.project_id,),
+        ).fetchall()
+        changed_chunk_count = sum(
+            1
+            for row in after_rows
+            if before_hashes.get(str(row["chunk_id"])) != str(row["content_hash"])
+        )
+
+        assert changed_chunk_count > 0
+        assert second_embed_count == changed_chunk_count
+        assert second_embed_count < first_embed_count
     finally:
         indexer.close()
 

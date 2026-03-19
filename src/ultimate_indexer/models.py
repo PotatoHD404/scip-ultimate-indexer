@@ -56,6 +56,7 @@ class ChunkRecord:
     content_hash: str
     embedding: bytes | None = None
     embedding_dim: int = 0
+    embedding_model_id: str = ""
 
 
 @dataclass(slots=True)

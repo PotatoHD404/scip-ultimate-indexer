@@ -91,6 +91,7 @@ class Storage:
                 content_hash TEXT NOT NULL,
                 embedding BLOB,
                 embedding_dim INTEGER NOT NULL DEFAULT 0,
+                embedding_model_id TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (project_id, chunk_id)
             );
 
@@ -126,6 +127,14 @@ class Storage:
             CREATE INDEX IF NOT EXISTS idx_chunks_symbol ON chunks(project_id, symbol_id);
             """
         )
+        chunk_columns = {
+            str(row["name"])
+            for row in self.connection.execute("PRAGMA table_info(chunks)").fetchall()
+        }
+        if "embedding_model_id" not in chunk_columns:
+            self.connection.execute(
+                "ALTER TABLE chunks ADD COLUMN embedding_model_id TEXT NOT NULL DEFAULT ''"
+            )
         self.connection.commit()
 
     def upsert_project(self, project_id: str, root_path: str, signature: str) -> None:
@@ -256,8 +265,9 @@ class Storage:
                     """
                     INSERT INTO chunks(
                         project_id, chunk_id, relative_path, symbol_id, symbol_name, artifact_name,
-                        chunk_kind, start_line, end_line, content, content_hash, embedding, embedding_dim
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        chunk_kind, start_line, end_line, content, content_hash, embedding, embedding_dim,
+                        embedding_model_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         chunk.project_id,
@@ -273,6 +283,7 @@ class Storage:
                         chunk.content_hash,
                         chunk.embedding,
                         chunk.embedding_dim,
+                        chunk.embedding_model_id,
                     ),
                 )
                 self.connection.execute(
@@ -344,6 +355,17 @@ class Storage:
         if not vectors:
             return np.zeros((0, 0), dtype=np.float32), rows
         return np.vstack(vectors), rows
+
+    def get_chunk_embeddings(self, project_id: str) -> dict[str, sqlite3.Row]:
+        rows = self.connection.execute(
+            """
+            SELECT chunk_id, content_hash, embedding, embedding_dim, embedding_model_id
+            FROM chunks
+            WHERE project_id = ? AND embedding IS NOT NULL
+            """,
+            (project_id,),
+        ).fetchall()
+        return {str(row["chunk_id"]): row for row in rows}
 
     def search_bm25(self, project_id: str, query: str, limit: int) -> list[QueryChunkHit]:
         tokens = [token for token in query.replace("/", " ").replace(".", " ").split() if token]

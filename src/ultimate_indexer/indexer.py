@@ -249,28 +249,42 @@ class UltimateIndexer:
         chunks: list[ChunkRecord],
         progress_callback: Callable[[IndexProgress], None] | None = None,
     ) -> list[ChunkRecord]:
-        self._emit_progress(
-            progress_callback,
-            stage="embed",
-            completed=0,
-            total=1,
-            unit="model",
-            detail="Loading embedding model",
-        )
         provider = self._provider_instance()
+        existing_chunk_embeddings = self.storage.get_chunk_embeddings(self.project_id)
         pending_indices: list[int] = []
         pending_texts: list[str] = []
         cached_count = 0
         for index, chunk in enumerate(chunks):
+            existing = existing_chunk_embeddings.get(chunk.chunk_id)
+            if (
+                existing is not None
+                and str(existing["content_hash"]) == chunk.content_hash
+                and str(existing["embedding_model_id"]) == provider.model_id
+            ):
+                chunk.embedding = bytes(existing["embedding"])
+                chunk.embedding_dim = int(existing["embedding_dim"])
+                chunk.embedding_model_id = provider.model_id
+                cached_count += 1
+                continue
             embedding_text = _provider_prepare_document_text(provider, chunk.content, chunk.relative_path)
             cached = self.storage.get_or_create_embedding(provider.model_id, embedding_text)
             if cached is not None:
                 chunk.embedding = cached.astype("float32").tobytes()
                 chunk.embedding_dim = int(cached.shape[0])
+                chunk.embedding_model_id = provider.model_id
                 cached_count += 1
                 continue
             pending_indices.append(index)
             pending_texts.append(embedding_text)
+        if pending_texts:
+            self._emit_progress(
+                progress_callback,
+                stage="embed",
+                completed=0,
+                total=1,
+                unit="model",
+                detail="Loading embedding model",
+            )
         self._emit_progress(
             progress_callback,
             stage="embed",
@@ -298,6 +312,7 @@ class UltimateIndexer:
                 self.storage.store_embedding(provider.model_id, embedding_text, vector)
                 chunk.embedding = vector.astype("float32").tobytes()
                 chunk.embedding_dim = int(vector.shape[0])
+                chunk.embedding_model_id = provider.model_id
         self._emit_progress(
             progress_callback,
             stage="embed",
