@@ -56,4 +56,16 @@ def test_query_project_stays_connected_and_returns_compact_output(fixture_projec
                 assert len(first.content[0].text) <= 4_000
                 assert len(second.content[0].text) <= 4_000
 
+                top = await session.call_tool(
+                    "top_project_symbols",
+                    {
+                        "project_path": str(fixture_project),
+                        "limit": 5,
+                        "embedding_backend": "hash",
+                    },
+                )
+                assert top.isError is False
+                assert top.content
+                assert "score=" not in top.content[0].text
+
     anyio.run(exercise_mcp)

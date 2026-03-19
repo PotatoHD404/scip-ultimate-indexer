@@ -150,5 +150,6 @@ def test_query_collapses_field_hits_to_parent_struct_and_formats_cleanly(tmp_pat
         assert "Name string" in rendered
         assert '"""' not in rendered
         assert "scip-go gomod" not in rendered
+        assert "interface omitted" not in rendered
     finally:
         indexer.close()

@@ -7,7 +7,6 @@ from .storage import Storage
 
 
 CLASS_LIKE_KINDS = {"Class", "Struct", "Interface", "Trait", "Enum"}
-COMPOSITE_TYPE_MARKERS = ("struct", "interface", "enum")
 
 
 def _comment_prefix(relative_path: str) -> str:
@@ -78,8 +77,24 @@ def _pretty_signature(kind: str, display_name: str, signature: str, docstring: s
 def _is_composite_symbol(kind: str, signature: str, docstring: str, snippet: str) -> bool:
     if kind in CLASS_LIKE_KINDS:
         return True
-    joined = " ".join(part.lower() for part in (signature, docstring, snippet) if part)
-    return any(marker in joined for marker in COMPOSITE_TYPE_MARKERS)
+    first_line = _first_doc_or_signature_line(docstring, signature).lower()
+    if first_line.startswith(("type ", "class ", "interface ", "enum ")):
+        return True
+    snippet_line = next((line.strip().lower() for line in snippet.splitlines() if line.strip()), "")
+    return snippet_line.startswith(("type ", "class ", "interface ", "enum "))
+
+
+def _render_composite_snippet(signature: str, snippet: str, comment_prefix: str) -> list[str]:
+    snippet_lines = [line.rstrip() for line in snippet.splitlines() if line.strip()]
+    if not snippet_lines:
+        return [signature.strip()]
+    first_line = signature.strip() or snippet_lines[0].strip()
+    remaining_lines = snippet_lines[1:] if snippet_lines and snippet_lines[0].strip() == first_line else snippet_lines[1:]
+    rows = [first_line]
+    rows.extend(remaining_lines)
+    if len(rows) == 1:
+        rows.append(f"    {comment_prefix} definition omitted")
+    return rows
 
 
 def _render_function_block(signature: str, snippet: str, comment_prefix: str) -> list[str]:
@@ -97,23 +112,25 @@ def _render_class_interface(
     symbol_id: str,
     signature: str,
     comment_prefix: str,
+    snippet: str,
 ) -> list[str]:
+    snippet_lines = [line.rstrip() for line in snippet.splitlines() if line.strip()]
+    if len(snippet_lines) > 1:
+        return _render_composite_snippet(signature, snippet, comment_prefix)
+
     rows = [signature.strip()]
     children = storage.get_symbol_children(project_id, symbol_id)
-    if children:
-        for child in children:
-            child_signature = _pretty_signature(
-                kind=str(child["kind"]),
-                display_name=str(child["display_name"]),
-                signature=str(child["signature"]),
-                docstring=str(child["docstring"]),
-                snippet=str(child["snippet"]),
-            ).strip()
-            if not child_signature:
-                continue
-            rows.append(f"    {child_signature}")
-    else:
-        rows.append(f"    {comment_prefix} interface omitted")
+    for child in children:
+        child_signature = _pretty_signature(
+            kind=str(child["kind"]),
+            display_name=str(child["display_name"]),
+            signature=str(child["signature"]),
+            docstring=str(child["docstring"]),
+            snippet=str(child["snippet"]),
+        ).strip()
+        if not child_signature:
+            continue
+        rows.append(f"    {child_signature}")
     return rows
 
 
@@ -152,6 +169,7 @@ def format_groups(
                         symbol_id=symbol.symbol_id,
                         signature=pretty_signature,
                         comment_prefix=comment_prefix,
+                        snippet=snippet,
                     )
                 )
             else:
@@ -196,10 +214,11 @@ def format_groups_compact(
     return truncate_text(text, max_chars)
 
 
-def format_top_symbols(rows: list) -> str:
+def format_top_symbols(rows: list, *, include_scores: bool = True) -> str:
     lines = []
     for index, row in enumerate(rows, start=1):
-        lines.append(
-            f"{index}. {row['display_name']} [{row['kind']}] {row['relative_path']} score={float(row['global_rank']):.5f}"
-        )
+        line = f"{index}. {row['display_name']} [{row['kind']}] {row['relative_path']}"
+        if include_scores:
+            line += f" score={float(row['global_rank']):.5f}"
+        lines.append(line)
     return "\n".join(lines)
