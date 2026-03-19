@@ -10,7 +10,6 @@ from mcp.server.fastmcp import FastMCP
 from .formatter import (
     format_important_symbols_codegraph,
     format_search_symbols_codegraph,
-    truncate_text,
 )
 from .indexer import UltimateIndexer
 
@@ -224,7 +223,7 @@ def build_mcp(
         embedding_backend: str = "auto",
     ) -> str:
         indexer = get_indexer(project, embedding_backend)
-        return truncate_text(indexer.project_overview(max_per_kind=max_per_kind), 8_000)
+        return indexer.project_overview(max_per_kind=max_per_kind)
 
     @server.tool()
     def get_stats(

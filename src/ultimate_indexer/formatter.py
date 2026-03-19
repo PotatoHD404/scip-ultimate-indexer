@@ -403,13 +403,9 @@ def format_groups(
 
 
 def truncate_text(text: str, max_chars: int, *, note_prefix: str = "//") -> str:
-    if max_chars <= 0 or len(text) <= max_chars:
-        return text
-    suffix = f"\n\n{note_prefix} output truncated for MCP"
-    available = max_chars - len(suffix)
-    if available <= 0:
-        return text[:max_chars]
-    return f"{text[:available].rstrip()}{suffix}"
+    _ = max_chars
+    _ = note_prefix
+    return text
 
 
 def format_groups_compact(
