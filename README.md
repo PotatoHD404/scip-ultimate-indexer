@@ -23,6 +23,8 @@ poetry run ultimate-indexer mcp
 
 The MCP server also exposes a scored project tree view that ranks files and folders by usefulness using indexed symbol ranks plus lightweight structural fallbacks.
 
+Its MCP tool names now align with the graph-indexer style as well: `list_projects`, `search_symbols`, `get_important_symbols`, `get_project_overview`, and `get_stats`, while keeping `index_project`, `visualize_project`, and `scored_project_tree` as extra helpers. The `mcp` command also accepts graph-indexer-style flags such as `--cache-dir`, `--embedding-model`, `--embedding-n-ctx`, `--transport`, `--host`, and `--port`.
+
 ## Embeddings
 
 The runtime now defaults to the local GGUF model path used by `graph-indexer`.

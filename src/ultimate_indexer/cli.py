@@ -148,5 +148,19 @@ def visualize(
 
 
 @app.command()
-def mcp() -> None:
-    run_mcp()
+def mcp(
+    transport: str = typer.Option("stdio", "--transport"),
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: int = typer.Option(8000, "--port"),
+    cache_dir: Path = typer.Option(Path(".scip_indexes"), "--cache-dir"),
+    embedding_model: str = typer.Option("models/coderankembed-q8_0.gguf", "--embedding-model"),
+    embedding_n_ctx: int = typer.Option(2048, "--embedding-n-ctx"),
+) -> None:
+    run_mcp(
+        transport=transport,
+        host=host,
+        port=port,
+        cache_dir=cache_dir,
+        embedding_model=embedding_model,
+        embedding_n_ctx=embedding_n_ctx,
+    )

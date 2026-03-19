@@ -6,3 +6,7 @@ __pycache__/
 .coverage
 .ultimate_indexer/
 tests/.tmp/
+
+graph-indexer/
+
+tests/fixtures/sample_project/.scip_indexes-registry-debug/

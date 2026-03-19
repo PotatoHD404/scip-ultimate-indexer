@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import os
+from collections import Counter, defaultdict
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable
+
+import networkx as nx
 
 from .constants import MAX_FILE_BYTES, SPECIAL_FILES, is_indexable_filename
 from .config import Settings
@@ -269,6 +272,10 @@ def _normalize_tree_scores(node: TreeScoreNode, root_score: float) -> None:
         node.score = (node.raw_score / root_score) * 100.0
     for child in node.children:
         _normalize_tree_scores(child, root_score)
+
+
+def _normalized_kind(kind: str) -> str:
+    return kind.replace("_", "").replace("-", "").lower()
 
 
 class UltimateIndexer:
@@ -684,6 +691,144 @@ class UltimateIndexer:
 
     def top_symbols(self, limit: int = 10):
         return self.storage.get_top_symbols(self.project_id, limit)
+
+    def important_symbols(
+        self,
+        *,
+        limit: int = 20,
+        metric: str = "pagerank",
+        kind_filter: str | None = None,
+    ):
+        symbol_rows = self.storage.get_symbol_rows(self.project_id)
+        normalized_filter = _normalized_kind(kind_filter) if kind_filter else None
+
+        def _fallback_positive_rows():
+            rows = [
+                row
+                for row in symbol_rows.values()
+                if str(row["kind"]) not in {"File", "Module", "Unknown"}
+                and float(row["global_rank"]) > 0
+                and (
+                    normalized_filter is None
+                    or _normalized_kind(str(row["kind"])) == normalized_filter
+                )
+            ]
+            rows.sort(key=lambda row: (-float(row["global_rank"]), str(row["display_name"])))
+            return rows[:limit]
+
+        rankable_rows = {
+            symbol_id: row
+            for symbol_id, row in symbol_rows.items()
+            if is_rankable_symbol(str(row["relative_path"]), str(row["kind"]))
+        }
+        if normalized_filter:
+            rankable_rows = {
+                symbol_id: row
+                for symbol_id, row in rankable_rows.items()
+                if _normalized_kind(str(row["kind"])) == normalized_filter
+            }
+        if not rankable_rows:
+            return _fallback_positive_rows()
+
+        if metric == "pagerank":
+            rows = [
+                row
+                for row in rankable_rows.values()
+                if float(row["global_rank"]) > 0
+            ]
+            rows.sort(key=lambda row: (-float(row["global_rank"]), str(row["display_name"])))
+            if rows:
+                return rows[:limit]
+            return _fallback_positive_rows()
+
+        graph = nx.DiGraph()
+        for symbol_id in rankable_rows:
+            graph.add_node(symbol_id)
+        for edge in self.storage.get_edges(self.project_id):
+            source = str(edge["source_symbol_id"])
+            target = str(edge["target_symbol_id"])
+            if source in rankable_rows and target in rankable_rows:
+                graph.add_edge(source, target, weight=float(edge["weight"]))
+
+        if metric == "betweenness":
+            raw_scores = nx.betweenness_centrality(graph) if graph.number_of_nodes() else {}
+        elif metric == "in_degree":
+            raw_scores = {node: float(score) for node, score in graph.in_degree()}
+        elif metric == "out_degree":
+            raw_scores = {node: float(score) for node, score in graph.out_degree()}
+        else:
+            raw_scores = {symbol_id: float(row["global_rank"]) for symbol_id, row in rankable_rows.items()}
+
+        ranked_ids = sorted(raw_scores, key=lambda symbol_id: (-raw_scores[symbol_id], str(rankable_rows[symbol_id]["display_name"])))
+        rows = [rankable_rows[symbol_id] for symbol_id in ranked_ids[:limit] if raw_scores[symbol_id] > 0]
+        if rows:
+            return rows
+        return _fallback_positive_rows()
+
+    def project_overview(self, *, max_per_kind: int = 15) -> str:
+        symbol_rows = self.storage.get_symbol_rows(self.project_id)
+        rankable_rows = [
+            row
+            for row in symbol_rows.values()
+            if is_rankable_symbol(str(row["relative_path"]), str(row["kind"]))
+            and float(row["global_rank"]) > 0
+        ]
+        rankable_rows.sort(key=lambda row: (-float(row["global_rank"]), str(row["display_name"])))
+        buckets = {
+            "Interfaces": {"interface"},
+            "Structs and Classes": {"struct", "class", "trait", "typealias", "type"},
+            "Functions and Methods": {"function", "method"},
+            "Constants and Values": {"constant", "const", "property"},
+        }
+        lines = [f"Project overview for {self.settings.project_root}"]
+        used_ids: set[str] = set()
+        for title, kinds in buckets.items():
+            lines.append("")
+            lines.append(f"{title}:")
+            count = 0
+            for row in rankable_rows:
+                symbol_id = str(row["symbol_id"])
+                if symbol_id in used_ids:
+                    continue
+                if _normalized_kind(str(row["kind"])) not in kinds:
+                    continue
+                used_ids.add(symbol_id)
+                count += 1
+                lines.append(
+                    f"- {row['display_name']} [{row['kind']}] {row['relative_path']} score={float(row['global_rank']):.5f}"
+                )
+                if count >= max_per_kind:
+                    break
+            if count == 0:
+                lines.append("- none")
+        return "\n".join(lines)
+
+    def project_stats(self) -> str:
+        files = list(self.storage.get_file_hashes(self.project_id).keys())
+        symbols = self.storage.get_symbol_rows(self.project_id)
+        edges = self.storage.get_edges(self.project_id)
+        chunks = self.storage.load_chunk_vectors(self.project_id)[1]
+        kind_counts = Counter(str(row["kind"]) for row in symbols.values())
+        folder_counts: dict[str, int] = defaultdict(int)
+        for relative_path in files:
+            parent = PurePosixPath(relative_path).parent.as_posix()
+            folder_counts["." if parent == "." else parent] += 1
+        lines = [
+            f"Project: {self.settings.project_root}",
+            f"Files: {len(files)}",
+            f"Symbols: {len(symbols)}",
+            f"Edges: {len(edges)}",
+            f"Embedded chunks: {len(chunks)}",
+            "",
+            "Top symbol kinds:",
+        ]
+        for kind, count in kind_counts.most_common(10):
+            lines.append(f"- {kind}: {count}")
+        lines.append("")
+        lines.append("Top folders by file count:")
+        for folder, count in sorted(folder_counts.items(), key=lambda item: (-item[1], item[0]))[:10]:
+            lines.append(f"- {folder}: {count}")
+        return "\n".join(lines)
 
     def scored_tree(self, *, max_chars: int | None = 12_000) -> str:
         rows = self.storage.get_tree_score_rows(self.project_id)

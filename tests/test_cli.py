@@ -38,3 +38,12 @@ def test_cli_end_to_end(fixture_project: Path, monkeypatch) -> None:
     )
     assert top_result.exit_code == 0, top_result.stdout
     assert "GreetingService" in top_result.stdout or "build_greeting" in top_result.stdout
+
+
+def test_mcp_command_exposes_graph_indexer_compatible_flags() -> None:
+    result = runner.invoke(app, ["mcp", "--help"])
+    assert result.exit_code == 0
+    assert "--cache-dir" in result.stdout
+    assert "--embedding-model" in result.stdout
+    assert "--embedding-n-ctx" in result.stdout
+    assert "--transport" in result.stdout
