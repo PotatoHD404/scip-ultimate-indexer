@@ -117,3 +117,39 @@ def test_write_query_visualization_enables_performance_mode_for_large_graphs(tmp
     assert "Performance mode enabled" in html
     assert "pkg/large.py::fn0" in html
     assert "pkg/large.py::fn1304" not in html
+
+
+def test_write_query_visualization_does_not_trim_by_default(tmp_path: Path) -> None:
+    node_count = 250
+    symbol_rows: dict[str, dict] = {}
+    edges = []
+    for index in range(node_count):
+        symbol_id = f"s{index}"
+        symbol_rows[symbol_id] = {
+            "kind": "Function",
+            "relative_path": "pkg/full.py",
+            "display_name": f"fn{index}",
+            "enclosing_symbol_id": None,
+            "global_rank": float(node_count - index),
+        }
+        if index > 0:
+            edges.append(
+                {
+                    "source_symbol_id": f"s{index - 1}",
+                    "target_symbol_id": symbol_id,
+                    "edge_type": "calls",
+                }
+            )
+
+    output_path = tmp_path / "query_graph.html"
+    write_query_visualization(
+        storage=_FakeStorage(symbol_rows, edges),
+        project_id="project",
+        groups=[_seed_group("s0", relative_path="pkg/full.py")],
+        output_path=output_path,
+        title="Full Graph",
+    )
+    html = output_path.read_text(encoding="utf-8")
+    assert "Nodes: 250" in html
+    assert "Edges: 249" in html
+    assert "trimmed for browser performance" not in html

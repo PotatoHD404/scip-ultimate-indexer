@@ -154,9 +154,9 @@ def write_query_visualization(
     max_edges: int | None = None,
 ) -> Path:
     if max_nodes is None:
-        max_nodes = _env_int("ULTIMATE_INDEXER_VISUAL_MAX_NODES", 180)
+        max_nodes = _env_int("ULTIMATE_INDEXER_VISUAL_MAX_NODES", 0)
     if max_edges is None:
-        max_edges = _env_int("ULTIMATE_INDEXER_VISUAL_MAX_EDGES", 2400)
+        max_edges = _env_int("ULTIMATE_INDEXER_VISUAL_MAX_EDGES", 0)
     perf_node_threshold = _env_int("ULTIMATE_INDEXER_VISUAL_PERF_NODES", 1200)
     perf_edge_threshold = _env_int("ULTIMATE_INDEXER_VISUAL_PERF_EDGES", 3000)
     label_budget = _env_int("ULTIMATE_INDEXER_VISUAL_LABEL_BUDGET", 300)
