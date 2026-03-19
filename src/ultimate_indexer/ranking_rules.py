@@ -6,17 +6,23 @@ from pathlib import PurePosixPath
 
 NON_RANKABLE_KINDS = {
     "Artifact",
+    "Field",
     "File",
     "Kind",
     "Module",
+    "Parameter",
     "Section",
     "Unknown",
+    "Variable",
 }
 NON_QUERYABLE_KINDS = {
+    "Field",
     "File",
     "Kind",
     "Module",
+    "Parameter",
     "Unknown",
+    "Variable",
 }
 GENERATED_SUFFIXES = (
     ".pb.go",

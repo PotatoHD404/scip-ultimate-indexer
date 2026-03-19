@@ -7,6 +7,7 @@ from .storage import Storage
 
 
 CLASS_LIKE_KINDS = {"Class", "Struct", "Interface", "Trait", "Enum"}
+COMPOSITE_TYPE_MARKERS = ("struct", "interface", "enum")
 
 
 def _comment_prefix(relative_path: str) -> str:
@@ -17,10 +18,68 @@ def _comment_prefix(relative_path: str) -> str:
     return "//"
 
 
-def _render_docstring(docstring: str) -> list[str]:
+def _meaningful_doc_lines(docstring: str) -> list[str]:
     if not docstring.strip():
         return []
-    return ['"""', docstring.strip(), '"""']
+    lines: list[str] = []
+    in_fence = False
+    for raw_line in docstring.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        lowered = line.lower()
+        if lowered.startswith(("function ", "func ", "method ", "type ", "class ", "interface ", "enum ")):
+            continue
+        if lowered.startswith(("struct field ", "(property) ", "(parameter) ", "var ", "let ", "const ")):
+            continue
+        lines.append(line)
+    return lines
+
+
+def _render_docstring(docstring: str, comment_prefix: str) -> list[str]:
+    lines = _meaningful_doc_lines(docstring)
+    if not lines:
+        return []
+    return [f"{comment_prefix} {line}" for line in lines]
+
+
+def _first_doc_or_signature_line(docstring: str, signature: str) -> str:
+    for source in (docstring, signature):
+        for raw_line in source.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("```"):
+                continue
+            return line
+    return ""
+
+
+def _pretty_signature(kind: str, display_name: str, signature: str, docstring: str, snippet: str) -> str:
+    first_line = _first_doc_or_signature_line(docstring, signature)
+    lowered = first_line.lower()
+    if lowered.startswith("struct field "):
+        return first_line[len("struct field ") :].strip()
+    if lowered.startswith("(property) "):
+        return first_line[len("(property) ") :].strip()
+    if lowered.startswith("(parameter) "):
+        return first_line[len("(parameter) ") :].strip()
+    if first_line and not first_line.startswith(("scip-", "local ")):
+        return first_line
+    snippet_line = next((line.strip() for line in snippet.splitlines() if line.strip()), "")
+    if snippet_line:
+        return snippet_line
+    return display_name or signature
+
+
+def _is_composite_symbol(kind: str, signature: str, docstring: str, snippet: str) -> bool:
+    if kind in CLASS_LIKE_KINDS:
+        return True
+    joined = " ".join(part.lower() for part in (signature, docstring, snippet) if part)
+    return any(marker in joined for marker in COMPOSITE_TYPE_MARKERS)
 
 
 def _render_function_block(signature: str, snippet: str, comment_prefix: str) -> list[str]:
@@ -43,7 +102,13 @@ def _render_class_interface(
     children = storage.get_symbol_children(project_id, symbol_id)
     if children:
         for child in children:
-            child_signature = str(child["signature"]).strip()
+            child_signature = _pretty_signature(
+                kind=str(child["kind"]),
+                display_name=str(child["display_name"]),
+                signature=str(child["signature"]),
+                docstring=str(child["docstring"]),
+                snippet=str(child["snippet"]),
+            ).strip()
             if not child_signature:
                 continue
             rows.append(f"    {child_signature}")
@@ -59,6 +124,7 @@ def format_groups(
     max_symbols_per_file: int = 3,
 ) -> str:
     lines: list[str] = []
+    symbol_rows = storage.get_symbol_rows(project_id)
     for group in groups:
         comment_prefix = _comment_prefix(group.relative_path)
         lines.append(f"// {group.relative_path}")
@@ -70,22 +136,29 @@ def format_groups(
         if not selected and group.symbols:
             selected = group.symbols[:1]
         for symbol in selected:
-            lines.extend(_render_docstring(symbol.docstring))
-            if symbol.kind in CLASS_LIKE_KINDS:
+            row = symbol_rows.get(symbol.symbol_id)
+            kind = str(row["kind"]) if row is not None else symbol.kind
+            display_name = str(row["display_name"]) if row is not None else symbol.display_name
+            signature = str(row["signature"]) if row is not None else symbol.signature
+            docstring = str(row["docstring"]) if row is not None else symbol.docstring
+            snippet = str(row["snippet"]) if row is not None else symbol.snippet
+            pretty_signature = _pretty_signature(kind, display_name, signature, docstring, snippet)
+            lines.extend(_render_docstring(docstring, comment_prefix))
+            if _is_composite_symbol(kind, signature, docstring, snippet):
                 lines.extend(
                     _render_class_interface(
                         storage=storage,
                         project_id=project_id,
                         symbol_id=symbol.symbol_id,
-                        signature=symbol.signature,
+                        signature=pretty_signature,
                         comment_prefix=comment_prefix,
                     )
                 )
             else:
                 lines.extend(
                     _render_function_block(
-                        signature=symbol.signature or symbol.display_name,
-                        snippet=symbol.snippet,
+                        signature=pretty_signature,
+                        snippet=snippet,
                         comment_prefix=comment_prefix,
                     )
                 )

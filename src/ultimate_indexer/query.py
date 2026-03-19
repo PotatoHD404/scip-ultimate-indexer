@@ -114,6 +114,27 @@ class QueryEngine:
             )
         return payload
 
+    def _canonical_symbol_id(self, symbol_rows: dict[str, object], symbol_id: str) -> str:
+        current_id = symbol_id
+        seen: set[str] = set()
+        while current_id not in seen:
+            seen.add(current_id)
+            row = symbol_rows.get(current_id)
+            if row is None:
+                return current_id
+            kind = str(row["kind"])
+            enclosing_symbol_id = str(row["enclosing_symbol_id"] or "")
+            if kind not in {"Field", "Parameter", "Variable"} or not enclosing_symbol_id:
+                return current_id
+            parent = symbol_rows.get(enclosing_symbol_id)
+            if parent is None:
+                return current_id
+            parent_kind = str(parent["kind"])
+            if parent_kind in {"File", "Module", "Section", "Unknown"}:
+                return current_id
+            current_id = enclosing_symbol_id
+        return symbol_id
+
     def search(self, project_id: str, query: str, limit: int = 10) -> list[FileGroup]:
         signature = self.storage.get_project_signature(project_id) or ""
         query_hash = sha256(f"{signature}:{self.provider.model_id}:{query}:{limit}".encode("utf-8")).hexdigest()
@@ -128,25 +149,33 @@ class QueryEngine:
             if is_queryable_symbol(str(row["relative_path"]), str(row["kind"]))
         }
 
-        bm25_hits = [
-            hit
-            for hit in self.storage.search_bm25(project_id, query, max(limit * 5, 20))
-            if hit.symbol_id in rankable_symbol_ids
-        ]
-        dense_hits = [
-            hit
-            for hit in self._dense_hits(project_id, query, max(limit * 5, 20))
-            if hit.symbol_id in rankable_symbol_ids
-        ]
+        canonical_bm25_hits: list[tuple[QueryChunkHit, str]] = []
+        for hit in self.storage.search_bm25(project_id, query, max(limit * 5, 20)):
+            canonical_symbol_id = self._canonical_symbol_id(symbol_rows, hit.symbol_id)
+            if canonical_symbol_id in rankable_symbol_ids:
+                canonical_bm25_hits.append((hit, canonical_symbol_id))
+
+        canonical_dense_hits: list[tuple[QueryChunkHit, str]] = []
+        for hit in self._dense_hits(project_id, query, max(limit * 5, 20)):
+            canonical_symbol_id = self._canonical_symbol_id(symbol_rows, hit.symbol_id)
+            if canonical_symbol_id in rankable_symbol_ids:
+                canonical_dense_hits.append((hit, canonical_symbol_id))
+
+        bm25_hits = [hit for hit, _ in canonical_bm25_hits]
+        dense_hits = [hit for hit, _ in canonical_dense_hits]
         fused = _rrf_scores(bm25_hits) | {}
         for chunk_id, value in _rrf_scores(dense_hits).items():
             fused[chunk_id] = fused.get(chunk_id, 0.0) + value
 
         chunk_by_id = {item.chunk_id: item for item in [*bm25_hits, *dense_hits]}
+        canonical_symbol_by_chunk_id = {
+            hit.chunk_id: canonical_symbol_id
+            for hit, canonical_symbol_id in [*canonical_bm25_hits, *canonical_dense_hits]
+        }
         seed_scores: dict[str, float] = defaultdict(float)
         for chunk_id, score in fused.items():
             chunk = chunk_by_id[chunk_id]
-            seed_scores[chunk.symbol_id] += score
+            seed_scores[canonical_symbol_by_chunk_id.get(chunk_id, chunk.symbol_id)] += score
 
         personalization_total = sum(seed_scores.values())
         personalization = None
