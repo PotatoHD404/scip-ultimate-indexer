@@ -49,6 +49,7 @@ def test_query_collapses_field_hits_to_parent_struct_and_formats_cleanly(tmp_pat
         file_symbol_id = f"file::{relative_path}"
         table_symbol_id = "scip-go gomod example `models`/Table#"
         field_symbol_id = "scip-go gomod example `models`/Table#Name."
+        columns_symbol_id = "scip-go gomod example `models`/Table#Columns."
         method_symbol_id = "scip-go gomod example `models`/Table#Validate()."
 
         indexer.storage.replace_project_contents(
@@ -88,7 +89,7 @@ def test_query_collapses_field_hits_to_parent_struct_and_formats_cleanly(tmp_pat
                     end_line=6,
                     signature=table_symbol_id,
                     docstring="type Table struct\nTable represents a database table.",
-                    snippet="type Table struct {\n    Name string\n    Columns []Column\n}",
+                    snippet="type Table struct",
                     enclosing_symbol_id=file_symbol_id,
                 ),
                 SymbolRecord(
@@ -103,6 +104,20 @@ def test_query_collapses_field_hits_to_parent_struct_and_formats_cleanly(tmp_pat
                     signature=field_symbol_id,
                     docstring="struct field Name string",
                     snippet="    Name string `json:\"name\"`",
+                    enclosing_symbol_id=table_symbol_id,
+                ),
+                SymbolRecord(
+                    project_id=project_id,
+                    symbol_id=columns_symbol_id,
+                    scip_symbol=columns_symbol_id,
+                    display_name="Columns",
+                    kind="Field",
+                    relative_path=relative_path,
+                    start_line=5,
+                    end_line=5,
+                    signature=columns_symbol_id,
+                    docstring="struct field Columns []Column",
+                    snippet="    Columns []Column `json:\"columns\"`",
                     enclosing_symbol_id=table_symbol_id,
                 ),
                 SymbolRecord(
@@ -161,12 +176,285 @@ def test_query_collapses_field_hits_to_parent_struct_and_formats_cleanly(tmp_pat
         rendered = format_groups(indexer.storage, project_id, groups)
         assert "// models/query.go" in rendered
         assert "// Table represents a database table." in rendered
-        assert "type Table struct" in rendered
-        assert "Name string" in rendered
-        assert "func (t *Table) Validate() error" in rendered
+        assert "type Table struct {" in rendered
+        assert "    Name string" in rendered
+        assert "    Columns []Column" in rendered
+        assert "\n\nfunc (t *Table) Validate() error" in rendered
+        assert "    return nil" in rendered
         assert '"""' not in rendered
         assert "scip-go gomod" not in rendered
         assert "interface omitted" not in rendered
+    finally:
+        indexer.close()
+
+
+def test_query_renders_go_interface_members_inside_interface_block(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+
+    source = project / "models" / "reader.go"
+    source.parent.mkdir()
+    source.write_text(
+        "package models\n\ntype Reader interface {\n    Read(ctx context.Context, key string) error\n}\n",
+        encoding="utf-8",
+    )
+
+    indexer = UltimateIndexer(project, embedding_backend="hash")
+    try:
+        project_id = indexer.project_id
+        relative_path = "models/reader.go"
+        file_symbol_id = f"file::{relative_path}"
+        interface_symbol_id = "scip-go gomod example `models`/Reader#"
+        method_symbol_id = "scip-go gomod example `models`/Reader#Read()."
+
+        indexer.storage.replace_project_contents(
+            project_id,
+            files=[
+                FileRecord(
+                    project_id=project_id,
+                    relative_path=relative_path,
+                    abs_path=str(source),
+                    language="go",
+                    content_hash="file-hash",
+                    content=source.read_text(encoding="utf-8"),
+                )
+            ],
+            symbols=[
+                SymbolRecord(
+                    project_id=project_id,
+                    symbol_id=file_symbol_id,
+                    scip_symbol=file_symbol_id,
+                    display_name="reader.go",
+                    kind="File",
+                    relative_path=relative_path,
+                    start_line=1,
+                    end_line=5,
+                    signature=relative_path,
+                    docstring="",
+                    snippet=source.read_text(encoding="utf-8"),
+                ),
+                SymbolRecord(
+                    project_id=project_id,
+                    symbol_id=interface_symbol_id,
+                    scip_symbol=interface_symbol_id,
+                    display_name="Reader",
+                    kind="Interface",
+                    relative_path=relative_path,
+                    start_line=3,
+                    end_line=5,
+                    signature=interface_symbol_id,
+                    docstring="type Reader interface",
+                    snippet="type Reader interface",
+                    enclosing_symbol_id=file_symbol_id,
+                ),
+                SymbolRecord(
+                    project_id=project_id,
+                    symbol_id=method_symbol_id,
+                    scip_symbol=method_symbol_id,
+                    display_name="Read",
+                    kind="Method",
+                    relative_path=relative_path,
+                    start_line=4,
+                    end_line=4,
+                    signature="Read(ctx context.Context, key string) error",
+                    docstring="func (Reader).Read(ctx context.Context, key string) error",
+                    snippet="Read(ctx context.Context, key string) error",
+                    enclosing_symbol_id=interface_symbol_id,
+                ),
+            ],
+            edges=[],
+            chunks=[
+                ChunkRecord(
+                    project_id=project_id,
+                    chunk_id="interface-chunk",
+                    relative_path=relative_path,
+                    symbol_id=method_symbol_id,
+                    symbol_name="Read",
+                    artifact_name=None,
+                    chunk_kind="symbol",
+                    start_line=4,
+                    end_line=4,
+                    content="reader interface read context key",
+                    content_hash="interface-chunk-hash",
+                )
+            ],
+        )
+        indexer.storage.upsert_project(project_id, project_id, "sig")
+
+        engine = QueryEngine(indexer.storage, HashEmbeddingProvider())
+        indexer.storage.search_bm25 = lambda project_id, query, limit: [  # type: ignore[method-assign]
+            QueryChunkHit(
+                chunk_id="interface-chunk",
+                relative_path=relative_path,
+                symbol_id=method_symbol_id,
+                symbol_name="Read",
+                score=1.0,
+                content="reader interface read context key",
+                start_line=4,
+                end_line=4,
+            )
+        ]
+        engine._dense_hits = lambda project_id, query, limit: []  # type: ignore[method-assign]
+
+        groups = engine.search(project_id, "reader read context", limit=5)
+        assert groups
+        assert groups[0].symbols[0].display_name == "Reader"
+
+        rendered = format_groups(indexer.storage, project_id, groups)
+        assert "type Reader interface {" in rendered
+        assert "    Read(ctx context.Context, key string) error" in rendered
+        assert "\n\nfunc " not in rendered
+    finally:
+        indexer.close()
+
+
+def test_query_renders_go_type_with_raw_signature_without_variable_noise(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+
+    source = project / "internal" / "api" / "rest" / "dto" / "audience" / "v2" / "update.go"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "package v2\n\n// UpdateStaticParametersReq is a dto for update static parameters.\ntype UpdateStaticParametersReq struct {\n    Name string\n    Value string\n}\n\nfunc (UpdateStaticParametersReq) Validate() error {\n    return nil\n}\n",
+        encoding="utf-8",
+    )
+
+    indexer = UltimateIndexer(project, embedding_backend="hash")
+    try:
+        project_id = indexer.project_id
+        relative_path = "internal/api/rest/dto/audience/v2/update.go"
+        file_symbol_id = f"file::{relative_path}"
+        type_symbol_id = "scip-go gomod example `internal/api/rest/dto/audience/v2`/UpdateStaticParametersReq#"
+        method_symbol_id = "scip-go gomod example `internal/api/rest/dto/audience/v2`/UpdateStaticParametersReq#Validate()."
+        field_symbol_id = "scip-go gomod example `internal/api/rest/dto/audience/v2`/UpdateStaticParametersReq#Name."
+        variable_symbol_id = "local::internal/api/rest/dto/audience/v2/update.go::local 3"
+
+        indexer.storage.replace_project_contents(
+            project_id,
+            files=[
+                FileRecord(
+                    project_id=project_id,
+                    relative_path=relative_path,
+                    abs_path=str(source),
+                    language="go",
+                    content_hash="file-hash",
+                    content=source.read_text(encoding="utf-8"),
+                )
+            ],
+            symbols=[
+                SymbolRecord(
+                    project_id=project_id,
+                    symbol_id=file_symbol_id,
+                    scip_symbol=file_symbol_id,
+                    display_name="update.go",
+                    kind="File",
+                    relative_path=relative_path,
+                    start_line=1,
+                    end_line=10,
+                    signature=relative_path,
+                    docstring="",
+                    snippet=source.read_text(encoding="utf-8"),
+                ),
+                SymbolRecord(
+                    project_id=project_id,
+                    symbol_id=type_symbol_id,
+                    scip_symbol=type_symbol_id,
+                    display_name="UpdateStaticParametersReq",
+                    kind="TypeAlias",
+                    relative_path=relative_path,
+                    start_line=4,
+                    end_line=7,
+                    signature=type_symbol_id,
+                    docstring="UpdateStaticParametersReq is a dto for update static parameters.",
+                    snippet="UpdateStaticParametersReq is a dto for update static parameters.",
+                    enclosing_symbol_id=file_symbol_id,
+                ),
+                SymbolRecord(
+                    project_id=project_id,
+                    symbol_id=field_symbol_id,
+                    scip_symbol=field_symbol_id,
+                    display_name="Name",
+                    kind="Field",
+                    relative_path=relative_path,
+                    start_line=5,
+                    end_line=5,
+                    signature=field_symbol_id,
+                    docstring="struct field Name string",
+                    snippet="    Name string",
+                    enclosing_symbol_id=type_symbol_id,
+                ),
+                SymbolRecord(
+                    project_id=project_id,
+                    symbol_id=method_symbol_id,
+                    scip_symbol=method_symbol_id,
+                    display_name="Validate",
+                    kind="Method",
+                    relative_path=relative_path,
+                    start_line=8,
+                    end_line=10,
+                    signature="func (UpdateStaticParametersReq) Validate() error",
+                    docstring="func (UpdateStaticParametersReq).Validate() error",
+                    snippet="func (UpdateStaticParametersReq) Validate() error {\n    return nil\n}",
+                    enclosing_symbol_id=type_symbol_id,
+                ),
+                SymbolRecord(
+                    project_id=project_id,
+                    symbol_id=variable_symbol_id,
+                    scip_symbol="local 3",
+                    display_name="sp",
+                    kind="Variable",
+                    relative_path=relative_path,
+                    start_line=8,
+                    end_line=8,
+                    signature="local 3",
+                    docstring="var sp gitlab.tcsbank.ru/t-segments/bff/internal/api/rest/dto/audience/v2.UpdateStaticParametersReq",
+                    snippet="var sp UpdateStaticParametersReq",
+                    enclosing_symbol_id=type_symbol_id,
+                ),
+            ],
+            edges=[],
+            chunks=[
+                ChunkRecord(
+                    project_id=project_id,
+                    chunk_id="type-chunk",
+                    relative_path=relative_path,
+                    symbol_id=type_symbol_id,
+                    symbol_name="UpdateStaticParametersReq",
+                    artifact_name=None,
+                    chunk_kind="symbol",
+                    start_line=4,
+                    end_line=7,
+                    content="update static parameters validate dto",
+                    content_hash="type-chunk-hash",
+                )
+            ],
+        )
+        indexer.storage.upsert_project(project_id, project_id, "sig")
+
+        engine = QueryEngine(indexer.storage, HashEmbeddingProvider())
+        indexer.storage.search_bm25 = lambda project_id, query, limit: [  # type: ignore[method-assign]
+            QueryChunkHit(
+                chunk_id="type-chunk",
+                relative_path=relative_path,
+                symbol_id=type_symbol_id,
+                symbol_name="UpdateStaticParametersReq",
+                score=1.0,
+                content="update static parameters validate dto",
+                start_line=4,
+                end_line=7,
+            )
+        ]
+        engine._dense_hits = lambda project_id, query, limit: []  # type: ignore[method-assign]
+
+        groups = engine.search(project_id, "update static parameters validate", limit=5)
+        assert groups
+        rendered = format_groups(indexer.storage, project_id, groups)
+        assert rendered.count("// UpdateStaticParametersReq is a dto for update static parameters.") == 1
+        assert "type UpdateStaticParametersReq struct {" in rendered
+        assert "    Name string" in rendered
+        assert "func (UpdateStaticParametersReq) Validate() error" in rendered
+        assert "var sp " not in rendered
+        assert "gitlab.tcsbank.ru/t-segments" not in rendered
     finally:
         indexer.close()
 
@@ -285,7 +573,9 @@ def test_query_collapses_local_variable_hit_to_function_and_shows_skipped_lines(
 
         rendered = format_groups(indexer.storage, project_id, groups)
         assert "func getOnlineSegment(id int64) (*segment, error)" in rendered
-        assert "// skipped 5 rows" in rendered
-        assert "var err error" not in rendered
+        assert "    var err error" in rendered
+        assert "    value := id + 1" in rendered
+        assert "// skipped 2 rows" in rendered
+        assert "\nvar err error\n" not in rendered
     finally:
         indexer.close()

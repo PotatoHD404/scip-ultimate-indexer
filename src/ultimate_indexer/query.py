@@ -124,13 +124,18 @@ class QueryEngine:
                 return current_id
             kind = str(row["kind"])
             enclosing_symbol_id = str(row["enclosing_symbol_id"] or "")
-            if kind not in {"Field", "Parameter", "Variable"} or not enclosing_symbol_id:
+            if not enclosing_symbol_id:
                 return current_id
             parent = symbol_rows.get(enclosing_symbol_id)
             if parent is None:
                 return current_id
             parent_kind = str(parent["kind"])
             if parent_kind in {"File", "Module", "Section", "Unknown"}:
+                return current_id
+            if kind == "Method" and parent_kind == "Interface":
+                current_id = enclosing_symbol_id
+                continue
+            if kind not in {"Field", "Parameter", "Variable"}:
                 return current_id
             current_id = enclosing_symbol_id
         return symbol_id
