@@ -22,7 +22,7 @@ def test_query_survives_embedding_backend_mismatch(fixture_project: Path, monkey
     finally:
         first.close()
 
-    second = UltimateIndexer(fixture_project, embedding_backend="llama-cpp")
+    second = UltimateIndexer(fixture_project, embedding_backend="auto")
     try:
         # Reuse the existing hash-built index and ensure the query path does not crash
         groups = second.query("greeting service", limit=5)

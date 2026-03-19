@@ -68,4 +68,19 @@ def test_query_project_stays_connected_and_returns_compact_output(fixture_projec
                 assert top.content
                 assert "score=" not in top.content[0].text
 
+                tree = await session.call_tool(
+                    "scored_project_tree",
+                    {
+                        "project_path": str(fixture_project),
+                        "embedding_backend": "hash",
+                    },
+                )
+                assert tree.isError is False
+                assert tree.content
+                assert "Project tree scored by usefulness." in tree.content[0].text
+                assert "sample_project/" in tree.content[0].text
+                assert "pkg/" in tree.content[0].text
+                assert "docs/" in tree.content[0].text
+                assert "app.py" in tree.content[0].text
+
     anyio.run(exercise_mcp)

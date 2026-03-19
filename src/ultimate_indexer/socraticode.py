@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .embeddings import hash_text
 from .models import ArtifactSpec, ChunkRecord, EdgeRecord, FileRecord, SymbolRecord
+from .structured_artifacts import extract_structured_artifact_views
 
 
 CONFIG_FILENAME = ".socraticodecontextartifacts.json"
@@ -180,6 +181,70 @@ def ingest_socraticode_artifacts(project_id: str, project_root: Path) -> Artifac
                 content_hash=hash_text(overview),
             )
         )
+        structured_views = extract_structured_artifact_views(relative_path, content)
+        for index, view in enumerate(structured_views, start=1):
+            view_symbol_id = f"artifact-item::{spec.name}::{relative_path}::{index}"
+            symbol_summary = "\n".join(
+                part
+                for part in [
+                    spec.description,
+                    view.summary,
+                ]
+                if part
+            )
+            symbols.append(
+                SymbolRecord(
+                    project_id=project_id,
+                    symbol_id=view_symbol_id,
+                    scip_symbol=view_symbol_id,
+                    display_name=view.label,
+                    kind=view.kind,
+                    relative_path=relative_path,
+                    start_line=view.start_line,
+                    end_line=view.end_line,
+                    signature=view.label,
+                    docstring=symbol_summary,
+                    snippet=view.rendered,
+                    enclosing_symbol_id=artifact_symbol_id,
+                    source_kind="artifact",
+                )
+            )
+            edges.append(
+                EdgeRecord(
+                    project_id=project_id,
+                    source_symbol_id=artifact_symbol_id,
+                    target_symbol_id=view_symbol_id,
+                    edge_type="contains",
+                    weight=0.55,
+                )
+            )
+            chunk_text = "\n".join(
+                part
+                for part in [
+                    f"artifact: {spec.name}",
+                    f"file: {relative_path}",
+                    f"label: {view.label}",
+                    f"summary: {view.summary}" if view.summary else "",
+                    f"attribution: {spec.description}" if spec.description else "",
+                    view.rendered,
+                ]
+                if part
+            )
+            chunks.append(
+                ChunkRecord(
+                    project_id=project_id,
+                    chunk_id=sha256(f"{relative_path}:structured:{index}".encode("utf-8")).hexdigest()[:32],
+                    relative_path=relative_path,
+                    symbol_id=view_symbol_id,
+                    symbol_name=view.label,
+                    artifact_name=spec.name,
+                    chunk_kind="artifact-structured",
+                    start_line=view.start_line,
+                    end_line=view.end_line,
+                    content=chunk_text,
+                    content_hash=hash_text(chunk_text),
+                )
+            )
         for index, (start, end, chunk_text) in enumerate(_line_chunks(content), start=1):
             if not chunk_text:
                 continue

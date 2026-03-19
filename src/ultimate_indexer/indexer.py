@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from hashlib import sha256
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable
 
 from .constants import MAX_FILE_BYTES, SPECIAL_FILES, is_indexable_filename
@@ -12,13 +12,12 @@ from .embeddings import (
     generate_embeddings,
     _provider_prepare_document_text,
     resolve_llama_cpp_provider,
-    resolve_sentence_transformer_provider,
 )
 from .fallback import build_fallback_bundle
+from .formatter import _pretty_signature, format_scored_tree
 from .ignore_rules import create_ignore_matcher
-from .models import ChunkRecord, EdgeRecord, FileRecord, IndexProgress, IndexSummary, SymbolRecord
-from .pagerank import weighted_pagerank
-from .query import QueryEngine
+from .models import ChunkRecord, EdgeRecord, FileRecord, IndexProgress, IndexSummary, SymbolRecord, TreeScoreNode
+from .query import QueryEngine, apply_kind_boost, dependency_ordered_pagerank
 from .ranking_rules import is_rankable_symbol
 from .scip_parser import ParsedScip, parse_scip_index
 from .scip_runner import ScipRunFailure, StructuredIndexingRequiredError, run_scip_indexers
@@ -37,7 +36,7 @@ INDEX_STAGES = (
     "store",
     "pagerank",
 )
-INDEX_FORMAT_VERSION = 4
+INDEX_FORMAT_VERSION = 5
 
 
 def _discover_code_files(project_root: Path, extra_extensions: set[str]) -> list[Path]:
@@ -75,8 +74,7 @@ def _project_signature(
     code_files: list[Path],
     project_root: Path,
     embedding_backend: str,
-    model_repo_id: str,
-    llama_model_repo_id: str,
+    model_path: str | None,
     model_filename: str,
     extra_extensions: set[str],
     max_chunk_lines: int,
@@ -88,8 +86,7 @@ def _project_signature(
         payload.append(f"{relative}:{path.stat().st_mtime_ns}:{path.stat().st_size}")
     payload.append(f"embedding-backend:{embedding_backend}")
     payload.append(f"index-format-version:{INDEX_FORMAT_VERSION}")
-    payload.append(f"model-repo:{model_repo_id}")
-    payload.append(f"llama-model-repo:{llama_model_repo_id}")
+    payload.append(f"model-path:{model_path or ''}")
     payload.append(f"model-file:{model_filename}")
     payload.append(f"extra-extensions:{','.join(sorted(extra_extensions))}")
     payload.append(f"respect-gitignore:{os.getenv('RESPECT_GITIGNORE', 'true')}")
@@ -169,6 +166,111 @@ def _dedupe_parsed_scip(parsed: ParsedScip) -> ParsedScip:
     )
 
 
+def _first_meaningful_line(text: str) -> str:
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if line and not line.startswith("```"):
+            return line
+    return ""
+
+
+def _summarize_text(text: str, limit: int = 240) -> str:
+    compact = " ".join(part.strip() for part in text.splitlines() if part.strip())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3].rstrip() + "..."
+
+
+def _symbol_heading(
+    symbol: SymbolRecord,
+    symbol_lookup: dict[str, SymbolRecord],
+) -> str:
+    enclosing_display = ""
+    if symbol.enclosing_symbol_id:
+        parent = symbol_lookup.get(symbol.enclosing_symbol_id)
+        if parent is not None and parent.kind not in {"File", "Module"}:
+            enclosing_display = parent.display_name
+    if enclosing_display:
+        return f"{symbol.kind.lower()}: {enclosing_display}.{symbol.display_name}"
+    return f"{symbol.kind.lower()}: {symbol.display_name}"
+
+
+def _child_lines(
+    symbol: SymbolRecord,
+    child_symbols: list[SymbolRecord],
+) -> list[str]:
+    if not child_symbols:
+        return []
+    lines: list[str] = []
+    for child in child_symbols[:30]:
+        signature = _pretty_signature(
+            kind=child.kind,
+            display_name=child.display_name,
+            signature=child.signature,
+            docstring=child.docstring,
+            snippet=child.snippet,
+        ).strip()
+        if not signature:
+            continue
+        line = f"  {signature}"
+        summary = _summarize_text(_first_meaningful_line(child.docstring), limit=100)
+        if summary and summary != signature:
+            line += f"  // {summary}"
+        lines.append(line)
+    if len(child_symbols) > 30:
+        lines.append(f"  ... and {len(child_symbols) - 30} more")
+    return lines
+
+
+def _symbol_chunk_content(
+    symbol: SymbolRecord,
+    *,
+    symbol_lookup: dict[str, SymbolRecord],
+    children_by_symbol_id: dict[str, list[SymbolRecord]],
+) -> str:
+    pretty_signature = _pretty_signature(
+        kind=symbol.kind,
+        display_name=symbol.display_name,
+        signature=symbol.signature,
+        docstring=symbol.docstring,
+        snippet=symbol.snippet,
+    ).strip()
+    parts = [
+        _symbol_heading(symbol, symbol_lookup),
+        f"file: {symbol.relative_path}",
+    ]
+    if pretty_signature:
+        parts.append(f"signature:\n{pretty_signature}")
+    summary = _summarize_text(symbol.docstring, limit=500)
+    if summary:
+        parts.append(f"documentation: {summary}")
+    child_lines = _child_lines(symbol, children_by_symbol_id.get(symbol.symbol_id, []))
+    if child_lines:
+        label = "fields and methods" if symbol.kind in {"Class", "Struct", "Interface", "TypeAlias", "Enum", "Trait"} else "members"
+        parts.append(f"{label}:\n" + "\n".join(child_lines))
+    if symbol.snippet.strip():
+        snippet = symbol.snippet.strip()
+        if len(snippet) > 800:
+            snippet = snippet[:800].rstrip() + "\n..."
+        parts.append(f"code:\n{snippet}")
+    return "\n".join(part for part in parts if part)
+
+
+def _file_usefulness_score(rank_sum: float, rank_max: float, useful_symbol_count: int, chunk_count: int) -> float:
+    symbol_bonus = 0.005 * min(max(useful_symbol_count, 0), 10)
+    chunk_bonus = 0.001 * min(max(chunk_count, 0), 10)
+    return max(0.0, rank_sum) + max(0.0, rank_max) * 0.35 + symbol_bonus + chunk_bonus
+
+
+def _normalize_tree_scores(node: TreeScoreNode, root_score: float) -> None:
+    if root_score <= 0:
+        node.score = 0.0
+    else:
+        node.score = (node.raw_score / root_score) * 100.0
+    for child in node.children:
+        _normalize_tree_scores(child, root_score)
+
+
 class UltimateIndexer:
     def __init__(self, project_root: Path, embedding_backend: str | None = None) -> None:
         self.settings = Settings(project_root=project_root)
@@ -191,31 +293,18 @@ class UltimateIndexer:
             self._provider = HashEmbeddingProvider()
             return self._provider
         try:
-            if backend in {"auto", "sentence-transformers"}:
-                self._provider = resolve_sentence_transformer_provider(
-                    model_cache_dir=self.settings.model_cache_dir,
-                    model_name=self.settings.model_repo_id,
-                )
-            else:
-                self._provider = resolve_llama_cpp_provider(
-                    model_cache_dir=self.settings.model_cache_dir,
-                    repo_id=self.settings.llama_model_repo_id,
-                    filename=self.settings.model_filename,
-                )
+            self._provider = resolve_llama_cpp_provider(
+                project_root=self.settings.project_root,
+                model_cache_dir=self.settings.model_cache_dir,
+                model_path=self.settings.model_path,
+                filename=self.settings.model_filename,
+            )
             return self._provider
         except Exception:
-            if backend in {"llama-cpp", "sentence-transformers"}:
+            if backend in {"llama-cpp", "local"}:
                 raise
-            try:
-                self._provider = resolve_llama_cpp_provider(
-                    model_cache_dir=self.settings.model_cache_dir,
-                    repo_id=self.settings.llama_model_repo_id,
-                    filename=self.settings.model_filename,
-                )
-                return self._provider
-            except Exception:
-                self._provider = HashEmbeddingProvider()
-                return self._provider
+            self._provider = HashEmbeddingProvider()
+            return self._provider
 
     def _emit_progress(
         self,
@@ -325,25 +414,24 @@ class UltimateIndexer:
 
     def _global_ranks(self) -> None:
         symbol_rows = self.storage.get_symbol_rows(self.project_id)
-        symbol_ids = [
-            symbol_id
-            for symbol_id, row in symbol_rows.items()
-            if is_rankable_symbol(str(row["relative_path"]), str(row["kind"]))
-        ]
-        if not symbol_ids:
+        if not symbol_rows:
             return
-        rankable_ids = set(symbol_ids)
-        edges = [
-            (
-                str(edge["source_symbol_id"]),
-                str(edge["target_symbol_id"]),
-                float(edge["weight"]),
-            )
-            for edge in self.storage.get_edges(self.project_id)
-            if str(edge["source_symbol_id"]) in rankable_ids and str(edge["target_symbol_id"]) in rankable_ids
-        ]
-        ranks = weighted_pagerank(nodes=symbol_ids, edges=edges, alpha=0.85)
-        self.storage.set_global_ranks(self.project_id, ranks)
+        ranks = dependency_ordered_pagerank(
+            symbol_rows,
+            self.storage.get_edges(self.project_id),
+            alpha=0.15,
+        )
+        boosted = {
+            symbol_id: apply_kind_boost(symbol_rows[symbol_id], score)
+            for symbol_id, score in ranks.items()
+            if symbol_id in symbol_rows
+        }
+        total = sum(boosted.values())
+        if total > 0:
+            boosted = {symbol_id: score / total for symbol_id, score in boosted.items()}
+        else:
+            boosted = {}
+        self.storage.set_global_ranks(self.project_id, boosted)
 
     def index(
         self,
@@ -366,8 +454,7 @@ class UltimateIndexer:
             code_files,
             self.settings.project_root,
             self.settings.embedding_backend,
-            self.settings.model_repo_id,
-            self.settings.llama_model_repo_id,
+            self.settings.model_path,
             self.settings.model_filename,
             self.settings.extra_extensions,
             self.settings.max_chunk_lines,
@@ -505,8 +592,13 @@ class UltimateIndexer:
         edges = [*parsed.edges, *fallback_bundle.edges, *artifact_bundle.edges]
 
         symbols_by_file: dict[str, list[SymbolRecord]] = {}
+        symbol_lookup: dict[str, SymbolRecord] = {}
+        children_by_symbol_id: dict[str, list[SymbolRecord]] = {}
         for symbol in symbols:
             symbols_by_file.setdefault(symbol.relative_path, []).append(symbol)
+            symbol_lookup[symbol.symbol_id] = symbol
+            if symbol.enclosing_symbol_id:
+                children_by_symbol_id.setdefault(symbol.enclosing_symbol_id, []).append(symbol)
 
         chunks: list[ChunkRecord] = [*artifact_bundle.chunks, *fallback_bundle.chunks]
         self._emit_progress(progress_callback, stage="chunks", detail="Assembling query chunks")
@@ -520,15 +612,10 @@ class UltimateIndexer:
             for symbol in file_symbols:
                 if symbol.kind in {"File", "Module", "Section"}:
                     continue
-                chunk_content = "\n".join(
-                    part
-                    for part in [
-                        symbol.relative_path,
-                        symbol.signature,
-                        symbol.docstring,
-                        symbol.snippet,
-                    ]
-                    if part
+                chunk_content = _symbol_chunk_content(
+                    symbol,
+                    symbol_lookup=symbol_lookup,
+                    children_by_symbol_id=children_by_symbol_id,
                 )
                 chunks.append(
                     ChunkRecord(
@@ -597,6 +684,67 @@ class UltimateIndexer:
 
     def top_symbols(self, limit: int = 10):
         return self.storage.get_top_symbols(self.project_id, limit)
+
+    def scored_tree(self, *, max_chars: int | None = 12_000) -> str:
+        rows = self.storage.get_tree_score_rows(self.project_id)
+        root = TreeScoreNode(
+            name=self.settings.project_root.name or str(self.settings.project_root),
+            relative_path="",
+            node_type="dir",
+            raw_score=0.0,
+        )
+        directories: dict[str, TreeScoreNode] = {"": root}
+
+        def ensure_dir(relative_path: str) -> TreeScoreNode:
+            if relative_path in directories:
+                return directories[relative_path]
+            parent_path = PurePosixPath(relative_path).parent.as_posix()
+            if parent_path == ".":
+                parent_path = ""
+            parent = ensure_dir(parent_path)
+            node = TreeScoreNode(
+                name=PurePosixPath(relative_path).name,
+                relative_path=relative_path,
+                node_type="dir",
+                raw_score=0.0,
+            )
+            parent.children.append(node)
+            directories[relative_path] = node
+            return node
+
+        for row in rows:
+            relative_path = str(row["relative_path"])
+            path = PurePosixPath(relative_path)
+            parent_path = path.parent.as_posix()
+            if parent_path == ".":
+                parent_path = ""
+            parent = ensure_dir(parent_path)
+            file_node = TreeScoreNode(
+                name=path.name,
+                relative_path=relative_path,
+                node_type="file",
+                raw_score=_file_usefulness_score(
+                    float(row["rank_sum"]),
+                    float(row["rank_max"]),
+                    int(row["useful_symbol_count"]),
+                    int(row["chunk_count"]),
+                ),
+                useful_symbol_count=int(row["useful_symbol_count"]),
+                chunk_count=int(row["chunk_count"]),
+                source_kind=str(row["source_kind"]),
+            )
+            parent.children.append(file_node)
+            current_path = parent_path
+            while True:
+                directory = ensure_dir(current_path)
+                directory.raw_score += file_node.raw_score
+                if current_path == "":
+                    break
+                next_parent = PurePosixPath(current_path).parent.as_posix()
+                current_path = "" if next_parent == "." else next_parent
+
+        _normalize_tree_scores(root, root.raw_score)
+        return format_scored_tree(root, max_chars=max_chars)
 
     def visualize(self, groups, title: str = "Ultimate Indexer Visualization") -> Path:
         output_path = self.settings.visuals_dir / "query_graph.html"

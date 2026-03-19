@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .models import FileGroup
+from .models import FileGroup, TreeScoreNode
 from .storage import Storage
 
 
@@ -432,3 +432,50 @@ def format_top_symbols(rows: list, *, include_scores: bool = True) -> str:
             line += f" score={float(row['global_rank']):.5f}"
         lines.append(line)
     return "\n".join(lines)
+
+
+def _tree_label(node: TreeScoreNode) -> str:
+    if node.node_type == "dir":
+        if node.relative_path:
+            return f"{node.name}/"
+        return f"{node.name}/"
+    details: list[str] = []
+    if node.useful_symbol_count > 0:
+        details.append(f"{node.useful_symbol_count} syms")
+    if node.source_kind != "code":
+        details.append(node.source_kind)
+    detail_text = f" ({', '.join(details)})" if details else ""
+    return f"{node.name}{detail_text}"
+
+
+def _render_tree_lines(node: TreeScoreNode, prefix: str = "", *, is_last: bool = True) -> list[str]:
+    connector = "`-- " if is_last else "|-- "
+    score_text = f"{node.score:6.2f}"
+    lines = [f"{prefix}{connector}[{score_text}] {_tree_label(node)}"]
+    child_prefix = f"{prefix}{'    ' if is_last else '|   '}"
+    sorted_children = sorted(
+        node.children,
+        key=lambda child: (child.node_type != "dir", -child.score, child.name.lower()),
+    )
+    for index, child in enumerate(sorted_children):
+        lines.extend(
+            _render_tree_lines(
+                child,
+                child_prefix,
+                is_last=index == len(sorted_children) - 1,
+            )
+        )
+    return lines
+
+
+def format_scored_tree(root: TreeScoreNode, *, max_chars: int | None = 12_000) -> str:
+    header = (
+        f"Project tree scored by usefulness.\n"
+        f"File score blends symbol rank, strongest symbol, and a small structure fallback.\n"
+        f"Directory score rolls up all descendants.\n"
+    )
+    body_lines = _render_tree_lines(root, prefix="", is_last=True)
+    text = header + "\n".join(body_lines)
+    if max_chars is None:
+        return text
+    return truncate_text(text, max_chars)

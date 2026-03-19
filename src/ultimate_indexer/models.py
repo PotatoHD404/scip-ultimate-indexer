@@ -118,3 +118,16 @@ class IndexProgress:
     total: int = 0
     unit: str = "items"
     detail: str = ""
+
+
+@dataclass(slots=True)
+class TreeScoreNode:
+    name: str
+    relative_path: str
+    node_type: str
+    raw_score: float
+    score: float = 0.0
+    useful_symbol_count: int = 0
+    chunk_count: int = 0
+    source_kind: str = "code"
+    children: list["TreeScoreNode"] = field(default_factory=list)

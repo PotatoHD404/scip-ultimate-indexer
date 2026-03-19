@@ -12,12 +12,126 @@ from .pagerank import weighted_pagerank
 from .ranking_rules import is_queryable_symbol
 from .storage import Storage
 
+DEPENDENCY_EDGE_TYPES = {
+    "calls",
+    "imports",
+    "references",
+    "type",
+    "uses",
+}
+COMPOSITIONAL_EDGE_TYPES = {
+    "contains",
+}
+KIND_BOOSTS = {
+    "struct": 1.4,
+    "interface": 1.5,
+    "class": 1.4,
+    "trait": 1.4,
+    "typealias": 1.3,
+    "enum": 1.3,
+    "type": 1.3,
+    "constant": 1.25,
+    "const": 1.25,
+    "property": 0.85,
+    "field": 0.8,
+    "variable": 0.75,
+    "function": 1.0,
+    "method": 1.0,
+}
 
-def _rrf_scores(items: list[QueryChunkHit], k: int = 60) -> dict[str, float]:
-    scores: dict[str, float] = {}
-    for rank, item in enumerate(items, start=1):
-        scores[item.chunk_id] = scores.get(item.chunk_id, 0.0) + 1.0 / (k + rank)
-    return scores
+
+def _normalize_scores(values: dict[str, float]) -> dict[str, float]:
+    if not values:
+        return {}
+    positive = {key: max(0.0, value) for key, value in values.items()}
+    max_value = max(positive.values())
+    if max_value <= 0:
+        return {key: 0.0 for key in values}
+    return {key: value / max_value for key, value in positive.items()}
+
+
+def _symbol_kind(row: object) -> str:
+    return str(row["kind"]).replace("_", "").replace("-", "").lower()
+
+
+def _is_exported_symbol(row: object) -> bool:
+    display_name = str(row["display_name"]).strip()
+    if not display_name:
+        return False
+    if display_name.startswith("_"):
+        return False
+    first = display_name[0]
+    return first.isupper()
+
+
+def apply_kind_boost(row: object, score: float) -> float:
+    multiplier = KIND_BOOSTS.get(_symbol_kind(row), 1.0)
+    if _is_exported_symbol(row):
+        multiplier *= 1.1
+    return score * multiplier
+
+
+def _rankable_query_rows(symbol_rows: dict[str, object]) -> dict[str, object]:
+    return {
+        symbol_id: row
+        for symbol_id, row in symbol_rows.items()
+        if is_queryable_symbol(str(row["relative_path"]), str(row["kind"]))
+    }
+
+
+def dependency_ordered_pagerank(
+    symbol_rows: dict[str, object],
+    edge_rows: list[object],
+    *,
+    personalization: dict[str, float] | None = None,
+    alpha: float = 0.15,
+) -> dict[str, float]:
+    rankable_rows = _rankable_query_rows(symbol_rows)
+    rankable_ids = set(rankable_rows)
+    if not rankable_ids:
+        return {}
+
+    reoriented_edges: list[tuple[str, str, float]] = []
+
+    def _add_weight(source: str, target: str, weight: float) -> None:
+        if weight <= 0:
+            return
+        reoriented_edges.append((source, target, weight))
+
+    for edge in edge_rows:
+        source = str(edge["source_symbol_id"])
+        target = str(edge["target_symbol_id"])
+        if source not in rankable_ids or target not in rankable_ids:
+            continue
+        edge_type = str(edge["edge_type"])
+        base_weight = float(edge["weight"])
+        if base_weight <= 0:
+            continue
+        if edge_type in DEPENDENCY_EDGE_TYPES:
+            _add_weight(target, source, base_weight)
+            _add_weight(source, target, base_weight * 0.15)
+            continue
+        if edge_type in COMPOSITIONAL_EDGE_TYPES:
+            _add_weight(source, target, base_weight * 0.85)
+            _add_weight(target, source, base_weight * 0.85)
+            continue
+        _add_weight(target, source, base_weight * 0.5)
+        _add_weight(source, target, base_weight * 0.15)
+
+    filtered_personalization = None
+    if personalization:
+        filtered_personalization = {
+            symbol_id: value
+            for symbol_id, value in personalization.items()
+            if symbol_id in rankable_ids and value > 0
+        }
+
+    return weighted_pagerank(
+        nodes=sorted(rankable_ids),
+        edges=reoriented_edges,
+        alpha=alpha,
+        personalization=filtered_personalization,
+    )
 
 
 class QueryEngine:
@@ -140,6 +254,15 @@ class QueryEngine:
             current_id = enclosing_symbol_id
         return symbol_id
 
+    def _symbol_scores(
+        self,
+        hits: list[tuple[QueryChunkHit, str]],
+    ) -> dict[str, float]:
+        scores: dict[str, float] = defaultdict(float)
+        for hit, symbol_id in hits:
+            scores[symbol_id] = max(scores.get(symbol_id, 0.0), float(hit.score))
+        return scores
+
     def search(self, project_id: str, query: str, limit: int = 10) -> list[FileGroup]:
         signature = self.storage.get_project_signature(project_id) or ""
         query_hash = sha256(f"{signature}:{self.provider.model_id}:{query}:{limit}".encode("utf-8")).hexdigest()
@@ -148,94 +271,83 @@ class QueryEngine:
             return self._deserialize_groups(cached)
 
         symbol_rows = self.storage.get_symbol_rows(project_id)
-        rankable_symbol_ids = {
-            symbol_id
-            for symbol_id, row in symbol_rows.items()
-            if is_queryable_symbol(str(row["relative_path"]), str(row["kind"]))
-        }
+        rankable_rows = _rankable_query_rows(symbol_rows)
+        if not rankable_rows:
+            return []
 
         canonical_bm25_hits: list[tuple[QueryChunkHit, str]] = []
-        for hit in self.storage.search_bm25(project_id, query, max(limit * 5, 20)):
+        for hit in self.storage.search_bm25(project_id, query, max(limit * 6, 24)):
             canonical_symbol_id = self._canonical_symbol_id(symbol_rows, hit.symbol_id)
-            if canonical_symbol_id in rankable_symbol_ids:
+            if canonical_symbol_id in rankable_rows:
                 canonical_bm25_hits.append((hit, canonical_symbol_id))
 
         canonical_dense_hits: list[tuple[QueryChunkHit, str]] = []
-        for hit in self._dense_hits(project_id, query, max(limit * 5, 20)):
+        for hit in self._dense_hits(project_id, query, max(limit * 6, 24)):
             canonical_symbol_id = self._canonical_symbol_id(symbol_rows, hit.symbol_id)
-            if canonical_symbol_id in rankable_symbol_ids:
+            if canonical_symbol_id in rankable_rows:
                 canonical_dense_hits.append((hit, canonical_symbol_id))
 
-        bm25_hits = [hit for hit, _ in canonical_bm25_hits]
-        dense_hits = [hit for hit, _ in canonical_dense_hits]
-        fused = _rrf_scores(bm25_hits) | {}
-        for chunk_id, value in _rrf_scores(dense_hits).items():
-            fused[chunk_id] = fused.get(chunk_id, 0.0) + value
+        lexical_scores = _normalize_scores(self._symbol_scores(canonical_bm25_hits))
+        semantic_scores = _normalize_scores(self._symbol_scores(canonical_dense_hits))
 
-        chunk_by_id = {item.chunk_id: item for item in [*bm25_hits, *dense_hits]}
-        canonical_symbol_by_chunk_id = {
-            hit.chunk_id: canonical_symbol_id
-            for hit, canonical_symbol_id in [*canonical_bm25_hits, *canonical_dense_hits]
+        combined_seed_scores: dict[str, float] = {}
+        for symbol_id in set(lexical_scores) | set(semantic_scores):
+            combined_seed_scores[symbol_id] = (
+                semantic_scores.get(symbol_id, 0.0) * 0.65
+                + lexical_scores.get(symbol_id, 0.0) * 0.35
+            )
+
+        if not combined_seed_scores:
+            return []
+
+        max_seed = max(combined_seed_scores.values())
+        threshold = max(0.35, max_seed * 0.6)
+        seed_personalization = {
+            symbol_id: score
+            for symbol_id, score in combined_seed_scores.items()
+            if score >= threshold
         }
-        seed_scores: dict[str, float] = defaultdict(float)
-        for chunk_id, score in fused.items():
-            chunk = chunk_by_id[chunk_id]
-            seed_scores[canonical_symbol_by_chunk_id.get(chunk_id, chunk.symbol_id)] += score
+        if not seed_personalization:
+            top_seed_ids = sorted(combined_seed_scores, key=combined_seed_scores.get, reverse=True)[:5]
+            seed_personalization = {symbol_id: combined_seed_scores[symbol_id] for symbol_id in top_seed_ids}
 
-        personalization_total = sum(seed_scores.values())
-        personalization = None
-        if personalization_total > 0:
-            personalization = {
-                key: value / personalization_total
-                for key, value in seed_scores.items()
-                if key in rankable_symbol_ids
-            }
-
-        reverse_edges = [
-            (
-                str(edge["target_symbol_id"]),
-                str(edge["source_symbol_id"]),
-                float(edge["weight"]),
-            )
-            for edge in self.storage.get_edges(project_id)
-            if str(edge["target_symbol_id"]) in rankable_symbol_ids and str(edge["source_symbol_id"]) in rankable_symbol_ids
-        ]
-        ppr_scores = (
-            weighted_pagerank(
-                nodes=sorted(rankable_symbol_ids),
-                edges=reverse_edges,
-                alpha=0.85,
-                personalization=personalization,
-            )
-            if personalization
-            else {}
+        ppr_scores = dependency_ordered_pagerank(
+            symbol_rows,
+            self.storage.get_edges(project_id),
+            personalization=seed_personalization,
+            alpha=0.15,
         )
+        normalized_ppr_scores = _normalize_scores(ppr_scores)
+
+        candidates: dict[str, float] = {}
+        for symbol_id in set(combined_seed_scores) | set(sorted(normalized_ppr_scores, key=normalized_ppr_scores.get, reverse=True)[: limit * 4]):
+            row = rankable_rows.get(symbol_id)
+            if row is None:
+                continue
+            semantic = semantic_scores.get(symbol_id, 0.0)
+            lexical = lexical_scores.get(symbol_id, 0.0)
+            ppr = normalized_ppr_scores.get(symbol_id, 0.0)
+            score = semantic * 0.50 + lexical * 0.15 + ppr * 0.35
+            score = apply_kind_boost(row, score)
+            if score > 0:
+                candidates[symbol_id] = score
 
         ranked: list[RankedSymbol] = []
-        for symbol_id, row in symbol_rows.items():
-            if symbol_id not in rankable_symbol_ids:
-                continue
-            final_score = (
-                0.45 * seed_scores.get(symbol_id, 0.0)
-                + 0.45 * ppr_scores.get(symbol_id, 0.0)
-                + 0.10 * float(row["global_rank"])
-            )
-            if final_score <= 0:
-                continue
+        for symbol_id, score in sorted(candidates.items(), key=lambda item: (-item[1], item[0])):
+            row = rankable_rows[symbol_id]
             ranked.append(
                 RankedSymbol(
                     symbol_id=symbol_id,
                     relative_path=str(row["relative_path"]),
                     display_name=str(row["display_name"]),
                     kind=str(row["kind"]),
-                    score=final_score,
+                    score=score,
                     signature=str(row["signature"]),
                     docstring=str(row["docstring"]),
                     snippet=str(row["snippet"]),
                 )
             )
 
-        ranked.sort(key=lambda item: (-item.score, item.relative_path, item.display_name))
         grouped: dict[str, FileGroup] = {}
         for symbol in ranked:
             group = grouped.setdefault(

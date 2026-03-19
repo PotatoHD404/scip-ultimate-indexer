@@ -21,17 +21,17 @@ poetry run ultimate-indexer visualize /path/to/project "auth"
 poetry run ultimate-indexer mcp
 ```
 
+The MCP server also exposes a scored project tree view that ranks files and folders by usefulness using indexed symbol ranks plus lightweight structural fallbacks.
+
 ## Embeddings
 
-The runtime now defaults to `sentence-transformers` with [`nomic-ai/CodeRankEmbed`](https://huggingface.co/nomic-ai/CodeRankEmbed).
+The runtime now defaults to the local GGUF model path used by `graph-indexer`.
+No Hugging Face download path is used anymore.
 
-If a Hugging Face model is already cached locally, the indexer now reuses the cached snapshot/file without making another HF request. This keeps repeat runs stable on flaky or isolated networks.
-
-- on Apple Silicon, `auto` prefers the PyTorch `mps` device so inference runs on the Metal GPU
-- on Apple Silicon, the default embedding path also uses a smaller batch size and caps sequence length to `512` tokens to keep Metal memory stable
-- the query side uses the model's required prefix: `Represent this query for searching relevant code:`
-- batching is enabled by default for faster indexing throughput
-- `llama.cpp` remains available as a fallback/backend override
+- the first choice is `ULTIMATE_INDEXER_MODEL_PATH` when set
+- otherwise the indexer looks in `models/` and `graph-indexer/models/`
+- the default committed filename is `coderankembed-q8_0.gguf`
+- `auto` falls back to the deterministic `hash` backend only when no local GGUF model is available
 
 Ranking and query scoring exclude low-signal generated artifacts such as `.next` outputs, protobuf-generated `proto/*` code, `*.pb.go`, and `*_pb2.*` files. Those files are still stored for inspection, but they no longer dominate `top-symbols` or semantic query results.
 
@@ -39,15 +39,9 @@ For CI and tests, set `ULTIMATE_INDEXER_EMBEDDING_BACKEND=hash` to use a determi
 
 Useful debug envs:
 
-- `ULTIMATE_INDEXER_ST_DEVICE` to force `mps`, `cuda`, or `cpu`
-- `ULTIMATE_INDEXER_ST_BATCH_SIZE` to tune throughput
-- `ULTIMATE_INDEXER_ST_MAX_SEQ_LENGTH` to trade context length against speed and memory use
-- `ULTIMATE_INDEXER_ST_USE_FP16=true|false` to control half precision on GPU backends
-- `ULTIMATE_INDEXER_ST_NORMALIZE=false` to disable normalized embeddings
-- `ULTIMATE_INDEXER_HF_LOCAL_ONLY=true` to forbid all Hugging Face network access and require models to already exist in the local cache
+- `ULTIMATE_INDEXER_MODEL_PATH` to point at a specific local GGUF file
 - `ULTIMATE_INDEXER_LLAMA_VERBOSE=true` to expose backend/device logs
 - `ULTIMATE_INDEXER_LLAMA_SUPPRESS_LOGS=false` to stop silencing `llama.cpp` stderr/stdout
-- `ULTIMATE_INDEXER_LLAMA_MODEL_REPO_ID` to override the GGUF repo for the fallback `llama.cpp` backend
 - `ULTIMATE_INDEXER_LLAMA_N_GPU_LAYERS`, `ULTIMATE_INDEXER_LLAMA_N_CTX`, `ULTIMATE_INDEXER_LLAMA_N_BATCH`, and `ULTIMATE_INDEXER_LLAMA_N_UBATCH` to override runtime settings
 
 ## SCIP support
@@ -99,6 +93,12 @@ def build_greeting(user: User, excited: bool = False) -> str:
 ```
 
 Struct/class-like results emit their interface plus direct method signatures.
+
+Query ranking and `top-symbols` now follow the graph-indexer pattern more closely:
+
+- `top-symbols` uses dependency-ordered PageRank plus symbol-kind boosts
+- `query` uses lexical and semantic seeds, then expands with query-relative dependency ordering
+- config/docs artifacts keep qualified keys, parent headings, and attribution in their indexed text
 
 ## Notes on coverage
 

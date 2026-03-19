@@ -27,22 +27,15 @@ class Settings:
     embedding_backend: str = field(
         default_factory=lambda: os.getenv("ULTIMATE_INDEXER_EMBEDDING_BACKEND", "auto")
     )
-    model_repo_id: str = field(
+    model_path: str | None = field(
         default_factory=lambda: os.getenv(
-            "ULTIMATE_INDEXER_MODEL_REPO_ID",
-            "nomic-ai/CodeRankEmbed",
-        )
-    )
-    llama_model_repo_id: str = field(
-        default_factory=lambda: os.getenv(
-            "ULTIMATE_INDEXER_LLAMA_MODEL_REPO_ID",
-            "lmstudio-community/nomic-embed-code-GGUF",
+            "ULTIMATE_INDEXER_MODEL_PATH",
         )
     )
     model_filename: str = field(
         default_factory=lambda: os.getenv(
             "ULTIMATE_INDEXER_MODEL_FILENAME",
-            "nomic-embed-code-Q4_K_M.gguf",
+            "coderankembed-q8_0.gguf",
         )
     )
     model_cache_dir: Path = field(

@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
-import logging
 import os
-import re
 import sys
 import time
 from contextlib import nullcontext, redirect_stderr, redirect_stdout
@@ -20,7 +18,10 @@ BATCH_SIZE = 32
 PROVIDER_BATCH_DELAY_MS = {
     "hash-256": 0,
 }
-CODERANK_QUERY_PREFIX = "Represent this query for searching relevant code: "
+DEFAULT_MODEL_FILENAMES = (
+    "coderankembed-q8_0.gguf",
+    "nomic-embed-code-Q4_K_M.gguf",
+)
 
 
 def hash_text(text: str) -> str:
@@ -66,7 +67,7 @@ class EmbeddingProvider(Protocol):
 
 
 def prepare_document_text(content: str, file_path: str) -> str:
-    return f"search_document: {file_path}\n{content}"
+    return f"{file_path}\n{content}"
 
 
 def _provider_prepare_document_text(provider: EmbeddingProvider, content: str, file_path: str) -> str:
@@ -99,107 +100,64 @@ def _with_retry(
     raise last_error
 
 
-def _remote_dependency_install_hint(model_name: str, exc: ImportError) -> str | None:
-    message = str(exc)
-    packages: list[str] = []
-    quoted_module = re.search(r"No module named ['\"]([^'\"]+)['\"]", message)
-    if quoted_module:
-        packages = [quoted_module.group(1)]
-    else:
-        match = re.search(r"packages that were not found in your environment: ([^.]+)\.", message)
-        if match:
-            packages = [item.strip() for item in match.group(1).split(",") if item.strip()]
-    if not packages:
-        return None
-    package_list = " ".join(packages)
-    return (
-        f"`{model_name}` requires additional packages: {', '.join(packages)}. "
-        f"Install them with `poetry add {package_list}` or `pip install {package_list}`."
-    )
+def _package_root() -> Path:
+    return Path(__file__).resolve().parents[2]
 
 
-def _sentence_transformer_batch_size(device: str) -> int:
-    if device == "cuda":
-        return 32
-    if device == "mps":
-        return 8
-    return 16
-
-
-def _sentence_transformer_max_seq_length(device: str) -> int:
-    if device == "mps":
-        return 512
-    if device == "cuda":
-        return 1024
-    return 1024
-
-
-def _apply_sentence_transformer_limits(model: object, max_seq_length: int) -> None:
-    if max_seq_length <= 0:
-        return
-    current = getattr(model, "max_seq_length", None)
-    if current is None:
-        setattr(model, "max_seq_length", max_seq_length)
-    else:
-        setattr(model, "max_seq_length", min(int(current), max_seq_length))
-
-    tokenizer = getattr(model, "tokenizer", None)
-    if tokenizer is None:
-        return
-    tokenizer_limit = getattr(tokenizer, "model_max_length", None)
-    if tokenizer_limit is None:
-        setattr(tokenizer, "model_max_length", max_seq_length)
-    else:
-        setattr(tokenizer, "model_max_length", min(int(tokenizer_limit), max_seq_length))
-
-
-def _mps_memory_hint(model_name: str) -> str:
-    return (
-        f"`{model_name}` exhausted Apple GPU memory on `mps`. "
-        "Retry with `ULTIMATE_INDEXER_ST_BATCH_SIZE=2` and/or "
-        "`ULTIMATE_INDEXER_ST_MAX_SEQ_LENGTH=256`, or force CPU with "
-        "`ULTIMATE_INDEXER_ST_DEVICE=cpu`."
-    )
-
-
-def _env_truthy(name: str) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return False
-    return value.lower() in {"1", "true", "yes", "on"}
-
-
-def _hf_local_only_enabled() -> bool:
-    return any(
-        _env_truthy(name)
-        for name in ("ULTIMATE_INDEXER_HF_LOCAL_ONLY", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")
-    )
-
-
-def _offline_cache_miss_message(model_name: str, cache_dir: Path) -> str:
-    return (
-        f"`{model_name}` is not available in the local model cache at `{cache_dir}` and network access is disabled. "
-        "Pre-download the model once with network access, or unset the offline flags."
-    )
-
-
-def _resolve_cached_sentence_transformer_source(
+def resolve_local_model_path(
+    project_root: Path,
     model_cache_dir: Path,
-    model_name: str,
-) -> tuple[str, bool]:
-    from huggingface_hub import snapshot_download
+    *,
+    model_path: str | None,
+    filename: str,
+) -> Path:
+    tried: list[Path] = []
 
-    try:
-        local_path = snapshot_download(
-            repo_id=model_name,
-            cache_dir=str(model_cache_dir),
-            local_files_only=True,
-        )
-        return local_path, True
-    except Exception:
-        if _hf_local_only_enabled():
-            raise RuntimeError(_offline_cache_miss_message(model_name, model_cache_dir)) from None
-        return model_name, False
+    def _append_candidate(candidate: Path) -> None:
+        resolved = candidate.expanduser()
+        if not resolved.is_absolute():
+            resolved = (project_root / resolved).resolve()
+        else:
+            resolved = resolved.resolve()
+        if resolved not in tried:
+            tried.append(resolved)
+
+    if model_path:
+        _append_candidate(Path(model_path))
+
+    repo_root = _package_root()
+    for base in (
+        project_root / "models",
+        project_root / "graph-indexer" / "models",
+        repo_root / "models",
+        repo_root / "graph-indexer" / "models",
+        model_cache_dir,
+    ):
+        _append_candidate(base / filename)
+
+    for fallback_name in DEFAULT_MODEL_FILENAMES:
+        if fallback_name == filename:
+            continue
+        for base in (
+            project_root / "models",
+            project_root / "graph-indexer" / "models",
+            repo_root / "models",
+            repo_root / "graph-indexer" / "models",
+            model_cache_dir,
+        ):
+            _append_candidate(base / fallback_name)
+
+    for candidate in tried:
+        if candidate.exists() and candidate.is_file():
+            return candidate
+
+    attempted = "\n".join(f"- {candidate}" for candidate in tried)
+    raise RuntimeError(
+        "No local GGUF embedding model was found.\n"
+        "Set `ULTIMATE_INDEXER_MODEL_PATH` explicitly or place the committed model under "
+        "`models/` or `graph-indexer/models/`.\n"
+        f"Tried:\n{attempted}"
+    )
 
 
 @dataclass(slots=True)
@@ -230,15 +188,21 @@ class LlamaCppEmbeddingProvider:
     model_path: Path
     model_id: str
     supports_batching: bool = False
-    n_ctx: int = 0
-    n_batch: int = 1024
-    n_ubatch: int = 1024
+    n_ctx: int = 2048
+    n_batch: int = 2048
+    n_ubatch: int = 2048
     n_gpu_layers: int = field(
         default_factory=lambda: -1 if sys.platform == "darwin" else 0
     )
     verbose: bool = False
     suppress_backend_logs: bool = True
     _llama: object | None = field(init=False, repr=False, default=None)
+
+    def prepare_document_text(self, content: str, file_path: str) -> str:
+        return content
+
+    def prepare_query_text(self, text: str) -> str:
+        return text
 
     def _client(self):
         if self._llama is None:
@@ -266,136 +230,31 @@ class LlamaCppEmbeddingProvider:
         return [self._embed_one(text) for text in texts]
 
     def embed_query(self, text: str) -> np.ndarray:
-        return self._embed_one(f"search_query: {text}")
-
-
-@dataclass(slots=True)
-class SentenceTransformerEmbeddingProvider:
-    model_name: str
-    cache_dir: Path
-    model_id: str
-    device: str
-    batch_size: int = 64
-    max_seq_length: int = 0
-    use_fp16: bool = False
-    normalize_embeddings: bool = True
-    suppress_backend_logs: bool = True
-    local_files_only: bool = False
-    supports_batching: bool = True
-    _model: object | None = field(init=False, repr=False, default=None)
-
-    def prepare_document_text(self, content: str, file_path: str) -> str:
-        return f"{file_path}\n{content}"
-
-    def prepare_query_text(self, text: str) -> str:
-        return f"{CODERANK_QUERY_PREFIX}{text}"
-
-    def _client(self):
-        if self._model is None:
-            if self.device == "mps":
-                os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-            try:
-                import torch
-                from sentence_transformers import SentenceTransformer
-
-                huggingface_logger = logging.getLogger("huggingface_hub")
-                sentence_transformers_logger = logging.getLogger("sentence_transformers")
-                transformers_logger = logging.getLogger("transformers")
-                previous_levels = (
-                    huggingface_logger.level,
-                    sentence_transformers_logger.level,
-                    transformers_logger.level,
-                )
-                try:
-                    if self.suppress_backend_logs:
-                        huggingface_logger.setLevel(logging.ERROR)
-                        sentence_transformers_logger.setLevel(logging.ERROR)
-                        transformers_logger.setLevel(logging.ERROR)
-                    stdout_guard, stderr_guard = _stream_silence_guard(self.suppress_backend_logs)
-                    with stdout_guard, stderr_guard:
-                        if hasattr(torch, "set_float32_matmul_precision"):
-                            torch.set_float32_matmul_precision("high")
-                        self._model = SentenceTransformer(
-                            self.model_name,
-                            cache_folder=str(self.cache_dir),
-                            trust_remote_code=True,
-                            device=self.device,
-                            local_files_only=self.local_files_only,
-                        )
-                        _apply_sentence_transformer_limits(self._model, self.max_seq_length)
-                        if self.use_fp16:
-                            try:
-                                self._model.half()
-                            except Exception:
-                                pass
-                finally:
-                    if self.suppress_backend_logs:
-                        huggingface_logger.setLevel(previous_levels[0])
-                        sentence_transformers_logger.setLevel(previous_levels[1])
-                        transformers_logger.setLevel(previous_levels[2])
-            except ImportError as exc:
-                hint = _remote_dependency_install_hint(self.model_name, exc)
-                if hint is None:
-                    raise
-                raise RuntimeError(hint) from exc
-        return self._model
-
-    def embed(self, texts: Sequence[str]) -> list[np.ndarray]:
-        if not texts:
-            return []
-        import torch
-
-        try:
-            stdout_guard, stderr_guard = _stream_silence_guard(self.suppress_backend_logs)
-            with torch.inference_mode(), stdout_guard, stderr_guard:
-                encoded = self._client().encode(
-                    list(texts),
-                    batch_size=self.batch_size,
-                    show_progress_bar=False,
-                    convert_to_numpy=True,
-                    normalize_embeddings=self.normalize_embeddings,
-                )
-        except RuntimeError as exc:
-            message = str(exc)
-            if self.device == "mps" and any(marker in message for marker in ("Invalid buffer size", "out of memory", "MPS")):
-                raise RuntimeError(_mps_memory_hint(self.model_name)) from exc
-            raise
-        matrix = np.asarray(encoded, dtype=np.float32)
-        if matrix.ndim == 1:
-            return [matrix]
-        return [row for row in matrix]
-
-    def embed_query(self, text: str) -> np.ndarray:
-        return self.embed([self.prepare_query_text(text)])[0]
+        return self._embed_one(self.prepare_query_text(text))
 
 
 def resolve_llama_cpp_provider(
+    project_root: Path,
     model_cache_dir: Path,
-    repo_id: str,
+    *,
+    model_path: str | None,
     filename: str,
 ) -> LlamaCppEmbeddingProvider:
-    local_path = model_cache_dir / filename
-    if local_path.exists():
-        model_path = local_path
-    else:
-        if _hf_local_only_enabled():
-            raise RuntimeError(_offline_cache_miss_message(f"{repo_id}/{filename}", model_cache_dir))
-        from huggingface_hub import hf_hub_download
-        model_path = Path(_with_retry(
-            lambda: hf_hub_download(
-                repo_id=repo_id,
-                filename=filename,
-                local_dir=str(model_cache_dir),
-            ),
-            label=f"Download model {repo_id}/{filename}",
-        )
-        )
-    return LlamaCppEmbeddingProvider(
+    resolved_model_path = resolve_local_model_path(
+        project_root,
+        model_cache_dir,
         model_path=model_path,
-        model_id=f"{repo_id}:{filename}",
-        n_ctx=int(os.getenv("ULTIMATE_INDEXER_LLAMA_N_CTX", "0")),
-        n_batch=int(os.getenv("ULTIMATE_INDEXER_LLAMA_N_BATCH", "64")),
-        n_ubatch=int(os.getenv("ULTIMATE_INDEXER_LLAMA_N_UBATCH", "64")),
+        filename=filename,
+    )
+    n_ctx = int(os.getenv("ULTIMATE_INDEXER_LLAMA_N_CTX", "2048"))
+    n_batch = int(os.getenv("ULTIMATE_INDEXER_LLAMA_N_BATCH", str(n_ctx)))
+    n_ubatch = int(os.getenv("ULTIMATE_INDEXER_LLAMA_N_UBATCH", str(n_ctx)))
+    return LlamaCppEmbeddingProvider(
+        model_path=resolved_model_path,
+        model_id=f"local-gguf:{resolved_model_path.resolve()}",
+        n_ctx=n_ctx,
+        n_batch=n_batch,
+        n_ubatch=n_ubatch,
         n_gpu_layers=int(
             os.getenv(
                 "ULTIMATE_INDEXER_LLAMA_N_GPU_LAYERS",
@@ -404,47 +263,6 @@ def resolve_llama_cpp_provider(
         ),
         verbose=os.getenv("ULTIMATE_INDEXER_LLAMA_VERBOSE", "false").lower() == "true",
         suppress_backend_logs=os.getenv("ULTIMATE_INDEXER_LLAMA_SUPPRESS_LOGS", "true").lower() != "false",
-    )
-
-
-def _detect_sentence_transformer_device() -> str:
-    device_override = os.getenv("ULTIMATE_INDEXER_ST_DEVICE")
-    if device_override:
-        return device_override
-    import torch
-
-    if torch.cuda.is_available():
-        return "cuda"
-    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
-
-
-def resolve_sentence_transformer_provider(
-    model_cache_dir: Path,
-    model_name: str,
-) -> SentenceTransformerEmbeddingProvider:
-    device = _detect_sentence_transformer_device()
-    default_batch_size = _sentence_transformer_batch_size(device)
-    default_max_seq_length = _sentence_transformer_max_seq_length(device)
-    use_fp16_env = os.getenv("ULTIMATE_INDEXER_ST_USE_FP16")
-    use_fp16 = (
-        use_fp16_env.lower() == "true"
-        if use_fp16_env is not None
-        else device in {"cuda", "mps"}
-    )
-    source, local_files_only = _resolve_cached_sentence_transformer_source(model_cache_dir, model_name)
-    return SentenceTransformerEmbeddingProvider(
-        model_name=source,
-        cache_dir=model_cache_dir,
-        model_id=model_name,
-        device=device,
-        batch_size=int(os.getenv("ULTIMATE_INDEXER_ST_BATCH_SIZE", str(default_batch_size))),
-        max_seq_length=int(os.getenv("ULTIMATE_INDEXER_ST_MAX_SEQ_LENGTH", str(default_max_seq_length))),
-        use_fp16=use_fp16,
-        normalize_embeddings=os.getenv("ULTIMATE_INDEXER_ST_NORMALIZE", "true").lower() != "false",
-        suppress_backend_logs=os.getenv("ULTIMATE_INDEXER_ST_SUPPRESS_LOGS", "true").lower() != "false",
-        local_files_only=local_files_only or _hf_local_only_enabled(),
     )
 
 

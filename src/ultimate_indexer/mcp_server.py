@@ -58,6 +58,15 @@ def build_mcp() -> FastMCP:
         return truncate_text(format_top_symbols(indexer.top_symbols(limit=limit), include_scores=False), 4_000)
 
     @server.tool()
+    def scored_project_tree(
+        project_path: str,
+        embedding_backend: str = "auto",
+        max_chars: int = 12_000,
+    ) -> str:
+        indexer = get_indexer(project_path, embedding_backend)
+        return indexer.scored_tree(max_chars=max_chars)
+
+    @server.tool()
     def visualize_project(
         project_path: str,
         query: str,

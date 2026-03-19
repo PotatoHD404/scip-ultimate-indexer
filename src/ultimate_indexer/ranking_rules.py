@@ -6,6 +6,8 @@ from pathlib import PurePosixPath
 
 NON_RANKABLE_KINDS = {
     "Artifact",
+    "ArtifactConfig",
+    "ArtifactSection",
     "Field",
     "File",
     "Kind",

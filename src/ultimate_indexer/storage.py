@@ -461,7 +461,7 @@ class Storage:
             SELECT *
             FROM symbols
             WHERE project_id = ?
-              AND kind NOT IN ('File', 'Artifact', 'Section', 'Module', 'Unknown')
+              AND kind NOT IN ('File', 'Artifact', 'ArtifactConfig', 'ArtifactSection', 'Section', 'Module', 'Unknown')
               AND global_rank > 0
             ORDER BY global_rank DESC, display_name ASC
             LIMIT ?
@@ -499,3 +499,59 @@ class Storage:
             """,
             (project_id, relative_path),
         ).fetchone()
+
+    def get_tree_score_rows(self, project_id: str) -> list[sqlite3.Row]:
+        return self.connection.execute(
+            """
+            SELECT
+                f.relative_path,
+                f.source_kind,
+                f.artifact_name,
+                COALESCE(symbol_stats.rank_sum, 0.0) AS rank_sum,
+                COALESCE(symbol_stats.rank_max, 0.0) AS rank_max,
+                COALESCE(symbol_stats.useful_symbol_count, 0) AS useful_symbol_count,
+                COALESCE(chunk_stats.chunk_count, 0) AS chunk_count
+            FROM files f
+            LEFT JOIN (
+                SELECT
+                    relative_path,
+                    SUM(
+                        CASE
+                            WHEN kind NOT IN ('File', 'Artifact', 'Section', 'Module', 'Unknown')
+                            THEN global_rank
+                            ELSE 0.0
+                        END
+                    ) AS rank_sum,
+                    MAX(
+                        CASE
+                            WHEN kind NOT IN ('File', 'Artifact', 'Section', 'Module', 'Unknown')
+                            THEN global_rank
+                            ELSE 0.0
+                        END
+                    ) AS rank_max,
+                    COUNT(
+                        CASE
+                            WHEN kind NOT IN ('File', 'Artifact', 'Section', 'Module', 'Unknown')
+                            THEN symbol_id
+                            ELSE NULL
+                        END
+                    ) AS useful_symbol_count
+                FROM symbols
+                WHERE project_id = ?
+                GROUP BY relative_path
+            ) AS symbol_stats
+                ON symbol_stats.relative_path = f.relative_path
+            LEFT JOIN (
+                SELECT
+                    relative_path,
+                    COUNT(*) AS chunk_count
+                FROM chunks
+                WHERE project_id = ?
+                GROUP BY relative_path
+            ) AS chunk_stats
+                ON chunk_stats.relative_path = f.relative_path
+            WHERE f.project_id = ?
+            ORDER BY f.relative_path ASC
+            """,
+            (project_id, project_id, project_id),
+        ).fetchall()
