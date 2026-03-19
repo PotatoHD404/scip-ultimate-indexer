@@ -25,6 +25,8 @@ poetry run ultimate-indexer mcp
 
 The runtime now defaults to `sentence-transformers` with [`nomic-ai/CodeRankEmbed`](https://huggingface.co/nomic-ai/CodeRankEmbed).
 
+If a Hugging Face model is already cached locally, the indexer now reuses the cached snapshot/file without making another HF request. This keeps repeat runs stable on flaky or isolated networks.
+
 - on Apple Silicon, `auto` prefers the PyTorch `mps` device so inference runs on the Metal GPU
 - on Apple Silicon, the default embedding path also uses a smaller batch size and caps sequence length to `512` tokens to keep Metal memory stable
 - the query side uses the model's required prefix: `Represent this query for searching relevant code:`
@@ -42,6 +44,7 @@ Useful debug envs:
 - `ULTIMATE_INDEXER_ST_MAX_SEQ_LENGTH` to trade context length against speed and memory use
 - `ULTIMATE_INDEXER_ST_USE_FP16=true|false` to control half precision on GPU backends
 - `ULTIMATE_INDEXER_ST_NORMALIZE=false` to disable normalized embeddings
+- `ULTIMATE_INDEXER_HF_LOCAL_ONLY=true` to forbid all Hugging Face network access and require models to already exist in the local cache
 - `ULTIMATE_INDEXER_LLAMA_VERBOSE=true` to expose backend/device logs
 - `ULTIMATE_INDEXER_LLAMA_SUPPRESS_LOGS=false` to stop silencing `llama.cpp` stderr/stdout
 - `ULTIMATE_INDEXER_LLAMA_MODEL_REPO_ID` to override the GGUF repo for the fallback `llama.cpp` backend

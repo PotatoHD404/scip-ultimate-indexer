@@ -162,6 +162,46 @@ def _mps_memory_hint(model_name: str) -> str:
     )
 
 
+def _env_truthy(name: str) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return False
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _hf_local_only_enabled() -> bool:
+    return any(
+        _env_truthy(name)
+        for name in ("ULTIMATE_INDEXER_HF_LOCAL_ONLY", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")
+    )
+
+
+def _offline_cache_miss_message(model_name: str, cache_dir: Path) -> str:
+    return (
+        f"`{model_name}` is not available in the local model cache at `{cache_dir}` and network access is disabled. "
+        "Pre-download the model once with network access, or unset the offline flags."
+    )
+
+
+def _resolve_cached_sentence_transformer_source(
+    model_cache_dir: Path,
+    model_name: str,
+) -> tuple[str, bool]:
+    from huggingface_hub import snapshot_download
+
+    try:
+        local_path = snapshot_download(
+            repo_id=model_name,
+            cache_dir=str(model_cache_dir),
+            local_files_only=True,
+        )
+        return local_path, True
+    except Exception:
+        if _hf_local_only_enabled():
+            raise RuntimeError(_offline_cache_miss_message(model_name, model_cache_dir)) from None
+        return model_name, False
+
+
 @dataclass(slots=True)
 class HashEmbeddingProvider:
     dim: int = 256
@@ -240,6 +280,7 @@ class SentenceTransformerEmbeddingProvider:
     use_fp16: bool = False
     normalize_embeddings: bool = True
     suppress_backend_logs: bool = True
+    local_files_only: bool = False
     supports_batching: bool = True
     _model: object | None = field(init=False, repr=False, default=None)
 
@@ -279,6 +320,7 @@ class SentenceTransformerEmbeddingProvider:
                             cache_folder=str(self.cache_dir),
                             trust_remote_code=True,
                             device=self.device,
+                            local_files_only=self.local_files_only,
                         )
                         _apply_sentence_transformer_limits(self._model, self.max_seq_length)
                         if self.use_fp16:
@@ -332,17 +374,22 @@ def resolve_llama_cpp_provider(
     repo_id: str,
     filename: str,
 ) -> LlamaCppEmbeddingProvider:
-    from huggingface_hub import hf_hub_download
-
-    model_path = Path(_with_retry(
-        lambda: hf_hub_download(
-            repo_id=repo_id,
-            filename=filename,
-            local_dir=str(model_cache_dir),
-        ),
-        label=f"Download model {repo_id}/{filename}",
-    )
-    )
+    local_path = model_cache_dir / filename
+    if local_path.exists():
+        model_path = local_path
+    else:
+        if _hf_local_only_enabled():
+            raise RuntimeError(_offline_cache_miss_message(f"{repo_id}/{filename}", model_cache_dir))
+        from huggingface_hub import hf_hub_download
+        model_path = Path(_with_retry(
+            lambda: hf_hub_download(
+                repo_id=repo_id,
+                filename=filename,
+                local_dir=str(model_cache_dir),
+            ),
+            label=f"Download model {repo_id}/{filename}",
+        )
+        )
     return LlamaCppEmbeddingProvider(
         model_path=model_path,
         model_id=f"{repo_id}:{filename}",
@@ -386,8 +433,9 @@ def resolve_sentence_transformer_provider(
         if use_fp16_env is not None
         else device in {"cuda", "mps"}
     )
+    source, local_files_only = _resolve_cached_sentence_transformer_source(model_cache_dir, model_name)
     return SentenceTransformerEmbeddingProvider(
-        model_name=model_name,
+        model_name=source,
         cache_dir=model_cache_dir,
         model_id=model_name,
         device=device,
@@ -396,6 +444,7 @@ def resolve_sentence_transformer_provider(
         use_fp16=use_fp16,
         normalize_embeddings=os.getenv("ULTIMATE_INDEXER_ST_NORMALIZE", "true").lower() != "false",
         suppress_backend_logs=os.getenv("ULTIMATE_INDEXER_ST_SUPPRESS_LOGS", "true").lower() != "false",
+        local_files_only=local_files_only or _hf_local_only_enabled(),
     )
 
 
