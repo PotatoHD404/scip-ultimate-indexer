@@ -115,10 +115,7 @@ def _render_class_interface(
     snippet: str,
 ) -> list[str]:
     snippet_lines = [line.rstrip() for line in snippet.splitlines() if line.strip()]
-    if len(snippet_lines) > 1:
-        return _render_composite_snippet(signature, snippet, comment_prefix)
-
-    rows = [signature.strip()]
+    child_signatures: list[str] = []
     children = storage.get_symbol_children(project_id, symbol_id)
     for child in children:
         child_signature = _pretty_signature(
@@ -130,6 +127,18 @@ def _render_class_interface(
         ).strip()
         if not child_signature:
             continue
+        child_signatures.append(child_signature)
+    if len(snippet_lines) > 1:
+        rows = _render_composite_snippet(signature, snippet, comment_prefix)
+        rendered_text = "\n".join(rows)
+        for child_signature in child_signatures:
+            if child_signature in rendered_text:
+                continue
+            rows.append(f"    {child_signature}")
+        return rows
+
+    rows = [signature.strip()]
+    for child_signature in child_signatures:
         rows.append(f"    {child_signature}")
     return rows
 

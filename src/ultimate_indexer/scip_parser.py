@@ -131,6 +131,28 @@ def _classify_edge(syntax_kind: int) -> str:
     return "uses"
 
 
+def _best_enclosing_definition(
+    definitions: list[tuple[tuple[int, int, int, int], str]],
+    position: tuple[int, ...],
+    *,
+    exclude_symbol_id: str | None = None,
+) -> str | None:
+    best_span = None
+    for full_range, symbol_id in definitions:
+        if exclude_symbol_id is not None and symbol_id == exclude_symbol_id:
+            continue
+        start_line, start_col, end_line, end_col = (full_range + (0, 0, 0, 0))[:4]
+        pos_line = position[0]
+        pos_col = position[1] if len(position) > 1 else 0
+        if (start_line < pos_line or (start_line == pos_line and start_col <= pos_col)) and (
+            end_line > pos_line or (end_line == pos_line and end_col >= pos_col)
+        ):
+            span = (end_line - start_line, end_col - start_col)
+            if best_span is None or span < best_span[0]:
+                best_span = (span, symbol_id)
+    return None if best_span is None else best_span[1]
+
+
 def parse_scip_index(
     project_id: str,
     project_root: Path,
@@ -214,6 +236,12 @@ def parse_scip_index(
             kind = _kind_name(info.kind)
             if kind == "Unknown":
                 kind = _infer_kind(info.symbol, docstring, signature, snippet)
+            definition_position = tuple(occurrence.enclosing_range or occurrence.range or [0, 0, 0, 0]) if occurrence else (0, 0, 0, 0)
+            derived_enclosing_symbol_id = _best_enclosing_definition(
+                defs,
+                definition_position,
+                exclude_symbol_id=normalized_symbol_id,
+            )
             record = SymbolRecord(
                 project_id=project_id,
                 symbol_id=normalized_symbol_id,
@@ -232,6 +260,9 @@ def parse_scip_index(
                 docstring=docstring,
                 snippet=snippet,
                 enclosing_symbol_id=(
+                    derived_enclosing_symbol_id
+                    if derived_enclosing_symbol_id is not None
+                    else
                     _normalize_symbol_id(relative_path, info.enclosing_symbol)
                     if info.enclosing_symbol
                     else f"file::{relative_path}"
@@ -268,19 +299,9 @@ def parse_scip_index(
                 continue
             source_symbol_id = f"file::{normalized_relative_path}"
             position = tuple(occurrence.enclosing_range or occurrence.range or [0, 0, 0, 0])
-            best_span = None
-            for full_range, symbol_id in definitions:
-                start_line, start_col, end_line, end_col = (full_range + (0, 0, 0, 0))[:4]
-                pos_line = position[0]
-                pos_col = position[1] if len(position) > 1 else 0
-                if (start_line < pos_line or (start_line == pos_line and start_col <= pos_col)) and (
-                    end_line > pos_line or (end_line == pos_line and end_col >= pos_col)
-                ):
-                    span = (end_line - start_line, end_col - start_col)
-                    if best_span is None or span < best_span[0]:
-                        best_span = (span, symbol_id)
-            if best_span is not None:
-                source_symbol_id = best_span[1]
+            enclosing_symbol_id = _best_enclosing_definition(definitions, position)
+            if enclosing_symbol_id is not None:
+                source_symbol_id = enclosing_symbol_id
             edge_type = _classify_edge(occurrence.syntax_kind)
             edge_key = (source_symbol_id, target_symbol_id, edge_type)
             if edge_key in seen_edges:

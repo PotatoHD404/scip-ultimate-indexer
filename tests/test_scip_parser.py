@@ -121,3 +121,66 @@ def test_infer_kind_uses_docstring_and_symbol_shape() -> None:
         "",
         "export const ROUTING = {}",
     ) == "Constant"
+
+
+def test_parse_scip_index_attaches_local_variable_to_enclosing_function(tmp_path: Path) -> None:
+    index = scip_pb2.Index()
+    document = index.documents.add()
+    document.language = "go"
+    document.relative_path = "main.go"
+    document.text = (
+        "package main\n\n"
+        "func doThing() error {\n"
+        "    var err error\n"
+        "    return err\n"
+        "}\n"
+    )
+
+    function_symbol = "scip-go gomod demo `main`/doThing()."
+    local_symbol = "local 1"
+
+    function_info = document.symbols.add()
+    function_info.symbol = function_symbol
+    function_info.display_name = "doThing"
+    function_info.kind = scip_pb2.SymbolInformation.UnspecifiedKind
+    function_info.documentation.append("```go\nfunc doThing() error\n```")
+
+    local_info = document.symbols.add()
+    local_info.symbol = local_symbol
+    local_info.display_name = "err"
+    local_info.kind = scip_pb2.SymbolInformation.UnspecifiedKind
+    local_info.documentation.append("```go\nvar err error\n```")
+
+    function_def = document.occurrences.add()
+    function_def.symbol = function_symbol
+    function_def.range.extend([2, 5, 2, 12])
+    function_def.enclosing_range.extend([2, 0, 5, 1])
+    function_def.symbol_roles = scip_pb2.Definition
+    function_def.syntax_kind = scip_pb2.IdentifierFunctionDefinition
+
+    local_def = document.occurrences.add()
+    local_def.symbol = local_symbol
+    local_def.range.extend([3, 8, 3, 11])
+    local_def.enclosing_range.extend([2, 0, 5, 1])
+    local_def.symbol_roles = scip_pb2.Definition
+    local_def.syntax_kind = scip_pb2.IdentifierLocal
+
+    local_ref = document.occurrences.add()
+    local_ref.symbol = local_symbol
+    local_ref.range.extend([4, 11, 4, 14])
+    local_ref.enclosing_range.extend([2, 0, 5, 1])
+    local_ref.symbol_roles = scip_pb2.ReadAccess
+    local_ref.syntax_kind = scip_pb2.IdentifierLocal
+
+    index_path = tmp_path / "fixture.scip"
+    index_path.write_bytes(index.SerializeToString())
+
+    parsed = parse_scip_index(
+        project_id=str(tmp_path),
+        project_root=tmp_path,
+        index_path=index_path,
+    )
+
+    local_record = next(symbol for symbol in parsed.symbols if symbol.scip_symbol == local_symbol)
+    function_record = next(symbol for symbol in parsed.symbols if symbol.scip_symbol == function_symbol)
+    assert local_record.enclosing_symbol_id == function_record.symbol_id
