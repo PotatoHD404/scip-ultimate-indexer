@@ -7,7 +7,6 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-  <script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/force-graph"></script>
   <style>
     :root {
@@ -83,177 +82,163 @@
   <div id="network"></div>
   <script>
     const performanceMode = {{ "true" if performance_mode else "false" }};
-    const edgeChunkSize = {{ edge_chunk_size }};
     const rawNodes = {{ nodes_json | safe }};
     const rawEdges = {{ edges_json | safe }};
     const container = document.getElementById("network");
     let hoveredNode = null;
 
+    function escapeHtml(value) {
+      return (value || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
+
+    function labelLines(text) {
+      return (text || "").split("\n").filter(Boolean);
+    }
+
     function drawNodeLabel(node, ctx, globalScale) {
-      if (!node.label) {
+      const lines = labelLines(node.label);
+      if (!lines.length) {
         return;
       }
-      const fontSize = Math.max(10, 14 / globalScale);
-      const text = node.label;
+      const fontSize = Math.max(10, 13 / globalScale);
+      const lineHeight = fontSize + 4;
       ctx.font = `${fontSize}px JetBrains Mono`;
-      const textWidth = ctx.measureText(text).width;
-      const bckgDimensions = [textWidth + 10, fontSize + 8];
+      const textWidth = Math.max(...lines.map(line => ctx.measureText(line).width));
+      const boxWidth = textWidth + 14;
+      const boxHeight = lines.length * lineHeight + 10;
+      const radius = Math.max(3, node.scale || 3);
+      const x = node.x + radius + 8;
+      const y = node.y - boxHeight / 2;
 
       ctx.fillStyle = "rgba(15, 23, 42, 0.9)";
-      ctx.fillRect(
-        node.x + 8,
-        node.y - bckgDimensions[1] / 2,
-        bckgDimensions[0],
-        bckgDimensions[1],
-      );
+      ctx.fillRect(x, y, boxWidth, boxHeight);
 
       ctx.textAlign = "left";
-      ctx.textBaseline = "middle";
+      ctx.textBaseline = "top";
       ctx.fillStyle = "#f8fafc";
-      ctx.fillText(text, node.x + 13, node.y);
+      lines.forEach((line, index) => {
+        ctx.fillText(line, x + 7, y + 5 + index * lineHeight);
+      });
     }
 
-    function addInChunks(dataset, items, chunkSize, onDone) {
-      if (!items.length) {
-        if (onDone) onDone();
+    function shouldShowPersistentLabel(node, globalScale) {
+      if (!node.alwaysLabel) {
+        return false;
+      }
+      if (rawNodes.length <= 120) {
+        return globalScale >= 0.45;
+      }
+      return globalScale >= 0.9;
+    }
+
+    function paintNode(node, ctx, globalScale) {
+      const radius = Math.max(2.6, node.scale || 3.2);
+      ctx.beginPath();
+      ctx.arc(node.x, node.y, radius, 0, 2 * Math.PI, false);
+      ctx.fillStyle = node.color;
+      ctx.fill();
+      ctx.lineWidth = Math.max(0.8, 1.8 / globalScale);
+      ctx.strokeStyle = node.borderColor;
+      ctx.stroke();
+
+      if (hoveredNode && hoveredNode.id === node.id) {
+        drawNodeLabel(node, ctx, globalScale);
         return;
       }
-      let index = 0;
-      const safeChunkSize = Math.max(200, chunkSize);
-      const pump = () => {
-        const end = Math.min(index + safeChunkSize, items.length);
-        dataset.add(items.slice(index, end));
-        index = end;
-        if (index < items.length) {
-          setTimeout(pump, 0);
-          return;
-        }
-        if (onDone) onDone();
-      };
-      pump();
+      if (shouldShowPersistentLabel(node, globalScale)) {
+        drawNodeLabel(node, ctx, globalScale);
+      }
     }
 
-    function renderVisNetwork() {
-      const nodes = new vis.DataSet();
-      const edges = new vis.DataSet();
-      const network = new vis.Network(container, { nodes, edges }, {
-        nodes: {
-          shape: "dot",
-          size: 18,
-          borderWidth: 2,
-          font: { color: "#f8fafc", size: 12, face: "JetBrains Mono", strokeWidth: 0 }
-        },
-        edges: {
-          arrows: "to",
-          smooth: false,
-          color: { color: "#64748b", highlight: "#818cf8" },
-          font: { color: "#cbd5e1", size: 10 }
-        },
-        physics: {
-          solver: "barnesHut",
-          barnesHut: {
-            gravitationalConstant: -4200,
-            centralGravity: 0.06,
-            springLength: 120,
-            springConstant: 0.04,
-            damping: 0.15
-          },
-          stabilization: { iterations: 90, fit: true }
-        },
-        interaction: {
-          hover: true
-        },
-        layout: {
-          improvedLayout: true,
-          randomSeed: 11
-        }
-      });
-
-      network.once("stabilizationIterationsDone", () => {
-        network.setOptions({ physics: false });
-      });
-
-      addInChunks(nodes, rawNodes, rawNodes.length, () => {
-        addInChunks(edges, rawEdges, rawEdges.length);
-      });
+    function paintPointerArea(node, color, ctx) {
+      const radius = Math.max(5, (node.scale || 3.2) + 4);
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(node.x, node.y, radius, 0, 2 * Math.PI, false);
+      ctx.fill();
     }
 
-    function renderForceGraph() {
-      window.devicePixelRatio = 1;
-      const graphData = {
-        nodes: rawNodes.map(node => ({
-          id: node.id,
-          label: node.label,
-          title: node.title,
-          color: node.color.background,
-          borderColor: node.color.border,
-          val: 1
-        })),
-        links: rawEdges.map(edge => ({
-          source: edge.from,
-          target: edge.to,
-          label: edge.label || ""
-        }))
-      };
+    window.devicePixelRatio = 1;
+    const graphData = {
+      nodes: rawNodes.map(node => ({
+        id: node.id,
+        label: node.label,
+        fullLabel: node.fullLabel || node.label,
+        title: node.title,
+        color: node.color.background,
+        borderColor: node.color.border,
+        scale: node.scale || 1,
+        alwaysLabel: Boolean(node.alwaysLabel)
+      })),
+      links: rawEdges.map(edge => ({
+        source: edge.from,
+        target: edge.to,
+        label: edge.label || ""
+      }))
+    };
 
-      const graph = new ForceGraph(container)
-        .graphData(graphData)
-        .backgroundColor("rgba(0,0,0,0)")
-        .nodeId("id")
-        .nodeLabel(node => {
-          if (!node.title && !node.label) {
-            return "";
-          }
-          const safeTitle = (node.title || "").replace(/\n/g, "<br>");
-          const safeLabel = node.label ? `<strong>${node.label}</strong><br>` : "";
-          return `<div style="padding:6px 8px;background:#0f172a;border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:#f8fafc;font-family:JetBrains Mono, monospace;font-size:12px;">${safeLabel}${safeTitle}</div>`;
-        })
-        .nodeRelSize(4)
-        .nodeVal(node => node.val)
-        .nodeColor(node => node.color)
-        .linkColor(() => "rgba(100, 116, 139, 0.18)")
-        .linkWidth(0.35)
-        .cooldownTime(45000)
-        .d3AlphaDecay(0)
-        .d3VelocityDecay(0.08)
-        .enableNodeDrag(true)
-        .enablePanInteraction(true)
-        .enableZoomInteraction(true)
-        .zoom(0.18)
-        .onNodeHover(node => {
-          hoveredNode = node || null;
-          container.style.cursor = node ? "pointer" : "grab";
-        })
-        .onNodeDragEnd(node => {
-          node.fx = node.x;
-          node.fy = node.y;
-        })
-        .onRenderFramePost((ctx, globalScale) => {
-          if (!hoveredNode) {
-            return;
-          }
-          drawNodeLabel(hoveredNode, ctx, globalScale);
-        });
+    const graph = new ForceGraph(container)
+      .graphData(graphData)
+      .backgroundColor("rgba(0,0,0,0)")
+      .nodeId("id")
+      .nodeLabel(node => {
+        const titleLines = escapeHtml(node.title || "").replace(/\n/g, "<br>");
+        const fullName = escapeHtml(node.fullLabel || "");
+        return `<div style="padding:6px 8px;background:#0f172a;border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:#f8fafc;font-family:JetBrains Mono, monospace;font-size:12px;"><strong>${fullName}</strong><br>${titleLines}</div>`;
+      })
+      .nodeCanvasObject(paintNode)
+      .nodeCanvasObjectMode(() => "replace")
+      .nodePointerAreaPaint(paintPointerArea)
+      .linkColor(() => performanceMode ? "rgba(100, 116, 139, 0.16)" : "rgba(100, 116, 139, 0.28)")
+      .linkWidth(() => performanceMode ? 0.3 : 0.55)
+      .linkDirectionalArrowLength(performanceMode ? 0 : 3.5)
+      .linkDirectionalArrowRelPos(1)
+      .cooldownTime(performanceMode ? 60000 : 18000)
+      .d3AlphaDecay(performanceMode ? 0 : 0.028)
+      .d3VelocityDecay(performanceMode ? 0.08 : 0.18)
+      .enableNodeDrag(true)
+      .enablePanInteraction(true)
+      .enableZoomInteraction(true)
+      .enablePointerInteraction(true)
+      .minZoom(0.02)
+      .zoom(performanceMode ? 0.18 : 0.85)
+      .onNodeHover(node => {
+        hoveredNode = node || null;
+        container.style.cursor = node ? "pointer" : "grab";
+      })
+      .onNodeDragEnd(node => {
+        node.fx = node.x;
+        node.fy = node.y;
+      });
 
-      const charge = graph.d3Force("charge");
-      if (charge && typeof charge.strength === "function") {
-        charge.strength(-18);
-      }
-      const linkForce = graph.d3Force("link");
-      if (linkForce && typeof linkForce.distance === "function") {
-        linkForce.distance(18);
-      }
-      if (linkForce && typeof linkForce.strength === "function") {
-        linkForce.strength(0.08);
+    const charge = graph.d3Force("charge");
+    if (charge && typeof charge.strength === "function") {
+      charge.strength(node => -(18 + (node.scale || 1) * (performanceMode ? 2.5 : 5)));
+    }
+    const linkForce = graph.d3Force("link");
+    if (linkForce && typeof linkForce.distance === "function") {
+      linkForce.distance(link => {
+        const sourceScale = typeof link.source === "object" ? (link.source.scale || 1) : 1;
+        const targetScale = typeof link.target === "object" ? (link.target.scale || 1) : 1;
+        const meanScale = (sourceScale + targetScale) / 2;
+        return (performanceMode ? 14 : 30) + meanScale * (performanceMode ? 3 : 5);
+      });
+    }
+    if (linkForce && typeof linkForce.strength === "function") {
+      linkForce.strength(performanceMode ? 0.08 : 0.14);
+    }
+
+    setTimeout(() => {
+      if (typeof graph.zoomToFit === "function") {
+        graph.zoomToFit(250, 80);
       }
       graph.d3ReheatSimulation();
-    }
-
-    if (performanceMode) {
-      renderForceGraph();
-    } else {
-      renderVisNetwork();
-    }
+    }, 50);
   </script>
 </body>
 </html>

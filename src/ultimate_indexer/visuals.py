@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections import Counter
 from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
+from .formatter import qualified_display_name
 from .models import FileGroup
+from .ranking_rules import is_rankable_symbol
 from .storage import Storage
 
 
@@ -63,7 +66,7 @@ def generate_visualization_html(
     if dropped_edge_count > 0:
         notices.append(f"{dropped_edge_count} edges trimmed for browser performance.")
     if performance_mode:
-        notices.append("Performance mode enabled: canvas force layout and lighter rendering are active.")
+        notices.append("Performance mode enabled: tuned canvas force layout and lighter rendering are active.")
     return template.render(
         title=title,
         description=description,
@@ -77,33 +80,6 @@ def generate_visualization_html(
     )
 
 
-def _qualified_label(symbol_rows: dict[str, dict], symbol_id: str) -> str:
-    row = symbol_rows.get(symbol_id)
-    if row is None:
-        return symbol_id
-    relative_path = str(row["relative_path"])
-    if str(row["kind"]) == "File":
-        return relative_path
-
-    parts: list[str] = []
-    current_id = symbol_id
-    seen: set[str] = set()
-    while current_id and current_id not in seen:
-        seen.add(current_id)
-        current = symbol_rows.get(current_id)
-        if current is None:
-            break
-        if str(current["kind"]) == "File":
-            break
-        display_name = str(current["display_name"]).strip()
-        if display_name:
-            parts.append(display_name)
-        parent_id = current["enclosing_symbol_id"]
-        current_id = str(parent_id) if parent_id else ""
-    qualified_name = ".".join(reversed(parts))
-    return f"{relative_path}::{qualified_name}" if qualified_name else relative_path
-
-
 def _rank_value(symbol_rows: dict[str, dict], symbol_id: str) -> float:
     row = symbol_rows.get(symbol_id)
     if row is None:
@@ -112,6 +88,64 @@ def _rank_value(symbol_rows: dict[str, dict], symbol_id: str) -> float:
         return float(row["global_rank"])
     except Exception:
         return 0.0
+
+
+def _is_visible_graph_symbol(row: dict | None) -> bool:
+    if row is None:
+        return False
+    return is_rankable_symbol(str(row["relative_path"]), str(row["kind"]))
+
+
+def _graph_scale(symbol_rows: dict[str, dict], symbol_id: str, max_rank: float) -> float:
+    rank = max(0.0, _rank_value(symbol_rows, symbol_id))
+    if max_rank <= 0:
+        return 1.0
+    normalized = min(1.0, rank / max_rank)
+    return 1.2 + normalized**0.5 * 5.8
+
+
+def _wrapped_graph_label(full_name: str, max_line_length: int = 44, max_lines: int = 4) -> str:
+    if len(full_name) <= max_line_length:
+        return full_name
+
+    lines: list[str] = []
+    remainder = full_name
+    if "::" in full_name:
+        file_part, remainder = full_name.split("::", 1)
+        lines.append(file_part)
+
+    current = ""
+    for token in re.split(r"([./#])", remainder):
+        if not token:
+            continue
+        candidate = f"{current}{token}"
+        if current and len(candidate) > max_line_length:
+            lines.append(current)
+            current = token.lstrip("./#")
+            if len(lines) >= max_lines - 1:
+                break
+            continue
+        current = candidate
+    if current and len(lines) < max_lines:
+        lines.append(current)
+
+    if not lines:
+        lines = [full_name]
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+    if len(lines) == max_lines and sum(len(line) for line in lines) < len(full_name):
+        lines[-1] = f"{lines[-1][: max(0, max_line_length - 1)].rstrip()}…"
+    return "\n".join(lines)
+
+
+def _full_graph_name(symbol_id: str, row: dict, symbol_rows: dict[str, dict]) -> str:
+    relative_path = str(row["relative_path"])
+    qualified = qualified_display_name(symbol_id, str(row["display_name"]), symbol_rows).strip()
+    if not qualified:
+        return relative_path
+    if qualified == relative_path or qualified.startswith(f"{relative_path}::"):
+        return qualified
+    return f"{relative_path}::{qualified}"
 
 
 def _trim_edges_for_budget(
@@ -159,7 +193,7 @@ def write_query_visualization(
         max_edges = _env_int("ULTIMATE_INDEXER_VISUAL_MAX_EDGES", 0)
     perf_node_threshold = _env_int("ULTIMATE_INDEXER_VISUAL_PERF_NODES", 1200)
     perf_edge_threshold = _env_int("ULTIMATE_INDEXER_VISUAL_PERF_EDGES", 3000)
-    label_budget = _env_int("ULTIMATE_INDEXER_VISUAL_LABEL_BUDGET", 300)
+    label_budget = _env_int("ULTIMATE_INDEXER_VISUAL_LABEL_BUDGET", 60)
     edge_chunk_size = _env_int("ULTIMATE_INDEXER_VISUAL_EDGE_CHUNK", 1200)
 
     symbol_rows = storage.get_symbol_rows(project_id)
@@ -168,16 +202,24 @@ def write_query_visualization(
     core_ids: set[str] = set()
     for group in groups:
         for symbol in group.symbols[:3]:
+            row = symbol_rows.get(symbol.symbol_id)
+            if not _is_visible_graph_symbol(row):
+                continue
             selected_ids.add(symbol.symbol_id)
             core_ids.add(symbol.symbol_id)
-            row = symbol_rows.get(symbol.symbol_id)
             if row and row["enclosing_symbol_id"]:
                 parent_id = str(row["enclosing_symbol_id"])
-                selected_ids.add(parent_id)
-                core_ids.add(parent_id)
+                parent_row = symbol_rows.get(parent_id)
+                if _is_visible_graph_symbol(parent_row):
+                    selected_ids.add(parent_id)
+                    core_ids.add(parent_id)
     for edge in all_edges:
         source = str(edge["source_symbol_id"])
         target = str(edge["target_symbol_id"])
+        source_row = symbol_rows.get(source)
+        target_row = symbol_rows.get(target)
+        if not _is_visible_graph_symbol(source_row) or not _is_visible_graph_symbol(target_row):
+            continue
         if source in selected_ids or target in selected_ids:
             selected_ids.add(source)
             selected_ids.add(target)
@@ -202,6 +244,10 @@ def write_query_visualization(
         target = str(edge["target_symbol_id"])
         if source not in selected_ids or target not in selected_ids:
             continue
+        source_row = symbol_rows.get(source)
+        target_row = symbol_rows.get(target)
+        if not _is_visible_graph_symbol(source_row) or not _is_visible_graph_symbol(target_row):
+            continue
         edges.append(
             {
                 "from": source,
@@ -212,37 +258,42 @@ def write_query_visualization(
 
     edges, dropped_edge_count = _trim_edges_for_budget(edges, core_ids, max_edges=max_edges)
     performance_mode = len(selected_ids) >= perf_node_threshold or len(edges) >= perf_edge_threshold
+    max_rank = max((_rank_value(symbol_rows, symbol_id) for symbol_id in selected_ids), default=0.0)
 
-    if performance_mode:
-        ranked_ids = sorted(
-            selected_ids,
-            key=lambda symbol_id: (
-                symbol_id not in core_ids,
-                -_rank_value(symbol_rows, symbol_id),
-                symbol_id,
-            ),
-        )
+    ranked_ids = sorted(
+        selected_ids,
+        key=lambda symbol_id: (
+            symbol_id not in core_ids,
+            -_rank_value(symbol_rows, symbol_id),
+            symbol_id,
+        ),
+    )
+    if len(selected_ids) <= 120:
+        labeled_ids = set(selected_ids)
+    else:
         labeled_ids = set(ranked_ids[: max(0, label_budget)])
         labeled_ids.update(core_ids)
+    if performance_mode:
         for edge in edges:
             edge.pop("label", None)
-    else:
-        labeled_ids = selected_ids
 
     nodes = []
     for symbol_id in sorted(selected_ids):
         row = symbol_rows.get(symbol_id)
-        if row is None:
+        if not _is_visible_graph_symbol(row):
             continue
         color = _node_color(str(row["kind"]))
-        label = _qualified_label(symbol_rows, symbol_id) if symbol_id in labeled_ids else ""
+        full_name = _full_graph_name(symbol_id, row, symbol_rows)
         nodes.append(
             {
                 "id": symbol_id,
-                "label": label,
+                "label": _wrapped_graph_label(full_name),
+                "fullLabel": full_name,
                 "group": str(row["kind"]),
-                "title": f"{row['kind']}\\n{row['relative_path']}",
+                "title": f"{full_name}\n{row['kind']}\n{row['relative_path']}",
                 "color": color,
+                "scale": _graph_scale(symbol_rows, symbol_id, max_rank),
+                "alwaysLabel": symbol_id in labeled_ids,
             }
         )
 

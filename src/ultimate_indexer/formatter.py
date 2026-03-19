@@ -516,7 +516,11 @@ def _qualified_display_name(symbol_id: str, fallback_name: str, symbol_rows: dic
         deduped_parts.append(part)
     qualified_from_hierarchy = ".".join(deduped_parts)
 
-    fallback_from_symbol = _qualified_from_scip_symbol(str(row["scip_symbol"] or symbol_id))
+    try:
+        scip_symbol = str(row["scip_symbol"] or symbol_id)
+    except Exception:
+        scip_symbol = symbol_id
+    fallback_from_symbol = _qualified_from_scip_symbol(scip_symbol)
     if fallback_from_symbol:
         hierarchy_depth = qualified_from_hierarchy.count(".") + qualified_from_hierarchy.count("/")
         fallback_depth = fallback_from_symbol.count(".") + fallback_from_symbol.count("/")
@@ -527,6 +531,10 @@ def _qualified_display_name(symbol_id: str, fallback_name: str, symbol_rows: dic
     if fallback_from_symbol:
         return fallback_from_symbol
     return fallback_name
+
+
+def qualified_display_name(symbol_id: str, fallback_name: str, symbol_rows: dict[str, object]) -> str:
+    return _qualified_display_name(symbol_id, fallback_name, symbol_rows)
 
 
 def _symbol_declaration_block(

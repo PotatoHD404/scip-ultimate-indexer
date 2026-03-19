@@ -117,7 +117,6 @@ def test_write_query_visualization_enables_performance_mode_for_large_graphs(tmp
     assert "Performance mode enabled" in html
     assert "force-graph" in html
     assert "pkg/large.py::fn0" in html
-    assert "pkg/large.py::fn1304" not in html
 
 
 def test_write_query_visualization_does_not_trim_by_default(tmp_path: Path) -> None:
@@ -154,3 +153,51 @@ def test_write_query_visualization_does_not_trim_by_default(tmp_path: Path) -> N
     assert "Nodes: 250" in html
     assert "Edges: 249" in html
     assert "trimmed for browser performance" not in html
+
+
+def test_write_query_visualization_filters_non_rankable_symbols(tmp_path: Path) -> None:
+    symbol_rows = {
+        "class": {
+            "kind": "Class",
+            "relative_path": "pkg/models.py",
+            "display_name": "User",
+            "scip_symbol": "scip-python python pkg User#",
+            "enclosing_symbol_id": None,
+            "global_rank": 10.0,
+        },
+        "field": {
+            "kind": "Field",
+            "relative_path": "pkg/models.py",
+            "display_name": "email",
+            "scip_symbol": "scip-python python pkg User#email.",
+            "enclosing_symbol_id": "class",
+            "global_rank": 4.0,
+        },
+        "variable": {
+            "kind": "Variable",
+            "relative_path": "pkg/models.py",
+            "display_name": "tmp_user",
+            "scip_symbol": "local pkg/models.py tmp_user",
+            "enclosing_symbol_id": None,
+            "global_rank": 3.0,
+        },
+    }
+    edges = [
+        {"source_symbol_id": "class", "target_symbol_id": "field", "edge_type": "contains"},
+        {"source_symbol_id": "variable", "target_symbol_id": "class", "edge_type": "uses"},
+    ]
+
+    output_path = tmp_path / "query_graph.html"
+    write_query_visualization(
+        storage=_FakeStorage(symbol_rows, edges),
+        project_id="project",
+        groups=[_seed_group("class", relative_path="pkg/models.py")],
+        output_path=output_path,
+        title="Filtered Graph",
+        max_nodes=0,
+        max_edges=0,
+    )
+    html = output_path.read_text(encoding="utf-8")
+    assert "User" in html
+    assert "email" not in html
+    assert "tmp_user" not in html

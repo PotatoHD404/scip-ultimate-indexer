@@ -52,7 +52,7 @@ def test_top_symbols_and_visualization(fixture_project: Path, monkeypatch) -> No
         output_path = indexer.visualize(groups, title="Greeting graph")
         assert output_path.exists()
         html = output_path.read_text(encoding="utf-8")
-        assert "vis-network" in html
+        assert "force-graph" in html
         assert "Greeting graph" in html
         assert "pkg/services.py::GreetingService" in html
     finally:
