@@ -19,6 +19,7 @@ DEFAULT_EDGE_WEIGHTS = {
 @dataclass(slots=True)
 class Settings:
     project_root: Path
+    state_dir_override: Path | None = None
     state_dir: Path = field(init=False)
     database_path: Path = field(init=False)
     visuals_dir: Path = field(init=False)
@@ -56,7 +57,10 @@ class Settings:
 
     def __post_init__(self) -> None:
         self.project_root = self.project_root.resolve()
-        self.state_dir = self.project_root / ".ultimate_indexer"
+        if self.state_dir_override is not None:
+            self.state_dir = self.state_dir_override.expanduser().resolve()
+        else:
+            self.state_dir = self.project_root / ".ultimate_indexer"
         self.database_path = self.state_dir / "index.sqlite3"
         self.visuals_dir = self.state_dir / "visuals"
         self.cache_dir = self.state_dir / "cache"

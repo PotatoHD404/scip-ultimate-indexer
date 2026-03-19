@@ -22,6 +22,22 @@ DEPENDENCY_EDGE_TYPES = {
 COMPOSITIONAL_EDGE_TYPES = {
     "contains",
 }
+TYPE_CONTAINER_KINDS = {
+    "class",
+    "struct",
+    "interface",
+    "trait",
+    "enum",
+    "typealias",
+    "type",
+}
+TYPE_MEMBER_KINDS = {
+    "method",
+    "field",
+    "property",
+    "constant",
+    "const",
+}
 KIND_BOOSTS = {
     "struct": 1.4,
     "interface": 1.5,
@@ -109,14 +125,22 @@ def dependency_ordered_pagerank(
             continue
         if edge_type in DEPENDENCY_EDGE_TYPES:
             _add_weight(target, source, base_weight)
-            _add_weight(source, target, base_weight * 0.15)
+            _add_weight(source, target, base_weight * 0.10)
             continue
         if edge_type in COMPOSITIONAL_EDGE_TYPES:
-            _add_weight(source, target, base_weight * 0.85)
-            _add_weight(target, source, base_weight * 0.85)
+            source_kind = _symbol_kind(rankable_rows[source])
+            target_kind = _symbol_kind(rankable_rows[target])
+            if source_kind in TYPE_CONTAINER_KINDS and target_kind in TYPE_MEMBER_KINDS:
+                factor = 0.85
+            elif target_kind in TYPE_CONTAINER_KINDS and source_kind in TYPE_MEMBER_KINDS:
+                factor = 0.85
+            else:
+                factor = 0.20
+            _add_weight(source, target, base_weight * factor)
+            _add_weight(target, source, base_weight * factor)
             continue
         _add_weight(target, source, base_weight * 0.5)
-        _add_weight(source, target, base_weight * 0.15)
+        _add_weight(source, target, base_weight * 0.10)
 
     filtered_personalization = None
     if personalization:

@@ -30,4 +30,19 @@ def test_clean_symbol_display_name_prefers_docstring_and_symbol_tail() -> None:
         display_name="",
         docstring="",
         relative_path="lib/i18n.ts",
-    ) == "getDictionary()"
+    ) == "getDictionary"
+
+
+def test_clean_symbol_display_name_extracts_member_leafs_from_scip_descriptor() -> None:
+    assert clean_symbol_display_name(
+        symbol="scip-go gomod demo `models`/Table#Validate().",
+        display_name="",
+        docstring="",
+        relative_path="models/table.go",
+    ) == "Validate"
+    assert clean_symbol_display_name(
+        symbol="scip-go gomod demo `models`/Table#Name:",
+        display_name="",
+        docstring="",
+        relative_path="models/table.go",
+    ) == "Name"

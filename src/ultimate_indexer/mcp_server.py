@@ -7,7 +7,11 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from .formatter import format_groups_compact, format_top_symbols, truncate_text
+from .formatter import (
+    format_important_symbols_codegraph,
+    format_search_symbols_codegraph,
+    truncate_text,
+)
 from .indexer import UltimateIndexer
 
 
@@ -84,6 +88,8 @@ def build_mcp(
 ) -> FastMCP:
     cache_dir = Path(cache_dir).resolve()
     cache_dir.mkdir(parents=True, exist_ok=True)
+    index_cache_dir = cache_dir / "indexes"
+    index_cache_dir.mkdir(parents=True, exist_ok=True)
     server = FastMCP(
         "scip-ultimate-indexer",
         log_level="WARNING",
@@ -106,7 +112,11 @@ def build_mcp(
         cache_key = (str(resolved_path), backend)
         indexer = indexers.get(cache_key)
         if indexer is None:
-            indexer = UltimateIndexer(resolved_path, embedding_backend=backend)
+            indexer = UltimateIndexer(
+                resolved_path,
+                embedding_backend=backend,
+                cache_base_dir=index_cache_dir,
+            )
             if embedding_model:
                 indexer.settings.model_path = embedding_model
             if embedding_n_ctx > 0:
@@ -180,7 +190,14 @@ def build_mcp(
             groups = filtered_groups
         if not hybrid:
             groups = groups[:count]
-        return format_groups_compact(indexer.storage, indexer.project_id, groups)
+        return format_search_symbols_codegraph(
+            indexer.storage,
+            indexer.project_id,
+            query,
+            groups,
+            max_results=count,
+            max_chars=4_000,
+        )
 
     @server.tool()
     def get_important_symbols(
@@ -192,7 +209,13 @@ def build_mcp(
     ) -> str:
         indexer = get_indexer(project, embedding_backend)
         rows = indexer.important_symbols(limit=count, metric=metric, kind_filter=kind)
-        return truncate_text(format_top_symbols(rows, include_scores=True), 4_000)
+        return format_important_symbols_codegraph(
+            indexer.storage,
+            indexer.project_id,
+            rows,
+            metric=metric,
+            max_chars=4_000,
+        )
 
     @server.tool()
     def get_project_overview(

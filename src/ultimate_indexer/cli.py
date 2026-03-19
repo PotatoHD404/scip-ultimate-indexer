@@ -18,6 +18,14 @@ app = typer.Typer(add_completion=False)
 console = Console()
 
 
+def _build_indexer(project_path: Path, embedding_backend: str, cache_dir: Path | None) -> UltimateIndexer:
+    return UltimateIndexer(
+        project_path,
+        embedding_backend=embedding_backend,
+        cache_base_dir=cache_dir.resolve() if cache_dir is not None else None,
+    )
+
+
 class _IndexProgressDisplay:
     def __init__(self, *, enabled: bool) -> None:
         self.enabled = enabled
@@ -67,9 +75,10 @@ def index(
     force: bool = typer.Option(False, "--force"),
     scip_path: Path | None = typer.Option(None, "--scip-path"),
     embedding_backend: str = typer.Option("auto", "--embedding-backend"),
+    cache_dir: Path | None = typer.Option(None, "--cache-dir"),
     progress: bool = typer.Option(True, "--progress/--no-progress"),
 ) -> None:
-    indexer = UltimateIndexer(project_path, embedding_backend=embedding_backend)
+    indexer = _build_indexer(project_path, embedding_backend, cache_dir)
     try:
         try:
             with _IndexProgressDisplay(enabled=progress and console.is_terminal) as display:
@@ -109,8 +118,9 @@ def query(
     text: str,
     limit: int = typer.Option(10, "--limit"),
     embedding_backend: str = typer.Option("auto", "--embedding-backend"),
+    cache_dir: Path | None = typer.Option(None, "--cache-dir"),
 ) -> None:
-    indexer = UltimateIndexer(project_path, embedding_backend=embedding_backend)
+    indexer = _build_indexer(project_path, embedding_backend, cache_dir)
     try:
         groups = indexer.query(text, limit=limit)
         console.print(format_groups(indexer.storage, indexer.project_id, groups))
@@ -123,8 +133,9 @@ def top_symbols(
     project_path: Path,
     limit: int = typer.Option(10, "--limit"),
     embedding_backend: str = typer.Option("auto", "--embedding-backend"),
+    cache_dir: Path | None = typer.Option(None, "--cache-dir"),
 ) -> None:
-    indexer = UltimateIndexer(project_path, embedding_backend=embedding_backend)
+    indexer = _build_indexer(project_path, embedding_backend, cache_dir)
     try:
         console.print(format_top_symbols(indexer.top_symbols(limit=limit)))
     finally:
@@ -137,8 +148,9 @@ def visualize(
     query: str,
     limit: int = typer.Option(10, "--limit"),
     embedding_backend: str = typer.Option("auto", "--embedding-backend"),
+    cache_dir: Path | None = typer.Option(None, "--cache-dir"),
 ) -> None:
-    indexer = UltimateIndexer(project_path, embedding_backend=embedding_backend)
+    indexer = _build_indexer(project_path, embedding_backend, cache_dir)
     try:
         groups = indexer.query(query, limit=limit)
         output_path = indexer.visualize(groups, title=f"Results for: {query}")

@@ -131,14 +131,56 @@ def _classify_edge(syntax_kind: int) -> str:
     return "uses"
 
 
+def _definition_priority(symbol_id: str, kind: str) -> int:
+    if symbol_id.startswith("local::"):
+        return 0
+    normalized = kind.replace("_", "").replace("-", "").lower()
+    if normalized in {"function", "method", "class", "struct", "interface", "trait", "enum", "typealias", "type"}:
+        return 5
+    if normalized in {"module", "namespace", "package", "constant", "const"}:
+        return 3
+    if normalized in {"field", "property", "parameter", "variable"}:
+        return 1
+    if normalized in {"file", "section", "unknown"}:
+        return 0
+    return 2
+
+
+def _parent_symbol_from_scip_symbol(symbol: str) -> str | None:
+    if symbol.startswith("local "):
+        return None
+    parts = symbol.split()
+    if len(parts) < 4:
+        return None
+    prefix = " ".join(parts[:-1])
+    descriptor = parts[-1].strip()
+    if not descriptor or descriptor.endswith("/"):
+        return None
+
+    if "#" in descriptor:
+        hash_index = descriptor.rfind("#")
+        member_part = descriptor[hash_index + 1 :]
+        if member_part in {"", "."}:
+            slash_index = descriptor.rfind("/")
+            if slash_index <= 0:
+                return None
+            return f"{prefix} {descriptor[: slash_index + 1]}"
+        return f"{prefix} {descriptor[: hash_index + 1]}"
+
+    slash_index = descriptor.rfind("/")
+    if slash_index <= 0:
+        return None
+    return f"{prefix} {descriptor[: slash_index + 1]}"
+
+
 def _best_enclosing_definition(
-    definitions: list[tuple[tuple[int, int, int, int], str]],
+    definitions: list[tuple[tuple[int, int, int, int], str, int]],
     position: tuple[int, ...],
     *,
     exclude_symbol_id: str | None = None,
 ) -> str | None:
-    best_span = None
-    for full_range, symbol_id in definitions:
+    best_choice: tuple[tuple[int, int], int, str] | None = None
+    for full_range, symbol_id, priority in definitions:
         if exclude_symbol_id is not None and symbol_id == exclude_symbol_id:
             continue
         start_line, start_col, end_line, end_col = (full_range + (0, 0, 0, 0))[:4]
@@ -148,9 +190,9 @@ def _best_enclosing_definition(
             end_line > pos_line or (end_line == pos_line and end_col >= pos_col)
         ):
             span = (end_line - start_line, end_col - start_col)
-            if best_span is None or span < best_span[0]:
-                best_span = (span, symbol_id)
-    return None if best_span is None else best_span[1]
+            if best_choice is None or span < best_choice[0] or (span == best_choice[0] and priority > best_choice[1]):
+                best_choice = (span, priority, symbol_id)
+    return None if best_choice is None else best_choice[2]
 
 
 def parse_scip_index(
@@ -169,7 +211,7 @@ def parse_scip_index(
     symbols: list[SymbolRecord] = []
     edges: list[EdgeRecord] = []
     symbols_by_key: dict[str, SymbolRecord] = {}
-    def_ranges: dict[str, list[tuple[tuple[int, int, int, int], str]]] = {}
+    def_ranges: dict[str, list[tuple[tuple[int, int, int, int], str, int]]] = {}
 
     for document in index.documents:
         document_relative_path = document.relative_path
@@ -205,13 +247,27 @@ def parse_scip_index(
         symbols.append(file_symbol)
         symbols_by_key[file_symbol.symbol_id] = file_symbol
 
-        defs: list[tuple[tuple[int, int, int, int], str]] = []
+        declared_symbol_ids: set[str] = set()
+        declared_symbol_kinds: dict[str, str] = {}
+        for info in document.symbols:
+            if info.symbol.startswith("file::"):
+                continue
+            normalized_symbol_id = _normalize_symbol_id(relative_path, info.symbol)
+            declared_symbol_ids.add(normalized_symbol_id)
+            declared_symbol_kinds[normalized_symbol_id] = _kind_name(info.kind)
+
+        defs: list[tuple[tuple[int, int, int, int], str, int]] = []
         occurrences = list(document.occurrences)
         for occurrence in occurrences:
             role = getattr(occurrence, "symbol_roles", getattr(occurrence, "role", 0))
             if role & scip_pb2.Definition:
                 full_range = tuple(occurrence.enclosing_range or occurrence.range or [0, 0, 0, 0])
-                defs.append((full_range, _normalize_symbol_id(relative_path, occurrence.symbol)))
+                normalized_definition_id = _normalize_symbol_id(relative_path, occurrence.symbol)
+                priority = _definition_priority(
+                    normalized_definition_id,
+                    declared_symbol_kinds.get(normalized_definition_id, "Unknown"),
+                )
+                defs.append((full_range, normalized_definition_id, priority))
         def_ranges[relative_path] = defs
 
         for info in document.symbols:
@@ -242,6 +298,17 @@ def parse_scip_index(
                 definition_position,
                 exclude_symbol_id=normalized_symbol_id,
             )
+            enclosing_from_info = ""
+            if info.enclosing_symbol:
+                candidate = _normalize_symbol_id(relative_path, info.enclosing_symbol)
+                if candidate == f"file::{relative_path}" or candidate in declared_symbol_ids:
+                    enclosing_from_info = candidate
+            parsed_parent_symbol_id = ""
+            parsed_parent = _parent_symbol_from_scip_symbol(info.symbol)
+            if parsed_parent:
+                candidate = _normalize_symbol_id(relative_path, parsed_parent)
+                if candidate in declared_symbol_ids:
+                    parsed_parent_symbol_id = candidate
             record = SymbolRecord(
                 project_id=project_id,
                 symbol_id=normalized_symbol_id,
@@ -262,9 +329,10 @@ def parse_scip_index(
                 enclosing_symbol_id=(
                     derived_enclosing_symbol_id
                     if derived_enclosing_symbol_id is not None
-                    else
-                    _normalize_symbol_id(relative_path, info.enclosing_symbol)
-                    if info.enclosing_symbol
+                    else enclosing_from_info
+                    if enclosing_from_info
+                    else parsed_parent_symbol_id
+                    if parsed_parent_symbol_id
                     else f"file::{relative_path}"
                 ),
             )
@@ -300,7 +368,7 @@ def parse_scip_index(
             source_symbol_id = f"file::{normalized_relative_path}"
             position = tuple(occurrence.enclosing_range or occurrence.range or [0, 0, 0, 0])
             enclosing_symbol_id = _best_enclosing_definition(definitions, position)
-            if enclosing_symbol_id is not None:
+            if enclosing_symbol_id is not None and enclosing_symbol_id in symbols_by_key:
                 source_symbol_id = enclosing_symbol_id
             edge_type = _classify_edge(occurrence.syntax_kind)
             edge_key = (source_symbol_id, target_symbol_id, edge_type)

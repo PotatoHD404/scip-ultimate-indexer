@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from collections import Counter, defaultdict
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
@@ -279,8 +280,21 @@ def _normalized_kind(kind: str) -> str:
 
 
 class UltimateIndexer:
-    def __init__(self, project_root: Path, embedding_backend: str | None = None) -> None:
-        self.settings = Settings(project_root=project_root)
+    def __init__(
+        self,
+        project_root: Path,
+        embedding_backend: str | None = None,
+        *,
+        state_dir: Path | None = None,
+        cache_base_dir: Path | None = None,
+    ) -> None:
+        resolved_root = project_root.resolve()
+        resolved_state_dir = state_dir
+        if resolved_state_dir is None and cache_base_dir is not None:
+            project_hash = sha256(str(resolved_root).encode("utf-8")).hexdigest()[:12]
+            safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", resolved_root.name).strip("-") or "project"
+            resolved_state_dir = cache_base_dir.resolve() / f"{safe_name}-{project_hash}"
+        self.settings = Settings(project_root=resolved_root, state_dir_override=resolved_state_dir)
         if embedding_backend is not None:
             self.settings.embedding_backend = embedding_backend
         self.settings.ensure_directories()
@@ -426,7 +440,7 @@ class UltimateIndexer:
         ranks = dependency_ordered_pagerank(
             symbol_rows,
             self.storage.get_edges(self.project_id),
-            alpha=0.15,
+            alpha=0.85,
         )
         boosted = {
             symbol_id: apply_kind_boost(symbol_rows[symbol_id], score)

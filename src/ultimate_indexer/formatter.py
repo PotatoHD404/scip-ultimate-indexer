@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 
-from .models import FileGroup, TreeScoreNode
+from .models import FileGroup, RankedSymbol, TreeScoreNode
 from .storage import Storage
 
 
@@ -432,6 +433,233 @@ def format_top_symbols(rows: list, *, include_scores: bool = True) -> str:
             line += f" score={float(row['global_rank']):.5f}"
         lines.append(line)
     return "\n".join(lines)
+
+
+def _qualified_from_scip_symbol(symbol: str) -> str:
+    if not symbol:
+        return ""
+    if symbol.startswith(
+        (
+            "local ",
+            "local::",
+            "file::",
+            "module::",
+            "section::",
+            "artifact::",
+            "artifact-item::",
+        )
+    ):
+        return ""
+    parts = symbol.split()
+    if len(parts) < 4:
+        return ""
+    package = parts[2].strip()
+    descriptor = parts[-1].strip()
+    if not descriptor:
+        return ""
+
+    clean = descriptor.rstrip(".")
+    clean = clean.replace("().", "").replace("()", "")
+    descriptor_parts = [
+        part.strip("`")
+        for part in re.split(r"[#:/]", clean)
+        if part and part.strip("`")
+    ]
+    if not descriptor_parts:
+        return ""
+    descriptor_path = ".".join(descriptor_parts)
+
+    package_clean = re.sub(
+        r"^(github\.com|gitlab\.com|golang\.org/x|bitbucket\.org)/[^/]+/",
+        "",
+        package,
+    )
+    package_parts = [part for part in package_clean.replace("\\", "/").split("/") if part]
+    if len(package_parts) >= 2:
+        package_short = "/".join(package_parts[-2:])
+    elif package_parts:
+        package_short = package_parts[-1]
+    else:
+        package_short = ""
+
+    if package_short and package_short not in descriptor_path:
+        return f"{package_short}.{descriptor_path}"
+    return descriptor_path
+
+
+def _qualified_display_name(symbol_id: str, fallback_name: str, symbol_rows: dict[str, object]) -> str:
+    row = symbol_rows.get(symbol_id)
+    if row is None:
+        return fallback_name
+    names = [str(row["display_name"])]
+    current = row
+    seen: set[str] = {symbol_id}
+    while True:
+        enclosing_symbol_id = str(current["enclosing_symbol_id"] or "")
+        if not enclosing_symbol_id or enclosing_symbol_id in seen:
+            break
+        seen.add(enclosing_symbol_id)
+        parent = symbol_rows.get(enclosing_symbol_id)
+        if parent is None:
+            break
+        parent_kind = str(parent["kind"])
+        if parent_kind in {"File", "Section", "Unknown"}:
+            break
+        names.append(str(parent["display_name"]))
+        current = parent
+    qualified_parts = list(reversed([name for name in names if name]))
+    deduped_parts: list[str] = []
+    for part in qualified_parts:
+        if deduped_parts and deduped_parts[-1] == part:
+            continue
+        deduped_parts.append(part)
+    qualified_from_hierarchy = ".".join(deduped_parts)
+
+    fallback_from_symbol = _qualified_from_scip_symbol(str(row["scip_symbol"] or symbol_id))
+    if fallback_from_symbol:
+        hierarchy_depth = qualified_from_hierarchy.count(".") + qualified_from_hierarchy.count("/")
+        fallback_depth = fallback_from_symbol.count(".") + fallback_from_symbol.count("/")
+        if fallback_depth > hierarchy_depth:
+            return fallback_from_symbol
+    if qualified_from_hierarchy:
+        return qualified_from_hierarchy
+    if fallback_from_symbol:
+        return fallback_from_symbol
+    return fallback_name
+
+
+def _symbol_declaration_block(
+    storage: Storage,
+    project_id: str,
+    symbol: RankedSymbol,
+    symbol_rows: dict[str, object],
+    *,
+    include_members: bool,
+) -> list[str]:
+    row = symbol_rows.get(symbol.symbol_id)
+    kind = str(row["kind"]) if row is not None else symbol.kind
+    display_name = str(row["display_name"]) if row is not None else symbol.display_name
+    signature = str(row["signature"]) if row is not None else symbol.signature
+    docstring = str(row["docstring"]) if row is not None else symbol.docstring
+    snippet = str(row["snippet"]) if row is not None else symbol.snippet
+    relative_path = str(row["relative_path"]) if row is not None else symbol.relative_path
+    pretty_signature = _pretty_signature(kind, display_name, signature, docstring, snippet)
+    comment_prefix = _comment_prefix(relative_path)
+
+    lines: list[str] = []
+    doc_lines = [
+        line
+        for line in _render_docstring(docstring, comment_prefix)
+        if line.removeprefix(f"{comment_prefix} ").strip() != pretty_signature.strip()
+    ]
+    lines.extend(doc_lines)
+    if include_members and _is_composite_symbol(kind, signature, docstring, snippet):
+        lines.extend(
+            _render_class_interface(
+                storage=storage,
+                project_id=project_id,
+                symbol_id=symbol.symbol_id,
+                kind=kind,
+                display_name=display_name,
+                signature=pretty_signature,
+                comment_prefix=comment_prefix,
+                snippet=snippet,
+                relative_path=relative_path,
+            )
+        )
+    else:
+        lines.extend(
+            _render_function_block(
+                signature=pretty_signature,
+                snippet=snippet,
+                comment_prefix=comment_prefix,
+            )
+        )
+    return lines
+
+
+def format_search_symbols_codegraph(
+    storage: Storage,
+    project_id: str,
+    query: str,
+    groups: list[FileGroup],
+    *,
+    max_results: int = 10,
+    max_chars: int = 4_000,
+) -> str:
+    symbol_rows = storage.get_symbol_rows(project_id)
+    symbol_map: dict[str, RankedSymbol] = {}
+    for group in groups:
+        for symbol in group.symbols:
+            existing = symbol_map.get(symbol.symbol_id)
+            if existing is None or symbol.score > existing.score:
+                symbol_map[symbol.symbol_id] = symbol
+
+    ranked = sorted(
+        symbol_map.values(),
+        key=lambda item: (-item.score, item.relative_path, item.display_name),
+    )[:max_results]
+    lines = [f"// Search: {query}", ""]
+    for symbol in ranked:
+        row = symbol_rows.get(symbol.symbol_id)
+        kind = str(row["kind"]) if row is not None else symbol.kind
+        relative_path = str(row["relative_path"]) if row is not None else symbol.relative_path
+        start_line = int(row["start_line"]) if row is not None else 0
+        qualified = _qualified_display_name(symbol.symbol_id, symbol.display_name, symbol_rows)
+        location = f"{relative_path}:{start_line}" if start_line > 0 else relative_path
+        lines.append(f"// {qualified}  ({kind})  {location}  score={symbol.score:.4f}")
+        include_members = kind in {"Class", "Struct", "Interface", "Trait", "Enum", "TypeAlias"}
+        lines.extend(
+            _symbol_declaration_block(
+                storage,
+                project_id,
+                symbol,
+                symbol_rows,
+                include_members=include_members,
+            )
+        )
+        lines.append("")
+    return truncate_text("\n".join(lines).strip(), max_chars)
+
+
+def format_important_symbols_codegraph(
+    storage: Storage,
+    project_id: str,
+    rows: list,
+    *,
+    metric: str = "pagerank",
+    max_chars: int = 4_000,
+) -> str:
+    symbol_rows = storage.get_symbol_rows(project_id)
+    lines = [f"// Top {len(rows)} symbols by {metric}", ""]
+    for index, row in enumerate(rows, start=1):
+        symbol_id = str(row["symbol_id"])
+        symbol = RankedSymbol(
+            symbol_id=symbol_id,
+            relative_path=str(row["relative_path"]),
+            display_name=str(row["display_name"]),
+            kind=str(row["kind"]),
+            score=float(row["global_rank"]),
+            signature=str(row["signature"]),
+            docstring=str(row["docstring"]),
+            snippet=str(row["snippet"]),
+        )
+        qualified = _qualified_display_name(symbol_id, symbol.display_name, symbol_rows)
+        start_line = int(row["start_line"])
+        location = f"{symbol.relative_path}:{start_line}" if start_line > 0 else symbol.relative_path
+        lines.append(f"// #{index}  {qualified}  score={float(row['global_rank']):.4f}  {location}")
+        include_members = symbol.kind in {"Class", "Struct", "Interface", "Trait", "Enum", "TypeAlias"}
+        lines.extend(
+            _symbol_declaration_block(
+                storage,
+                project_id,
+                symbol,
+                symbol_rows,
+                include_members=include_members,
+            )
+        )
+        lines.append("")
+    return truncate_text("\n".join(lines).strip(), max_chars)
 
 
 def _tree_label(node: TreeScoreNode) -> str:

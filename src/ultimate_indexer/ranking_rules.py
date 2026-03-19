@@ -83,6 +83,37 @@ def _first_docstring_line(docstring: str) -> str:
     return ""
 
 
+def _symbol_leaf_name(symbol: str, relative_path: str) -> str:
+    descriptor = symbol
+    parts = symbol.split()
+    if len(parts) >= 4:
+        descriptor = parts[-1]
+    descriptor = descriptor.strip()
+    if not descriptor:
+        return PurePosixPath(relative_path).stem
+
+    descriptor = re.sub(r"'\+\d+$", "", descriptor.rstrip("."))
+    if "#" in descriptor:
+        _, member = descriptor.rsplit("#", 1)
+        member = member.strip().rstrip(":")
+        if member.endswith("()"):
+            member = member[:-2]
+        member_match = re.search(r"[A-Za-z_][\w$]*$", member)
+        if member_match:
+            return member_match.group(0)
+        owner = descriptor.rsplit("#", 1)[0].split("/")[-1].strip("`")
+        if owner:
+            return owner
+
+    leaf = descriptor.split("/")[-1].strip("`").rstrip(":")
+    if leaf.endswith("()"):
+        leaf = leaf[:-2]
+    leaf_match = re.search(r"[A-Za-z_][\w$]*$", leaf)
+    if leaf_match:
+        return leaf_match.group(0)
+    return leaf or PurePosixPath(relative_path).stem
+
+
 def clean_symbol_display_name(symbol: str, display_name: str, docstring: str, relative_path: str) -> str:
     cleaned_display_name = display_name.strip()
     if cleaned_display_name and cleaned_display_name != symbol:
@@ -94,9 +125,5 @@ def clean_symbol_display_name(symbol: str, display_name: str, docstring: str, re
         if match:
             return match.group(1)
 
-    candidate = symbol.rsplit("/", 1)[-1].strip() or PurePosixPath(relative_path).stem
-    candidate = re.sub(r"[#.:]$", "", candidate)
-    candidate = re.sub(r"'\+\d+$", "", candidate)
-    if "#" in candidate and not re.search(r"[A-Za-z_][\w$]*$", candidate.split("#", 1)[-1]):
-        candidate = candidate.split("#", 1)[0]
+    candidate = _symbol_leaf_name(symbol, relative_path)
     return candidate or PurePosixPath(relative_path).stem
