@@ -95,6 +95,34 @@ def format_groups(
     return "\n".join(lines).strip()
 
 
+def truncate_text(text: str, max_chars: int, *, note_prefix: str = "//") -> str:
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    suffix = f"\n\n{note_prefix} output truncated for MCP"
+    available = max_chars - len(suffix)
+    if available <= 0:
+        return text[:max_chars]
+    return f"{text[:available].rstrip()}{suffix}"
+
+
+def format_groups_compact(
+    storage: Storage,
+    project_id: str,
+    groups: list[FileGroup],
+    *,
+    max_files: int = 5,
+    max_symbols_per_file: int = 2,
+    max_chars: int = 4_000,
+) -> str:
+    text = format_groups(
+        storage=storage,
+        project_id=project_id,
+        groups=groups[:max_files],
+        max_symbols_per_file=max_symbols_per_file,
+    )
+    return truncate_text(text, max_chars)
+
+
 def format_top_symbols(rows: list) -> str:
     lines = []
     for index, row in enumerate(rows, start=1):

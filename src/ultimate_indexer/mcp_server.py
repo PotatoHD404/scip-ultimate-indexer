@@ -4,12 +4,12 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
-from .formatter import format_groups, format_top_symbols
+from .formatter import format_groups_compact, format_top_symbols, truncate_text
 from .indexer import UltimateIndexer
 
 
 def build_mcp() -> FastMCP:
-    server = FastMCP("scip-ultimate-indexer")
+    server = FastMCP("scip-ultimate-indexer", log_level="WARNING")
 
     @server.tool()
     def index_project(project_path: str, force: bool = False, embedding_backend: str = "auto") -> str:
@@ -33,7 +33,7 @@ def build_mcp() -> FastMCP:
         indexer = UltimateIndexer(Path(project_path), embedding_backend=embedding_backend)
         try:
             groups = indexer.query(query, limit=limit)
-            return format_groups(indexer.storage, indexer.project_id, groups)
+            return format_groups_compact(indexer.storage, indexer.project_id, groups)
         finally:
             indexer.close()
 
@@ -41,7 +41,7 @@ def build_mcp() -> FastMCP:
     def top_project_symbols(project_path: str, limit: int = 10, embedding_backend: str = "auto") -> str:
         indexer = UltimateIndexer(Path(project_path), embedding_backend=embedding_backend)
         try:
-            return format_top_symbols(indexer.top_symbols(limit=limit))
+            return truncate_text(format_top_symbols(indexer.top_symbols(limit=limit)), 4_000)
         finally:
             indexer.close()
 
