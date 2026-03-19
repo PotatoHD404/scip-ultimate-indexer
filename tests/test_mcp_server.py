@@ -8,22 +8,7 @@ import anyio
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
-from ultimate_indexer.indexer import UltimateIndexer
-from ultimate_indexer.python_scip import emit_python_scip
-
-
 def test_query_project_stays_connected_and_returns_compact_output(fixture_project: Path) -> None:
-    python_files = sorted(fixture_project.rglob("*.py"))
-    scip_path = fixture_project / ".ultimate_indexer" / "cache" / "fixture.scip"
-    scip_path.parent.mkdir(parents=True, exist_ok=True)
-    emit_python_scip(fixture_project, python_files, scip_path)
-
-    indexer = UltimateIndexer(fixture_project, embedding_backend="hash")
-    try:
-        indexer.index(force=True, scip_path=scip_path)
-    finally:
-        indexer.close()
-
     async def exercise_mcp() -> None:
         server = StdioServerParameters(
             command=sys.executable,
@@ -34,6 +19,14 @@ def test_query_project_stays_connected_and_returns_compact_output(fixture_projec
             session = ClientSession(read_stream, write_stream)
             async with session:
                 await session.initialize()
+                indexed = await session.call_tool(
+                    "index_project",
+                    {
+                        "project_path": str(fixture_project),
+                        "force": True,
+                        "embedding_backend": "hash",
+                    },
+                )
                 first = await session.call_tool(
                     "query_project",
                     {
@@ -53,6 +46,7 @@ def test_query_project_stays_connected_and_returns_compact_output(fixture_projec
                     },
                 )
 
+                assert indexed.isError is False
                 assert first.isError is False
                 assert second.isError is False
                 assert first.content

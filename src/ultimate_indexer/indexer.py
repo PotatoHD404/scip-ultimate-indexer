@@ -178,6 +178,7 @@ class UltimateIndexer:
         self.project_id = str(self.settings.project_root)
         self.storage = Storage(self.settings.database_path)
         self._provider = None
+        self._query_engine: QueryEngine | None = None
 
     def close(self) -> None:
         self.storage.close()
@@ -575,8 +576,9 @@ class UltimateIndexer:
         )
 
     def query(self, text: str, limit: int = 10):
-        engine = QueryEngine(self.storage, self._provider_instance())
-        return engine.search(self.project_id, text, limit=limit)
+        if self._query_engine is None:
+            self._query_engine = QueryEngine(self.storage, self._provider_instance())
+        return self._query_engine.search(self.project_id, text, limit=limit)
 
     def top_symbols(self, limit: int = 10):
         return self.storage.get_top_symbols(self.project_id, limit)

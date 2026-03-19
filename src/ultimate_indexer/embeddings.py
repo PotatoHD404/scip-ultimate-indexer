@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import io
+import logging
 import os
 import re
 import sys
 import time
-from contextlib import nullcontext
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Protocol, Sequence
@@ -44,6 +46,13 @@ def _backend_log_guard(suppress_logs: bool):
     except Exception:
         return nullcontext()
     return suppress_stdout_stderr(disable=False)
+
+
+def _stream_silence_guard(suppress_logs: bool):
+    if not suppress_logs:
+        return nullcontext(), nullcontext()
+    sink = io.StringIO()
+    return redirect_stdout(sink), redirect_stderr(sink)
 
 
 class EmbeddingProvider(Protocol):
@@ -230,6 +239,7 @@ class SentenceTransformerEmbeddingProvider:
     max_seq_length: int = 0
     use_fp16: bool = False
     normalize_embeddings: bool = True
+    suppress_backend_logs: bool = True
     supports_batching: bool = True
     _model: object | None = field(init=False, repr=False, default=None)
 
@@ -247,20 +257,40 @@ class SentenceTransformerEmbeddingProvider:
                 import torch
                 from sentence_transformers import SentenceTransformer
 
-                if hasattr(torch, "set_float32_matmul_precision"):
-                    torch.set_float32_matmul_precision("high")
-                self._model = SentenceTransformer(
-                    self.model_name,
-                    cache_folder=str(self.cache_dir),
-                    trust_remote_code=True,
-                    device=self.device,
+                huggingface_logger = logging.getLogger("huggingface_hub")
+                sentence_transformers_logger = logging.getLogger("sentence_transformers")
+                transformers_logger = logging.getLogger("transformers")
+                previous_levels = (
+                    huggingface_logger.level,
+                    sentence_transformers_logger.level,
+                    transformers_logger.level,
                 )
-                _apply_sentence_transformer_limits(self._model, self.max_seq_length)
-                if self.use_fp16:
-                    try:
-                        self._model.half()
-                    except Exception:
-                        pass
+                try:
+                    if self.suppress_backend_logs:
+                        huggingface_logger.setLevel(logging.ERROR)
+                        sentence_transformers_logger.setLevel(logging.ERROR)
+                        transformers_logger.setLevel(logging.ERROR)
+                    stdout_guard, stderr_guard = _stream_silence_guard(self.suppress_backend_logs)
+                    with stdout_guard, stderr_guard:
+                        if hasattr(torch, "set_float32_matmul_precision"):
+                            torch.set_float32_matmul_precision("high")
+                        self._model = SentenceTransformer(
+                            self.model_name,
+                            cache_folder=str(self.cache_dir),
+                            trust_remote_code=True,
+                            device=self.device,
+                        )
+                        _apply_sentence_transformer_limits(self._model, self.max_seq_length)
+                        if self.use_fp16:
+                            try:
+                                self._model.half()
+                            except Exception:
+                                pass
+                finally:
+                    if self.suppress_backend_logs:
+                        huggingface_logger.setLevel(previous_levels[0])
+                        sentence_transformers_logger.setLevel(previous_levels[1])
+                        transformers_logger.setLevel(previous_levels[2])
             except ImportError as exc:
                 hint = _remote_dependency_install_hint(self.model_name, exc)
                 if hint is None:
@@ -274,7 +304,8 @@ class SentenceTransformerEmbeddingProvider:
         import torch
 
         try:
-            with torch.inference_mode():
+            stdout_guard, stderr_guard = _stream_silence_guard(self.suppress_backend_logs)
+            with torch.inference_mode(), stdout_guard, stderr_guard:
                 encoded = self._client().encode(
                     list(texts),
                     batch_size=self.batch_size,
@@ -364,6 +395,7 @@ def resolve_sentence_transformer_provider(
         max_seq_length=int(os.getenv("ULTIMATE_INDEXER_ST_MAX_SEQ_LENGTH", str(default_max_seq_length))),
         use_fp16=use_fp16,
         normalize_embeddings=os.getenv("ULTIMATE_INDEXER_ST_NORMALIZE", "true").lower() != "false",
+        suppress_backend_logs=os.getenv("ULTIMATE_INDEXER_ST_SUPPRESS_LOGS", "true").lower() != "false",
     )
 
 
