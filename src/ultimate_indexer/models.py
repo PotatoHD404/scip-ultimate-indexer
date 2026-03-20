@@ -49,10 +49,63 @@ class ChunkRecord:
     symbol_id: str
     symbol_name: str
     artifact_name: str | None
-    chunk_kind: str
+    chunk_kind: str  # "symbol", "file-overview", "function_metadata", "function_body", "markdown_section", etc.
     start_line: int
     end_line: int
     content: str
+    content_hash: str
+    embedding: bytes | None = None
+    embedding_dim: int = 0
+    embedding_model_id: str = ""
+
+
+@dataclass(slots=True)
+class FunctionMetadataRecord:
+    """Extended metadata for function indexing."""
+    project_id: str
+    symbol_id: str
+    relative_path: str
+    display_name: str
+    kind: str  # Function, Method
+    fully_qualified_name: str
+    signature: str
+    normalized_signature: str
+    docstring: str
+    params: str  # JSON-encoded list
+    param_types: str  # JSON-encoded dict
+    return_type: str
+    decorators: str  # JSON-encoded list
+    referenced_types: str  # JSON-encoded list
+    called_functions: str  # JSON-encoded list
+    raised_exceptions: str  # JSON-encoded list
+    literals: str  # JSON-encoded list
+    behavioral_tags: str  # JSON-encoded list
+    start_line: int
+    end_line: int
+    metadata_content: str  # Indexable text for embedding
+    content_hash: str
+    embedding: bytes | None = None
+    embedding_dim: int = 0
+    embedding_model_id: str = ""
+
+
+@dataclass(slots=True)
+class FunctionBodyChunkRecord:
+    """Extended body chunk for function indexing."""
+    project_id: str
+    chunk_id: str
+    symbol_id: str
+    relative_path: str
+    display_name: str
+    kind: str
+    signature: str
+    chunk_index: int
+    total_chunks: int
+    body: str
+    chunk_type: str  # main, branch, loop, try_block, closure, section
+    start_line: int
+    end_line: int
+    content: str  # Indexable text for embedding
     content_hash: str
     embedding: bytes | None = None
     embedding_dim: int = 0

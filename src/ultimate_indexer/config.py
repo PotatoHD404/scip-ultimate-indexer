@@ -68,6 +68,9 @@ class Settings:
     embedding_api_model: str | None = field(
         default_factory=lambda: os.getenv("ULTIMATE_INDEXER_EMBEDDING_API_MODEL")
     )
+    embedding_api_max_tokens: int | None = field(
+        default_factory=lambda: int(os.getenv("ULTIMATE_INDEXER_EMBEDDING_API_MAX_TOKENS", "0")) or None
+    )
     edge_weights: dict[str, float] = field(default_factory=lambda: DEFAULT_EDGE_WEIGHTS.copy())
     max_chunk_lines: int = 120
     chunk_overlap: int = 20

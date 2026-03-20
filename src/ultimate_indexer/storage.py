@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 
 from .embeddings import hash_text
-from .models import ChunkRecord, EdgeRecord, FileRecord, QueryChunkHit, SymbolRecord
+from .models import ChunkRecord, EdgeRecord, FileRecord, FunctionBodyChunkRecord, FunctionMetadataRecord, QueryChunkHit, SymbolRecord
 
 
 def _utcnow() -> str:
@@ -104,6 +104,83 @@ class Storage:
                 content
             );
 
+            CREATE TABLE IF NOT EXISTS function_metadata (
+                project_id TEXT NOT NULL,
+                symbol_id TEXT NOT NULL,
+                relative_path TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                fully_qualified_name TEXT NOT NULL,
+                signature TEXT NOT NULL,
+                normalized_signature TEXT NOT NULL,
+                docstring TEXT NOT NULL,
+                params TEXT NOT NULL,
+                param_types TEXT NOT NULL,
+                return_type TEXT NOT NULL,
+                decorators TEXT NOT NULL,
+                referenced_types TEXT NOT NULL,
+                called_functions TEXT NOT NULL,
+                raised_exceptions TEXT NOT NULL,
+                literals TEXT NOT NULL,
+                behavioral_tags TEXT NOT NULL,
+                start_line INTEGER NOT NULL,
+                end_line INTEGER NOT NULL,
+                metadata_content TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                embedding BLOB,
+                embedding_dim INTEGER NOT NULL DEFAULT 0,
+                embedding_model_id TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (project_id, symbol_id)
+            );
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS function_metadata_fts USING fts5(
+                project_id UNINDEXED,
+                symbol_id UNINDEXED,
+                fully_qualified_name,
+                signature,
+                params,
+                return_type,
+                called_functions,
+                referenced_types,
+                behavioral_tags,
+                literals,
+                docstring,
+                metadata_content
+            );
+
+            CREATE TABLE IF NOT EXISTS function_body_chunks (
+                project_id TEXT NOT NULL,
+                chunk_id TEXT NOT NULL,
+                symbol_id TEXT NOT NULL,
+                relative_path TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                signature TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                total_chunks INTEGER NOT NULL,
+                body TEXT NOT NULL,
+                chunk_type TEXT NOT NULL,
+                start_line INTEGER NOT NULL,
+                end_line INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                embedding BLOB,
+                embedding_dim INTEGER NOT NULL DEFAULT 0,
+                embedding_model_id TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (project_id, chunk_id)
+            );
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS function_body_fts USING fts5(
+                project_id UNINDEXED,
+                chunk_id UNINDEXED,
+                symbol_id UNINDEXED,
+                display_name,
+                signature,
+                chunk_type,
+                body,
+                content
+            );
+
             CREATE TABLE IF NOT EXISTS embedding_cache (
                 model_id TEXT NOT NULL,
                 text_hash TEXT NOT NULL,
@@ -125,6 +202,8 @@ class Storage:
             CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(project_id, source_symbol_id);
             CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(project_id, target_symbol_id);
             CREATE INDEX IF NOT EXISTS idx_chunks_symbol ON chunks(project_id, symbol_id);
+            CREATE INDEX IF NOT EXISTS idx_function_metadata_symbol ON function_metadata(project_id, symbol_id);
+            CREATE INDEX IF NOT EXISTS idx_function_body_symbol ON function_body_chunks(project_id, symbol_id);
             """
         )
         chunk_columns = {
@@ -172,17 +251,25 @@ class Storage:
         symbols: Iterable[SymbolRecord],
         edges: Iterable[EdgeRecord],
         chunks: Iterable[ChunkRecord],
+        function_metadata: Iterable[FunctionMetadataRecord] | None = None,
+        function_body_chunks: Iterable[FunctionBodyChunkRecord] | None = None,
     ) -> None:
         files = list(files)
         symbols = list(symbols)
         edges = list(edges)
         chunks = list(chunks)
+        function_metadata = list(function_metadata) if function_metadata else []
+        function_body_chunks = list(function_body_chunks) if function_body_chunks else []
         keep_paths = {item.relative_path for item in files}
         with self.connection:
             self.connection.execute("DELETE FROM edges WHERE project_id = ?", (project_id,))
             self.connection.execute("DELETE FROM chunk_fts WHERE project_id = ?", (project_id,))
             self.connection.execute("DELETE FROM chunks WHERE project_id = ?", (project_id,))
             self.connection.execute("DELETE FROM symbols WHERE project_id = ?", (project_id,))
+            self.connection.execute("DELETE FROM function_metadata_fts WHERE project_id = ?", (project_id,))
+            self.connection.execute("DELETE FROM function_metadata WHERE project_id = ?", (project_id,))
+            self.connection.execute("DELETE FROM function_body_fts WHERE project_id = ?", (project_id,))
+            self.connection.execute("DELETE FROM function_body_chunks WHERE project_id = ?", (project_id,))
             self.connection.execute(
                 "DELETE FROM files WHERE project_id = ? AND relative_path NOT IN ({})".format(
                     ",".join("?" for _ in keep_paths) if keep_paths else "''"
@@ -301,6 +388,116 @@ class Storage:
                     ),
                 )
 
+            for meta in function_metadata:
+                self.connection.execute(
+                    """
+                    INSERT INTO function_metadata(
+                        project_id, symbol_id, relative_path, display_name, kind, fully_qualified_name,
+                        signature, normalized_signature, docstring, params, param_types, return_type,
+                        decorators, referenced_types, called_functions, raised_exceptions, literals,
+                        behavioral_tags, start_line, end_line, metadata_content, content_hash,
+                        embedding, embedding_dim, embedding_model_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        meta.project_id,
+                        meta.symbol_id,
+                        meta.relative_path,
+                        meta.display_name,
+                        meta.kind,
+                        meta.fully_qualified_name,
+                        meta.signature,
+                        meta.normalized_signature,
+                        meta.docstring,
+                        json.dumps(meta.params),
+                        json.dumps(meta.param_types),
+                        meta.return_type,
+                        json.dumps(meta.decorators),
+                        json.dumps(meta.referenced_types),
+                        json.dumps(meta.called_functions),
+                        json.dumps(meta.raised_exceptions),
+                        json.dumps(meta.literals),
+                        json.dumps(meta.behavioral_tags),
+                        meta.start_line,
+                        meta.end_line,
+                        meta.metadata_content,
+                        meta.content_hash,
+                        meta.embedding,
+                        meta.embedding_dim,
+                        meta.embedding_model_id,
+                    ),
+                )
+                self.connection.execute(
+                    """
+                    INSERT INTO function_metadata_fts(
+                        project_id, symbol_id, fully_qualified_name, signature, params, return_type,
+                        called_functions, referenced_types, behavioral_tags, literals, docstring, metadata_content
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        meta.project_id,
+                        meta.symbol_id,
+                        meta.fully_qualified_name,
+                        meta.signature,
+                        json.dumps(meta.params),
+                        meta.return_type,
+                        json.dumps(meta.called_functions),
+                        json.dumps(meta.referenced_types),
+                        json.dumps(meta.behavioral_tags),
+                        json.dumps(meta.literals),
+                        meta.docstring,
+                        meta.metadata_content,
+                    ),
+                )
+
+            for body_chunk in function_body_chunks:
+                self.connection.execute(
+                    """
+                    INSERT INTO function_body_chunks(
+                        project_id, chunk_id, symbol_id, relative_path, display_name, kind, signature,
+                        chunk_index, total_chunks, body, chunk_type, start_line, end_line, content,
+                        content_hash, embedding, embedding_dim, embedding_model_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        body_chunk.project_id,
+                        body_chunk.chunk_id,
+                        body_chunk.symbol_id,
+                        body_chunk.relative_path,
+                        body_chunk.display_name,
+                        body_chunk.kind,
+                        body_chunk.signature,
+                        body_chunk.chunk_index,
+                        body_chunk.total_chunks,
+                        body_chunk.body,
+                        body_chunk.chunk_type,
+                        body_chunk.start_line,
+                        body_chunk.end_line,
+                        body_chunk.content,
+                        body_chunk.content_hash,
+                        body_chunk.embedding,
+                        body_chunk.embedding_dim,
+                        body_chunk.embedding_model_id,
+                    ),
+                )
+                self.connection.execute(
+                    """
+                    INSERT INTO function_body_fts(
+                        project_id, chunk_id, symbol_id, display_name, signature, chunk_type, body, content
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        body_chunk.project_id,
+                        body_chunk.chunk_id,
+                        body_chunk.symbol_id,
+                        body_chunk.display_name,
+                        body_chunk.signature,
+                        body_chunk.chunk_type,
+                        body_chunk.body,
+                        body_chunk.content,
+                    ),
+                )
+
     def get_or_create_embedding(
         self,
         model_id: str,
@@ -356,6 +553,53 @@ class Storage:
             return np.zeros((0, 0), dtype=np.float32), rows
         return np.vstack(vectors), rows
 
+    def load_function_metadata_vectors(
+        self,
+        project_id: str,
+    ) -> tuple[np.ndarray, list[sqlite3.Row]]:
+        """Load function metadata vectors for dense search."""
+        rows = self.connection.execute(
+            """
+            SELECT symbol_id, relative_path, display_name, kind, fully_qualified_name,
+                   signature, docstring, metadata_content, start_line, end_line, embedding, embedding_dim
+            FROM function_metadata
+            WHERE project_id = ? AND embedding IS NOT NULL
+            ORDER BY symbol_id
+            """,
+            (project_id,),
+        ).fetchall()
+        vectors = [
+            np.frombuffer(row["embedding"], dtype=np.float32, count=row["embedding_dim"]).copy()
+            for row in rows
+        ]
+        if not vectors:
+            return np.zeros((0, 0), dtype=np.float32), rows
+        return np.vstack(vectors), rows
+
+    def load_function_body_vectors(
+        self,
+        project_id: str,
+    ) -> tuple[np.ndarray, list[sqlite3.Row]]:
+        """Load function body chunk vectors for dense search."""
+        rows = self.connection.execute(
+            """
+            SELECT chunk_id, symbol_id, relative_path, display_name, kind, signature,
+                   chunk_index, total_chunks, body, chunk_type, start_line, end_line,
+                   content, embedding, embedding_dim
+            FROM function_body_chunks
+            WHERE project_id = ? AND embedding IS NOT NULL
+            ORDER BY symbol_id, chunk_index
+            """,
+            (project_id,),
+        ).fetchall()
+        vectors = [
+            np.frombuffer(row["embedding"], dtype=np.float32, count=row["embedding_dim"]).copy()
+            for row in rows
+        ]
+        if not vectors:
+            return np.zeros((0, 0), dtype=np.float32), rows
+        return np.vstack(vectors), rows
+
     def get_chunk_embeddings(self, project_id: str) -> dict[str, sqlite3.Row]:
         rows = self.connection.execute(
             """
@@ -366,6 +610,126 @@ class Storage:
             (project_id,),
         ).fetchall()
         return {str(row["chunk_id"]): row for row in rows}
+
+    def search_function_metadata_bm25(
+        self,
+        project_id: str,
+        query: str,
+        limit: int,
+    ) -> list[dict]:
+        """Search function metadata using BM25."""
+        tokens = [token for token in query.replace("/", " ").replace(".", " ").split() if token]
+        if not tokens:
+            return []
+        fts_query = " ".join(f'"{token}"' for token in tokens)
+        try:
+            rows = self.connection.execute(
+                """
+                SELECT m.symbol_id, m.relative_path, m.display_name, m.kind, m.fully_qualified_name,
+                       m.signature, m.docstring, m.called_functions, m.referenced_types, m.behavioral_tags,
+                       m.literals, m.metadata_content, m.start_line, m.end_line,
+                       bm25(function_metadata_fts) AS rank
+                FROM function_metadata_fts f
+                JOIN function_metadata m ON f.symbol_id = m.symbol_id AND f.project_id = m.project_id
+                WHERE f.project_id = ? AND f.function_metadata_fts MATCH ?
+                ORDER BY rank
+                LIMIT ?
+                """,
+                (project_id, fts_query, limit),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            rows = self.connection.execute(
+                """
+                SELECT symbol_id, relative_path, display_name, kind, fully_qualified_name,
+                       signature, docstring, called_functions, referenced_types, behavioral_tags,
+                       literals, metadata_content, start_line, end_line, 0.0 AS rank
+                FROM function_metadata
+                WHERE project_id = ? AND metadata_content LIKE ?
+                LIMIT ?
+                """,
+                (project_id, f"%{query}%", limit),
+            ).fetchall()
+        
+        results = []
+        for idx, row in enumerate(rows):
+            raw_rank = float(row["rank"])
+            score = 1.0 / (1.0 + max(raw_rank, 0.0) + idx)
+            results.append({
+                "symbol_id": str(row["symbol_id"]),
+                "relative_path": str(row["relative_path"]),
+                "display_name": str(row["display_name"]),
+                "kind": str(row["kind"]),
+                "fully_qualified_name": str(row["fully_qualified_name"]),
+                "signature": str(row["signature"]),
+                "docstring": str(row["docstring"]),
+                "called_functions": json.loads(row["called_functions"]) if row["called_functions"] else [],
+                "referenced_types": json.loads(row["referenced_types"]) if row["referenced_types"] else [],
+                "behavioral_tags": json.loads(row["behavioral_tags"]) if row["behavioral_tags"] else [],
+                "literals": json.loads(row["literals"]) if row["literals"] else [],
+                "score": score,
+                "start_line": int(row["start_line"]),
+                "end_line": int(row["end_line"]),
+            })
+        return results
+
+    def search_function_body_bm25(
+        self,
+        project_id: str,
+        query: str,
+        limit: int,
+    ) -> list[dict]:
+        """Search function body chunks using BM25."""
+        tokens = [token for token in query.replace("/", " ").replace(".", " ").split() if token]
+        if not tokens:
+            return []
+        fts_query = " ".join(f'"{token}"' for token in tokens)
+        try:
+            rows = self.connection.execute(
+                """
+                SELECT chunk_id, symbol_id, relative_path, display_name, kind, signature,
+                       chunk_index, total_chunks, body, chunk_type, start_line, end_line,
+                       content, bm25(function_body_fts) AS rank
+                FROM function_body_fts
+                JOIN function_body_chunks USING (project_id, chunk_id)
+                WHERE function_body_fts.project_id = ? AND function_body_fts MATCH ?
+                ORDER BY rank
+                LIMIT ?
+                """,
+                (project_id, fts_query, limit),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            rows = self.connection.execute(
+                """
+                SELECT chunk_id, symbol_id, relative_path, display_name, kind, signature,
+                       chunk_index, total_chunks, body, chunk_type, start_line, end_line,
+                       content, 0.0 AS rank
+                FROM function_body_chunks
+                WHERE project_id = ? AND content LIKE ?
+                LIMIT ?
+                """,
+                (project_id, f"%{query}%", limit),
+            ).fetchall()
+        
+        results = []
+        for idx, row in enumerate(rows):
+            raw_rank = float(row["rank"])
+            score = 1.0 / (1.0 + max(raw_rank, 0.0) + idx)
+            results.append({
+                "chunk_id": str(row["chunk_id"]),
+                "symbol_id": str(row["symbol_id"]),
+                "relative_path": str(row["relative_path"]),
+                "display_name": str(row["display_name"]),
+                "kind": str(row["kind"]),
+                "signature": str(row["signature"]),
+                "chunk_index": int(row["chunk_index"]),
+                "total_chunks": int(row["total_chunks"]),
+                "body": str(row["body"]),
+                "chunk_type": str(row["chunk_type"]),
+                "score": score,
+                "start_line": int(row["start_line"]),
+                "end_line": int(row["end_line"]),
+            })
+        return results
 
     def search_bm25(self, project_id: str, query: str, limit: int) -> list[QueryChunkHit]:
         tokens = [token for token in query.replace("/", " ").replace(".", " ").split() if token]

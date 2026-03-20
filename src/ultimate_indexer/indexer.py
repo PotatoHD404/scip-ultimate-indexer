@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 from collections import Counter, defaultdict
@@ -21,8 +22,12 @@ from .embeddings import (
 )
 from .fallback import build_fallback_bundle
 from .formatter import _pretty_signature, format_scored_tree
+from .function_indexer import chunk_function_bodies, extract_function_metadata
 from .ignore_rules import create_ignore_matcher
-from .models import ChunkRecord, EdgeRecord, FileRecord, IndexProgress, IndexSummary, SymbolRecord, TreeScoreNode
+from .models import (
+    ChunkRecord, EdgeRecord, FileRecord, FunctionBodyChunkRecord,
+    FunctionMetadataRecord, IndexProgress, IndexSummary, SymbolRecord, TreeScoreNode,
+)
 from .query import QueryEngine, apply_kind_boost, dependency_ordered_pagerank
 from .ranking_rules import is_rankable_symbol
 from .scip_parser import ParsedScip, parse_scip_index
@@ -323,6 +328,7 @@ class UltimateIndexer:
                 api_endpoint=self.settings.embedding_api_endpoint,
                 api_model=self.settings.embedding_api_model,
                 api_key=self.settings.embedding_api_key,
+                max_tokens=self.settings.embedding_api_max_tokens,
             )
             return self._provider
         try:
@@ -710,9 +716,122 @@ class UltimateIndexer:
             detail="Prepared chunks",
         )
 
+        # Extract function metadata and body chunks from Python files
+        function_metadata_records: list[FunctionMetadataRecord] = []
+        function_body_records: list[FunctionBodyChunkRecord] = []
+        self._emit_progress(progress_callback, stage="chunks", detail="Extracting function metadata")
+        
+        for file_record in files:
+            if not file_record.relative_path.endswith(".py"):
+                continue
+            try:
+                source = file_record.content
+                metadata_list = extract_function_metadata(file_record.relative_path, source)
+                
+                for meta in metadata_list:
+                    # Create metadata record
+                    metadata_content = meta.to_index_text()
+                    meta_record = FunctionMetadataRecord(
+                        project_id=self.project_id,
+                        symbol_id=meta.symbol_id,
+                        relative_path=meta.relative_path,
+                        display_name=meta.display_name,
+                        kind=meta.kind,
+                        fully_qualified_name=meta.fully_qualified_name,
+                        signature=meta.signature,
+                        normalized_signature=meta.normalized_signature,
+                        docstring=meta.docstring,
+                        params=json.dumps(meta.params),
+                        param_types=json.dumps(meta.param_types),
+                        return_type=meta.return_type,
+                        decorators=json.dumps(meta.decorators),
+                        referenced_types=json.dumps(meta.referenced_types),
+                        called_functions=json.dumps(meta.called_functions),
+                        raised_exceptions=json.dumps(meta.raised_exceptions),
+                        literals=json.dumps(meta.literals),
+                        behavioral_tags=json.dumps(meta.behavioral_tags),
+                        start_line=meta.start_line,
+                        end_line=meta.end_line,
+                        metadata_content=metadata_content,
+                        content_hash=sha256(metadata_content.encode("utf-8")).hexdigest(),
+                    )
+                    function_metadata_records.append(meta_record)
+                
+                # Create body chunk records
+                body_chunks = chunk_function_bodies(metadata_list, source)
+                for body_chunk in body_chunks:
+                    body_content = body_chunk.to_index_text()
+                    body_record = FunctionBodyChunkRecord(
+                        project_id=self.project_id,
+                        chunk_id=sha256(
+                            f"{body_chunk.symbol_id}:{body_chunk.chunk_index}".encode("utf-8")
+                        ).hexdigest()[:32],
+                        symbol_id=body_chunk.symbol_id,
+                        relative_path=body_chunk.relative_path,
+                        display_name=body_chunk.display_name,
+                        kind=body_chunk.kind,
+                        signature=body_chunk.signature,
+                        chunk_index=body_chunk.chunk_index,
+                        total_chunks=body_chunk.total_chunks,
+                        body=body_chunk.body,
+                        chunk_type=body_chunk.chunk_type,
+                        start_line=body_chunk.start_line,
+                        end_line=body_chunk.end_line,
+                        content=body_content,
+                        content_hash=sha256(body_content.encode("utf-8")).hexdigest(),
+                    )
+                    function_body_records.append(body_record)
+            except Exception:
+                # Skip files that can't be parsed
+                continue
+        
+        self._emit_progress(
+            progress_callback,
+            stage="chunks",
+            completed=max(len(function_metadata_records) + len(function_body_records), 1),
+            total=max(len(function_metadata_records) + len(function_body_records), 1),
+            unit="function_docs",
+            detail="Extracted function metadata and body chunks",
+        )
+
+        # Embed function metadata and body chunks
+        all_function_docs: list[tuple[str, FunctionMetadataRecord | FunctionBodyChunkRecord]] = []
+        for meta in function_metadata_records:
+            all_function_docs.append(("metadata", meta))
+        for body in function_body_records:
+            all_function_docs.append(("body", body))
+        
+        if all_function_docs:
+            self._emit_progress(progress_callback, stage="embed", detail="Embedding function documents")
+            doc_texts = [doc.metadata_content if isinstance(doc, FunctionMetadataRecord) else doc.content
+                        for _, doc in all_function_docs]
+            provider = self._provider_instance()
+            
+            # Generate embeddings in batches
+            vectors = generate_embeddings(provider, doc_texts)
+            
+            for i, (doc_type, doc) in enumerate(all_function_docs):
+                vec = vectors[i]
+                doc.embedding = vec.astype("float32").tobytes()
+                doc.embedding_dim = int(vec.shape[0])
+                doc.embedding_model_id = provider.model_id
+            
+            self._emit_progress(
+                progress_callback,
+                stage="embed",
+                completed=len(all_function_docs),
+                total=len(all_function_docs),
+                unit="function_docs",
+                detail="Embedded function documents",
+            )
+
         self._embed_chunks(chunks, progress_callback=progress_callback)
         self._emit_progress(progress_callback, stage="store", detail="Writing index to SQLite")
-        self.storage.replace_project_contents(self.project_id, files, symbols, edges, chunks)
+        self.storage.replace_project_contents(
+            self.project_id, files, symbols, edges, chunks,
+            function_metadata=function_metadata_records,
+            function_body_chunks=function_body_records,
+        )
         self.storage.upsert_project(self.project_id, self.project_id, signature)
         self._emit_progress(
             progress_callback,
