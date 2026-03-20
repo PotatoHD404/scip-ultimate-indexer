@@ -199,7 +199,12 @@ def _output_file_for_root(cache_dir: Path, language: str, invocation_root: Path,
     return cache_dir / f"{language}-{suffix}.scip"
 
 
-def run_scip_indexers(project_root: Path, files: list[Path], cache_dir: Path) -> ScipRunReport:
+def run_scip_indexers(
+    project_root: Path,
+    files: list[Path],
+    cache_dir: Path,
+    timeout_seconds: int | None = None,
+) -> ScipRunReport:
     results: list[ScipRunResult] = []
     missing: list[ScipRequirement] = []
     failed: list[ScipRunFailure] = []
@@ -236,7 +241,7 @@ def run_scip_indexers(project_root: Path, files: list[Path], cache_dir: Path) ->
                     cwd=str(invocation_root),
                     capture_output=True,
                     text=True,
-                    timeout=300,
+                    timeout=timeout_seconds,
                 )
             except Exception as exc:
                 failed.append(

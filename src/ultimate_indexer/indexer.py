@@ -12,9 +12,11 @@ import networkx as nx
 from .constants import MAX_FILE_BYTES, SPECIAL_FILES, is_indexable_filename
 from .config import Settings
 from .embeddings import (
+    APIEmbeddingProvider,
     HashEmbeddingProvider,
     generate_embeddings,
     _provider_prepare_document_text,
+    resolve_api_provider,
     resolve_llama_cpp_provider,
 )
 from .fallback import build_fallback_bundle
@@ -28,19 +30,21 @@ from .scip_runner import ScipRunFailure, StructuredIndexingRequiredError, run_sc
 from .socraticode import ingest_socraticode_artifacts
 from .storage import Storage
 from .visuals import write_query_visualization
+from .docs.ingest import ingest_documentation
 
 
 INDEX_STAGES = (
     "discover",
     "scip",
     "artifacts",
+    "docs",
     "fallback",
     "chunks",
     "embed",
     "store",
     "pagerank",
 )
-INDEX_FORMAT_VERSION = 5
+INDEX_FORMAT_VERSION = 6
 
 
 def _discover_code_files(project_root: Path, extra_extensions: set[str]) -> list[Path]:
@@ -313,6 +317,14 @@ class UltimateIndexer:
         if backend == "hash":
             self._provider = HashEmbeddingProvider()
             return self._provider
+        # Check if API embedding is configured
+        if backend == "api" or (self.settings.embedding_api_endpoint and self.settings.embedding_api_model):
+            self._provider = resolve_api_provider(
+                api_endpoint=self.settings.embedding_api_endpoint,
+                api_model=self.settings.embedding_api_model,
+                api_key=self.settings.embedding_api_key,
+            )
+            return self._provider
         try:
             self._provider = resolve_llama_cpp_provider(
                 project_root=self.settings.project_root,
@@ -525,7 +537,13 @@ class UltimateIndexer:
                 detail=f"Parsed SCIP index {scip_path.name}",
             )
         else:
-            scip_report = run_scip_indexers(self.settings.project_root, code_files, self.settings.cache_dir)
+            timeout_seconds = int(os.getenv("ULTIMATE_INDEXER_SCIP_TIMEOUT", "600"))
+            scip_report = run_scip_indexers(
+                self.settings.project_root,
+                code_files,
+                self.settings.cache_dir,
+                timeout_seconds=timeout_seconds,
+            )
             if scip_report.missing:
                 raise StructuredIndexingRequiredError(scip_report.missing, [])
             scip_warnings = [
@@ -578,8 +596,35 @@ class UltimateIndexer:
             unit="artifacts",
             detail="Loaded artifact files",
         )
+        
+        # Ingest documentation files (Markdown and OpenAPI) BEFORE fallback
+        # This ensures documentation files are excluded from fallback processing
+        self._emit_progress(progress_callback, stage="docs", detail="Ingesting documentation files")
+        doc_files, doc_symbols, doc_edges, doc_chunks = ingest_documentation(
+            project_id=self.project_id,
+            project_root=self.settings.project_root,
+            progress_callback=lambda completed, total, rel_path: self._emit_progress(
+                progress_callback,
+                stage="docs",
+                completed=completed,
+                total=total,
+                unit="docs",
+                detail=f"Doc: {rel_path}",
+            ),
+        )
+        self._emit_progress(
+            progress_callback,
+            stage="docs",
+            completed=max(len(doc_files), 1),
+            total=max(len(doc_files), 1),
+            unit="docs",
+            detail="Ingested documentation files",
+        )
+        
+        # Mark documentation files as covered so fallback doesn't process them
         covered_paths = {record.relative_path for record in parsed.files}
         covered_paths.update(record.relative_path for record in artifact_bundle.files)
+        covered_paths.update(record.relative_path for record in doc_files)
         self._emit_progress(progress_callback, stage="fallback", detail="Building fallback index coverage")
         fallback_bundle = build_fallback_bundle(
             project_id=self.project_id,
@@ -608,9 +653,9 @@ class UltimateIndexer:
                 unit="files",
                 detail="No fallback files needed",
             )
-        files: list[FileRecord] = [*parsed.files, *fallback_bundle.files, *artifact_bundle.files]
-        symbols: list[SymbolRecord] = [*parsed.symbols, *fallback_bundle.symbols, *artifact_bundle.symbols]
-        edges = [*parsed.edges, *fallback_bundle.edges, *artifact_bundle.edges]
+        files: list[FileRecord] = [*parsed.files, *fallback_bundle.files, *artifact_bundle.files, *doc_files]
+        symbols: list[SymbolRecord] = [*parsed.symbols, *fallback_bundle.symbols, *artifact_bundle.symbols, *doc_symbols]
+        edges = [*parsed.edges, *fallback_bundle.edges, *artifact_bundle.edges, *doc_edges]
 
         symbols_by_file: dict[str, list[SymbolRecord]] = {}
         symbol_lookup: dict[str, SymbolRecord] = {}
@@ -621,7 +666,7 @@ class UltimateIndexer:
             if symbol.enclosing_symbol_id:
                 children_by_symbol_id.setdefault(symbol.enclosing_symbol_id, []).append(symbol)
 
-        chunks: list[ChunkRecord] = [*artifact_bundle.chunks, *fallback_bundle.chunks]
+        chunks: list[ChunkRecord] = [*artifact_bundle.chunks, *fallback_bundle.chunks, *doc_chunks]
         self._emit_progress(progress_callback, stage="chunks", detail="Assembling query chunks")
         for file_symbols in symbols_by_file.values():
             file_symbols.sort(key=lambda item: (item.start_line, item.display_name))
@@ -695,6 +740,7 @@ class UltimateIndexer:
             indexed_chunks=len(chunks),
             reused_files=0,
             artifact_files=len(artifact_bundle.files),
+            documentation_files=len(doc_files),
             warnings=scip_warnings,
         )
 
@@ -710,7 +756,6 @@ class UltimateIndexer:
         self,
         *,
         limit: int = 20,
-        metric: str = "pagerank",
         kind_filter: str | None = None,
     ):
         symbol_rows = self.storage.get_symbol_rows(self.project_id)
@@ -744,39 +789,14 @@ class UltimateIndexer:
         if not rankable_rows:
             return _fallback_positive_rows()
 
-        if metric == "pagerank":
-            rows = [
-                row
-                for row in rankable_rows.values()
-                if float(row["global_rank"]) > 0
-            ]
-            rows.sort(key=lambda row: (-float(row["global_rank"]), str(row["display_name"])))
-            if rows:
-                return rows[:limit]
-            return _fallback_positive_rows()
-
-        graph = nx.DiGraph()
-        for symbol_id in rankable_rows:
-            graph.add_node(symbol_id)
-        for edge in self.storage.get_edges(self.project_id):
-            source = str(edge["source_symbol_id"])
-            target = str(edge["target_symbol_id"])
-            if source in rankable_rows and target in rankable_rows:
-                graph.add_edge(source, target, weight=float(edge["weight"]))
-
-        if metric == "betweenness":
-            raw_scores = nx.betweenness_centrality(graph) if graph.number_of_nodes() else {}
-        elif metric == "in_degree":
-            raw_scores = {node: float(score) for node, score in graph.in_degree()}
-        elif metric == "out_degree":
-            raw_scores = {node: float(score) for node, score in graph.out_degree()}
-        else:
-            raw_scores = {symbol_id: float(row["global_rank"]) for symbol_id, row in rankable_rows.items()}
-
-        ranked_ids = sorted(raw_scores, key=lambda symbol_id: (-raw_scores[symbol_id], str(rankable_rows[symbol_id]["display_name"])))
-        rows = [rankable_rows[symbol_id] for symbol_id in ranked_ids[:limit] if raw_scores[symbol_id] > 0]
+        rows = [
+            row
+            for row in rankable_rows.values()
+            if float(row["global_rank"]) > 0
+        ]
+        rows.sort(key=lambda row: (-float(row["global_rank"]), str(row["display_name"])))
         if rows:
-            return rows
+            return rows[:limit]
         return _fallback_positive_rows()
 
     def project_overview(self, *, max_per_kind: int = 15) -> str:
@@ -844,8 +864,28 @@ class UltimateIndexer:
             lines.append(f"- {folder}: {count}")
         return "\n".join(lines)
 
-    def scored_tree(self, *, max_chars: int | None = 12_000) -> str:
+    def scored_tree(
+        self,
+        *,
+        max_chars: int | None = 12_000,
+        top_k: int | None = None,
+    ) -> str:
         rows = self.storage.get_tree_score_rows(self.project_id)
+        
+        # If top_k is specified, filter to top k files by score
+        if top_k is not None and top_k > 0:
+            scored_rows = []
+            for row in rows:
+                score = _file_usefulness_score(
+                    float(row["rank_sum"]),
+                    float(row["rank_max"]),
+                    int(row["useful_symbol_count"]),
+                    int(row["chunk_count"]),
+                )
+                scored_rows.append((row, score))
+            scored_rows.sort(key=lambda item: -item[1])
+            rows = [row for row, _ in scored_rows[:top_k]]
+        
         root = TreeScoreNode(
             name=self.settings.project_root.name or str(self.settings.project_root),
             relative_path="",
@@ -903,7 +943,7 @@ class UltimateIndexer:
                 current_path = "" if next_parent == "." else next_parent
 
         _normalize_tree_scores(root, root.raw_score)
-        return format_scored_tree(root, max_chars=max_chars)
+        return format_scored_tree(root, max_chars=max_chars, top_k=top_k)
 
     def visualize(self, groups, title: str = "Ultimate Indexer Visualization") -> Path:
         output_path = self.settings.visuals_dir / "query_graph.html"

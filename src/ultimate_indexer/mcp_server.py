@@ -84,11 +84,13 @@ def build_mcp(
     embedding_n_ctx: int = 2048,
     host: str = "127.0.0.1",
     port: int = 8000,
+    embedding_api_key: str | None = None,
+    embedding_api_endpoint: str | None = None,
+    embedding_api_model: str | None = None,
 ) -> FastMCP:
     cache_dir = Path(cache_dir).resolve()
     cache_dir.mkdir(parents=True, exist_ok=True)
-    index_cache_dir = cache_dir / "indexes"
-    index_cache_dir.mkdir(parents=True, exist_ok=True)
+    index_cache_dir = cache_dir
     server = FastMCP(
         "scip-ultimate-indexer",
         log_level="WARNING",
@@ -100,6 +102,9 @@ def build_mcp(
     def _backend_for_request(embedding_backend: str) -> str:
         if embedding_backend and embedding_backend != "auto":
             return embedding_backend
+        # If API embedding is configured, use API backend
+        if embedding_api_endpoint and embedding_api_model:
+            return "api"
         model_candidate = Path(embedding_model).expanduser()
         if model_candidate.exists():
             return "local"
@@ -116,6 +121,14 @@ def build_mcp(
                 embedding_backend=backend,
                 cache_base_dir=index_cache_dir,
             )
+            # Configure API embedding if provided
+            if embedding_api_key:
+                indexer.settings.embedding_api_key = embedding_api_key
+            if embedding_api_endpoint:
+                indexer.settings.embedding_api_endpoint = embedding_api_endpoint
+            if embedding_api_model:
+                indexer.settings.embedding_api_model = embedding_api_model
+            # Configure local embedding if provided
             if embedding_model:
                 indexer.settings.model_path = embedding_model
             if embedding_n_ctx > 0:
@@ -202,17 +215,15 @@ def build_mcp(
     def get_important_symbols(
         project: str | None = None,
         count: int = 20,
-        metric: str = "pagerank",
         kind: str | None = None,
         embedding_backend: str = "auto",
     ) -> str:
         indexer = get_indexer(project, embedding_backend)
-        rows = indexer.important_symbols(limit=count, metric=metric, kind_filter=kind)
+        rows = indexer.important_symbols(limit=count, kind_filter=kind)
         return format_important_symbols_codegraph(
             indexer.storage,
             indexer.project_id,
             rows,
-            metric=metric,
             max_chars=0,
         )
 
@@ -238,9 +249,10 @@ def build_mcp(
         project: str | None = None,
         embedding_backend: str = "auto",
         max_chars: int = 12_000,
+        top_k: int | None = None,
     ) -> str:
         indexer = get_indexer(project, embedding_backend)
-        return indexer.scored_tree(max_chars=max_chars)
+        return indexer.scored_tree(max_chars=max_chars, top_k=top_k)
 
     @server.tool()
     def visualize_project(
@@ -265,6 +277,9 @@ def run_mcp(
     cache_dir: Path | str = ".scip_indexes",
     embedding_model: str = "models/coderankembed-q8_0.gguf",
     embedding_n_ctx: int = 2048,
+    embedding_api_key: str | None = None,
+    embedding_api_endpoint: str | None = None,
+    embedding_api_model: str | None = None,
 ) -> None:
     server = build_mcp(
         cache_dir=cache_dir,
@@ -272,5 +287,8 @@ def run_mcp(
         embedding_n_ctx=embedding_n_ctx,
         host=host,
         port=port,
+        embedding_api_key=embedding_api_key,
+        embedding_api_endpoint=embedding_api_endpoint,
+        embedding_api_model=embedding_api_model,
     )
     server.run(transport=transport)

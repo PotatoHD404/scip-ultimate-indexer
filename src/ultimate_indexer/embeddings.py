@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import os
 import sys
 import time
+import urllib.request
+import urllib.error
 from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -231,6 +234,115 @@ class LlamaCppEmbeddingProvider:
 
     def embed_query(self, text: str) -> np.ndarray:
         return self._embed_one(self.prepare_query_text(text))
+
+
+@dataclass(slots=True)
+class APIEmbeddingProvider:
+    """API-based embedding provider for remote embedding services."""
+    
+    api_endpoint: str
+    api_model: str
+    api_key: str | None = None
+    model_id: str = "api"
+    supports_batching: bool = True
+    batch_size: int = 32
+    timeout_seconds: float = 30.0
+    
+    def prepare_document_text(self, content: str, file_path: str) -> str:
+        return content
+    
+    def prepare_query_text(self, text: str) -> str:
+        return text
+    
+    def _call_api(self, texts: list[str]) -> list[list[float]]:
+        """Call the embedding API endpoint and return embeddings."""
+        payload = {
+            "input": texts,
+            "model": self.api_model,
+        }
+        
+        data = json.dumps(payload).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+        }
+        
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        
+        request = urllib.request.Request(
+            self.api_endpoint,
+            data=data,
+            headers=headers,
+            method="POST",
+        )
+        
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                result = json.loads(response.read().decode("utf-8"))
+                
+                # Handle different API response formats
+                if "data" in result:
+                    # OpenAI-compatible format: {"data": [{"embedding": [...]}]}
+                    embeddings = [item["embedding"] for item in result["data"]]
+                elif "embeddings" in result:
+                    # Alternative format: {"embeddings": [[...]]}
+                    embeddings = result["embeddings"]
+                elif "embedding" in result:
+                    # Single embedding format: {"embedding": [...]}
+                    embeddings = [result["embedding"]]
+                else:
+                    # Try to use the result directly if it's a list
+                    if isinstance(result, list):
+                        embeddings = result
+                    else:
+                        raise ValueError(f"Unexpected API response format: {result}")
+                
+                return embeddings
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode("utf-8") if e.fp else ""
+            raise RuntimeError(f"API request failed with status {e.code}: {error_body}") from e
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"API request failed: {e.reason}") from e
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"Failed to parse API response: {e}") from e
+    
+    def embed(self, texts: Sequence[str]) -> list[np.ndarray]:
+        texts_list = list(texts)
+        if not texts_list:
+            return []
+        
+        # Handle batching
+        all_embeddings: list[list[float]] = []
+        for start in range(0, len(texts_list), self.batch_size):
+            batch = texts_list[start:start + self.batch_size]
+            batch_embeddings = self._call_api(batch)
+            all_embeddings.extend(batch_embeddings)
+        
+        return [np.asarray(embedding, dtype=np.float32) for embedding in all_embeddings]
+    
+    def embed_query(self, text: str) -> np.ndarray:
+        embeddings = self.embed([self.prepare_query_text(text)])
+        return embeddings[0] if embeddings else np.array([], dtype=np.float32)
+
+
+def resolve_api_provider(
+    *,
+    api_endpoint: str,
+    api_model: str,
+    api_key: str | None = None,
+    model_id: str | None = None,
+    batch_size: int = 32,
+    timeout_seconds: float = 30.0,
+) -> APIEmbeddingProvider:
+    """Create an API embedding provider from configuration."""
+    return APIEmbeddingProvider(
+        api_endpoint=api_endpoint,
+        api_model=api_model,
+        api_key=api_key,
+        model_id=model_id or f"api:{api_model}",
+        batch_size=batch_size,
+        timeout_seconds=timeout_seconds,
+    )
 
 
 def resolve_llama_cpp_provider(

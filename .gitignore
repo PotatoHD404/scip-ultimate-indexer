@@ -10,3 +10,12 @@ tests/.tmp/
 graph-indexer/
 
 tests/fixtures/sample_project/.scip_indexes-registry-debug/
+
+.history
+
+.idea/
+/.env
+/confluence_parser.log
+/.confluence_cookies.json
+/config.json
+/confluence_export/

@@ -106,6 +106,7 @@ class IndexSummary:
     indexed_chunks: int
     reused_files: int
     artifact_files: int
+    documentation_files: int = 0
     warnings: list[str] = field(default_factory=list)
 
 

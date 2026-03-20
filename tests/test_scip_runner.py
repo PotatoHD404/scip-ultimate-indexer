@@ -41,7 +41,7 @@ def test_run_scip_indexers_reports_missing_tools(tmp_path: Path, monkeypatch) ->
     monkeypatch.setattr("ultimate_indexer.scip_runner.shutil.which", lambda _: None)
     files = [tmp_path / "main.ts"]
 
-    report = run_scip_indexers(tmp_path, files, tmp_path)
+    report = run_scip_indexers(tmp_path, files, tmp_path, timeout_seconds=600)
 
     assert report.results == []
     assert not report.failed
@@ -73,7 +73,7 @@ def test_run_scip_indexers_uses_nearest_project_roots(tmp_path: Path, monkeypatc
     monkeypatch.setattr("ultimate_indexer.scip_runner.shutil.which", lambda _: "/usr/bin/scip-typescript")
     monkeypatch.setattr("ultimate_indexer.scip_runner.subprocess.run", fake_run)
 
-    report = run_scip_indexers(project, [frontend / "main.ts", admin / "panel.ts"], tmp_path)
+    report = run_scip_indexers(project, [frontend / "main.ts", admin / "panel.ts"], tmp_path, timeout_seconds=600)
 
     assert not report.missing
     assert not report.failed

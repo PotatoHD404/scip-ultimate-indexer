@@ -26,6 +26,14 @@ NON_QUERYABLE_KINDS = {
     "Unknown",
     "Variable",
 }
+# Documentation kinds that should be rankable and queryable
+DOC_RANKABLE_KINDS = {
+    "Document",
+}
+DOC_QUERYABLE_KINDS = {
+    "Document",
+    "Section",  # Allow section queries for documentation
+}
 GENERATED_SUFFIXES = (
     ".pb.go",
     "_pb2.py",
@@ -64,13 +72,25 @@ def is_generated_path(relative_path: str) -> bool:
 
 def is_rankable_symbol(relative_path: str, kind: str) -> bool:
     if kind in NON_RANKABLE_KINDS:
+        # Allow documentation kinds even if they're in the non-rankable set
+        if kind in DOC_RANKABLE_KINDS:
+            return not is_generated_path(relative_path)
         return False
+    # Documentation sections are rankable
+    if kind in DOC_RANKABLE_KINDS:
+        return not is_generated_path(relative_path)
     return not is_generated_path(relative_path)
 
 
 def is_queryable_symbol(relative_path: str, kind: str) -> bool:
     if kind in NON_QUERYABLE_KINDS:
+        # Allow documentation kinds even if they're in the non-queryable set
+        if kind in DOC_QUERYABLE_KINDS:
+            return not is_generated_path(relative_path)
         return False
+    # Documentation sections are queryable
+    if kind in DOC_QUERYABLE_KINDS:
+        return not is_generated_path(relative_path)
     return not is_generated_path(relative_path)
 
 

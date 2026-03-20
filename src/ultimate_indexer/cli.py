@@ -18,12 +18,27 @@ app = typer.Typer(add_completion=False)
 console = Console()
 
 
-def _build_indexer(project_path: Path, embedding_backend: str, cache_dir: Path | None) -> UltimateIndexer:
-    return UltimateIndexer(
+def _build_indexer(
+    project_path: Path,
+    embedding_backend: str,
+    cache_dir: Path | None,
+    embedding_api_key: str | None = None,
+    embedding_api_endpoint: str | None = None,
+    embedding_api_model: str | None = None,
+) -> UltimateIndexer:
+    indexer = UltimateIndexer(
         project_path,
         embedding_backend=embedding_backend,
         cache_base_dir=cache_dir.resolve() if cache_dir is not None else None,
     )
+    # Override API settings if provided via CLI
+    if embedding_api_key:
+        indexer.settings.embedding_api_key = embedding_api_key
+    if embedding_api_endpoint:
+        indexer.settings.embedding_api_endpoint = embedding_api_endpoint
+    if embedding_api_model:
+        indexer.settings.embedding_api_model = embedding_api_model
+    return indexer
 
 
 class _IndexProgressDisplay:
@@ -77,8 +92,18 @@ def index(
     embedding_backend: str = typer.Option("auto", "--embedding-backend"),
     cache_dir: Path | None = typer.Option(None, "--cache-dir"),
     progress: bool = typer.Option(True, "--progress/--no-progress"),
+    embedding_api_key: str | None = typer.Option(None, "--embedding-api-key", help="API key for remote embedding service"),
+    embedding_api_endpoint: str | None = typer.Option(None, "--embedding-api-endpoint", help="API endpoint URL for remote embedding service"),
+    embedding_api_model: str | None = typer.Option(None, "--embedding-api-model", help="Model name for remote embedding service"),
 ) -> None:
-    indexer = _build_indexer(project_path, embedding_backend, cache_dir)
+    indexer = _build_indexer(
+        project_path,
+        embedding_backend,
+        cache_dir,
+        embedding_api_key=embedding_api_key,
+        embedding_api_endpoint=embedding_api_endpoint,
+        embedding_api_model=embedding_api_model,
+    )
     try:
         try:
             with _IndexProgressDisplay(enabled=progress and console.is_terminal) as display:
@@ -119,8 +144,18 @@ def query(
     limit: int = typer.Option(10, "--limit"),
     embedding_backend: str = typer.Option("auto", "--embedding-backend"),
     cache_dir: Path | None = typer.Option(None, "--cache-dir"),
+    embedding_api_key: str | None = typer.Option(None, "--embedding-api-key"),
+    embedding_api_endpoint: str | None = typer.Option(None, "--embedding-api-endpoint"),
+    embedding_api_model: str | None = typer.Option(None, "--embedding-api-model"),
 ) -> None:
-    indexer = _build_indexer(project_path, embedding_backend, cache_dir)
+    indexer = _build_indexer(
+        project_path,
+        embedding_backend,
+        cache_dir,
+        embedding_api_key=embedding_api_key,
+        embedding_api_endpoint=embedding_api_endpoint,
+        embedding_api_model=embedding_api_model,
+    )
     try:
         groups = indexer.query(text, limit=limit)
         console.print(format_groups(indexer.storage, indexer.project_id, groups))
@@ -134,8 +169,18 @@ def top_symbols(
     limit: int = typer.Option(10, "--limit"),
     embedding_backend: str = typer.Option("auto", "--embedding-backend"),
     cache_dir: Path | None = typer.Option(None, "--cache-dir"),
+    embedding_api_key: str | None = typer.Option(None, "--embedding-api-key"),
+    embedding_api_endpoint: str | None = typer.Option(None, "--embedding-api-endpoint"),
+    embedding_api_model: str | None = typer.Option(None, "--embedding-api-model"),
 ) -> None:
-    indexer = _build_indexer(project_path, embedding_backend, cache_dir)
+    indexer = _build_indexer(
+        project_path,
+        embedding_backend,
+        cache_dir,
+        embedding_api_key=embedding_api_key,
+        embedding_api_endpoint=embedding_api_endpoint,
+        embedding_api_model=embedding_api_model,
+    )
     try:
         console.print(format_top_symbols(indexer.top_symbols(limit=limit)))
     finally:
@@ -149,8 +194,18 @@ def visualize(
     limit: int = typer.Option(10, "--limit"),
     embedding_backend: str = typer.Option("auto", "--embedding-backend"),
     cache_dir: Path | None = typer.Option(None, "--cache-dir"),
+    embedding_api_key: str | None = typer.Option(None, "--embedding-api-key"),
+    embedding_api_endpoint: str | None = typer.Option(None, "--embedding-api-endpoint"),
+    embedding_api_model: str | None = typer.Option(None, "--embedding-api-model"),
 ) -> None:
-    indexer = _build_indexer(project_path, embedding_backend, cache_dir)
+    indexer = _build_indexer(
+        project_path,
+        embedding_backend,
+        cache_dir,
+        embedding_api_key=embedding_api_key,
+        embedding_api_endpoint=embedding_api_endpoint,
+        embedding_api_model=embedding_api_model,
+    )
     try:
         groups = indexer.query(query, limit=limit)
         output_path = indexer.visualize(groups, title=f"Results for: {query}")
@@ -167,6 +222,9 @@ def mcp(
     cache_dir: Path = typer.Option(Path(".scip_indexes"), "--cache-dir"),
     embedding_model: str = typer.Option("models/coderankembed-q8_0.gguf", "--embedding-model"),
     embedding_n_ctx: int = typer.Option(2048, "--embedding-n-ctx"),
+    embedding_api_key: str | None = typer.Option(None, "--embedding-api-key"),
+    embedding_api_endpoint: str | None = typer.Option(None, "--embedding-api-endpoint"),
+    embedding_api_model: str | None = typer.Option(None, "--embedding-api-model"),
 ) -> None:
     run_mcp(
         transport=transport,
@@ -175,4 +233,7 @@ def mcp(
         cache_dir=cache_dir,
         embedding_model=embedding_model,
         embedding_n_ctx=embedding_n_ctx,
+        embedding_api_key=embedding_api_key,
+        embedding_api_endpoint=embedding_api_endpoint,
+        embedding_api_model=embedding_api_model,
     )

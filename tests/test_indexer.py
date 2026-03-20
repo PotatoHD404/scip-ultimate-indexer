@@ -154,7 +154,7 @@ def test_index_continues_with_fallback_when_scip_root_fails(tmp_path: Path, monk
 
     monkeypatch.setattr(
         "ultimate_indexer.indexer.run_scip_indexers",
-        lambda project_root, files, cache_dir: ScipRunReport(
+        lambda project_root, files, cache_dir, timeout_seconds=None: ScipRunReport(
             results=[],
             missing=[],
             failed=[
@@ -243,7 +243,7 @@ def test_index_dedupes_overlapping_scip_results(tmp_path: Path, monkeypatch) -> 
 
     monkeypatch.setattr(
         "ultimate_indexer.indexer.run_scip_indexers",
-        lambda project_root, files, cache_dir: ScipRunReport(
+        lambda project_root, files, cache_dir, timeout_seconds=None: ScipRunReport(
             results=[
                 ScipRunResult(language="typescript", index_path=scip_a, source_root=project),
                 ScipRunResult(language="typescript", index_path=scip_b, source_root=project),
@@ -447,7 +447,7 @@ def test_generated_and_unknown_symbols_are_excluded_from_ranking_and_query(tmp_p
 
     monkeypatch.setattr(
         "ultimate_indexer.indexer.run_scip_indexers",
-        lambda project_root, files, cache_dir: ScipRunReport(
+        lambda project_root, files, cache_dir, timeout_seconds=None: ScipRunReport(
             results=[ScipRunResult(language="typescript", index_path=scip_path, source_root=project)],
             missing=[],
             failed=[],

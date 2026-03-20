@@ -9,6 +9,7 @@ from .storage import Storage
 
 CLASS_LIKE_KINDS = {"Class", "Struct", "Interface", "Trait", "Enum"}
 TYPE_LIKE_KINDS = CLASS_LIKE_KINDS | {"TypeAlias"}
+DOC_KINDS = {"Document", "Section"}
 
 
 def _comment_prefix(relative_path: str) -> str:
@@ -635,11 +636,10 @@ def format_important_symbols_codegraph(
     project_id: str,
     rows: list,
     *,
-    metric: str = "pagerank",
     max_chars: int = 0,
 ) -> str:
     symbol_rows = storage.get_symbol_rows(project_id)
-    lines = [f"// Top {len(rows)} symbols by {metric}", ""]
+    lines = [f"// Top {len(rows)} symbols", ""]
     for index, row in enumerate(rows, start=1):
         symbol_id = str(row["symbol_id"])
         symbol = RankedSymbol(
@@ -682,6 +682,63 @@ def _tree_label(node: TreeScoreNode) -> str:
     return f"{node.name}{detail_text}"
 
 
+def format_documentation_section(
+    storage: Storage,
+    project_id: str,
+    relative_path: str,
+    max_chars: int = 4000,
+) -> str:
+    """Format a documentation file for output.
+    
+    This provides a markdown-formatted view of documentation content,
+    preserving the original structure and adding context from the graph.
+    """
+    file_row = storage.get_file(project_id, relative_path)
+    if file_row is None:
+        return f"// Documentation not found: {relative_path}"
+    
+    content = str(file_row["content"])
+    source_kind = str(file_row.get("source_kind", "documentation"))
+    
+    # For markdown files, return content with minimal processing
+    if relative_path.endswith(('.md', '.markdown')):
+        return content[:max_chars]
+    
+    # For OpenAPI specs, format as structured output
+    if relative_path.endswith(('.yaml', '.yml', '.json')):
+        lines = [f"# OpenAPI Specification: {relative_path}", ""]
+        
+        # Get symbols for this file
+        symbol_rows = storage.get_symbol_rows(project_id)
+        file_symbols = [
+            row for row in symbol_rows.values()
+            if str(row["relative_path"]) == relative_path
+            and str(row["kind"]) in DOC_KINDS
+        ]
+        
+        # Group by kind
+        docs = [s for s in file_symbols if str(s["kind"]) == "Document"]
+        sections = [s for s in file_symbols if str(s["kind"]) == "Section"]
+        
+        for doc in docs:
+            docstring = str(doc["docstring"])
+            if docstring:
+                lines.append(f"## {str(doc['display_name'])}")
+                lines.append(docstring)
+                lines.append("")
+        
+        for section in sorted(sections, key=lambda s: float(s["start_line"])):
+            lines.append(f"### {str(section['display_name'])}")
+            snippet = str(section["snippet"])[:500]
+            if snippet:
+                lines.append(snippet)
+            lines.append("")
+        
+        return "\n".join(lines)[:max_chars]
+    
+    return content[:max_chars]
+
+
 def _render_tree_lines(node: TreeScoreNode, prefix: str = "", *, is_last: bool = True) -> list[str]:
     connector = "`-- " if is_last else "|-- "
     score_text = f"{node.score:6.2f}"
@@ -702,12 +759,22 @@ def _render_tree_lines(node: TreeScoreNode, prefix: str = "", *, is_last: bool =
     return lines
 
 
-def format_scored_tree(root: TreeScoreNode, *, max_chars: int | None = 12_000) -> str:
-    header = (
-        f"Project tree scored by usefulness.\n"
-        f"File score blends symbol rank, strongest symbol, and a small structure fallback.\n"
-        f"Directory score rolls up all descendants.\n"
-    )
+def format_scored_tree(
+    root: TreeScoreNode,
+    *,
+    max_chars: int | None = 12_000,
+    top_k: int | None = None,
+) -> str:
+    header_lines = ["Project tree scored by usefulness."]
+    if top_k is not None and top_k > 0:
+        header_lines.append(f"Showing top {top_k} files by PageRank-based score.")
+    else:
+        header_lines.append("Showing all files.")
+    header_lines.extend([
+        "File score blends symbol rank, strongest symbol, and a small structure fallback.",
+        "Directory score rolls up all descendants.",
+    ])
+    header = "\n".join(header_lines) + "\n"
     body_lines = _render_tree_lines(root, prefix="", is_last=True)
     text = header + "\n".join(body_lines)
     if max_chars is None:

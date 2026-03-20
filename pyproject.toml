@@ -9,6 +9,10 @@ include = [
     { path = "src/ultimate_indexer/templates/*.html", format = ["sdist", "wheel"] }
 ]
 
+[[tool.poetry.source]]
+name = "artifactory"
+url = "https://artifactory.tcsbank.ru/artifactory/api/pypi/python-all/simple"
+
 [tool.poetry.dependencies]
 python = ">=3.12,<3.15"
 typer = "^0.16.1"

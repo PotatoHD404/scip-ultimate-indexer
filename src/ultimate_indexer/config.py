@@ -16,6 +16,14 @@ DEFAULT_EDGE_WEIGHTS = {
     "references": 0.70,
     "implements": 0.95,
     "inherits": 0.90,
+    # Documentation-specific edge weights
+    "cross_file": 1.0,
+    "cross_anchor": 1.0,
+    "intra_anchor": 0.5,
+    "hierarchy": 0.3,
+    "openapi_ref": 0.8,
+    "openapi_tag": 0.8,
+    "sequence": 0.15,
 }
 
 
@@ -49,6 +57,16 @@ class Settings:
                 str(Path.home() / ".cache" / "ultimate_indexer" / "models"),
             )
         )
+    )
+    # API embedding provider settings
+    embedding_api_key: str | None = field(
+        default_factory=lambda: os.getenv("ULTIMATE_INDEXER_EMBEDDING_API_KEY")
+    )
+    embedding_api_endpoint: str | None = field(
+        default_factory=lambda: os.getenv("ULTIMATE_INDEXER_EMBEDDING_API_ENDPOINT")
+    )
+    embedding_api_model: str | None = field(
+        default_factory=lambda: os.getenv("ULTIMATE_INDEXER_EMBEDDING_API_MODEL")
     )
     edge_weights: dict[str, float] = field(default_factory=lambda: DEFAULT_EDGE_WEIGHTS.copy())
     max_chunk_lines: int = 120

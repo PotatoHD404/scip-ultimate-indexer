@@ -64,7 +64,7 @@ def test_query_project_stays_connected_and_returns_compact_output(fixture_projec
                 assert second.content[0].type == "text"
                 assert "// Search: greeting service" in first.content[0].text
                 assert "score=" not in first.content[0].text
-                assert any(path.name == "index.sqlite3" for path in (cache_dir / "indexes").rglob("index.sqlite3"))
+                assert any(path.name == "index.sqlite3" for path in cache_dir.rglob("index.sqlite3"))
 
                 listed = await session.call_tool(
                     "list_projects",
