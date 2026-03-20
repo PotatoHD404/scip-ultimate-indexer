@@ -29,7 +29,7 @@ from .models import (
     FunctionMetadataRecord, IndexProgress, IndexSummary, SymbolRecord, TreeScoreNode,
 )
 from .query import QueryEngine, apply_kind_boost, dependency_ordered_pagerank
-from .ranking_rules import is_rankable_symbol
+from .ranking_rules import is_queryable_symbol, is_rankable_symbol
 from .scip_parser import ParsedScip, parse_scip_index
 from .scip_runner import ScipRunFailure, StructuredIndexingRequiredError, run_scip_indexers
 from .socraticode import ingest_socraticode_artifacts
@@ -375,6 +375,7 @@ class UltimateIndexer:
     def _embed_chunks(
         self,
         chunks: list[ChunkRecord],
+        symbol_lookup: dict[str, SymbolRecord],
         progress_callback: Callable[[IndexProgress], None] | None = None,
     ) -> list[ChunkRecord]:
         provider = self._provider_instance()
@@ -382,7 +383,14 @@ class UltimateIndexer:
         pending_indices: list[int] = []
         pending_texts: list[str] = []
         cached_count = 0
+        skipped_count = 0
         for index, chunk in enumerate(chunks):
+            # Skip embedding for non-queryable symbols (but keep them in the graph)
+            if chunk.symbol_id and chunk.symbol_id in symbol_lookup:
+                symbol = symbol_lookup[chunk.symbol_id]
+                if not is_queryable_symbol(symbol.relative_path, symbol.kind):
+                    skipped_count += 1
+                    continue
             existing = existing_chunk_embeddings.get(chunk.chunk_id)
             if (
                 existing is not None
@@ -413,13 +421,14 @@ class UltimateIndexer:
                 unit="model",
                 detail="Loading embedding model",
             )
+        embeddable_chunks = len(chunks) - skipped_count
         self._emit_progress(
             progress_callback,
             stage="embed",
             completed=cached_count,
-            total=max(len(chunks), 1),
+            total=max(embeddable_chunks, 1),
             unit="chunks",
-            detail="Embedding chunks",
+            detail=f"Embedding chunks (skipped {skipped_count} non-queryable)",
         )
         if pending_texts:
             vectors = generate_embeddings(
@@ -429,9 +438,9 @@ class UltimateIndexer:
                     progress_callback,
                     stage="embed",
                     completed=cached_count + processed,
-                    total=max(len(chunks), 1),
+                    total=max(embeddable_chunks, 1),
                     unit="chunks",
-                    detail="Embedding chunks",
+                    detail=f"Embedding chunks (skipped {skipped_count} non-queryable)",
                 ),
             )
             for list_index, vector in enumerate(vectors):
@@ -444,10 +453,10 @@ class UltimateIndexer:
         self._emit_progress(
             progress_callback,
             stage="embed",
-            completed=max(len(chunks), 1),
-            total=max(len(chunks), 1),
+            completed=max(embeddable_chunks, 1),
+            total=max(embeddable_chunks, 1),
             unit="chunks",
-            detail="Embedded chunks",
+            detail=f"Embedded chunks (skipped {skipped_count} non-queryable)",
         )
         return chunks
 
@@ -825,7 +834,7 @@ class UltimateIndexer:
                 detail="Embedded function documents",
             )
 
-        self._embed_chunks(chunks, progress_callback=progress_callback)
+        self._embed_chunks(chunks, symbol_lookup, progress_callback=progress_callback)
         self._emit_progress(progress_callback, stage="store", detail="Writing index to SQLite")
         self.storage.replace_project_contents(
             self.project_id, files, symbols, edges, chunks,

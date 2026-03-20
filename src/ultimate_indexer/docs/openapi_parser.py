@@ -53,17 +53,40 @@ class OpenAPIParser:
 
     def parse(self) -> tuple[list[OpenAPISection], list[ParsedLink], dict[str, int]]:
         """Parse the OpenAPI spec into sections and links."""
+        # Handle empty or whitespace-only content silently (common in projects)
+        if not self.raw_content or not self.raw_content.strip():
+            return [], [], {}
+        
         try:
             if self.file_path.endswith('.json'):
                 self.spec = json.loads(self.raw_content)
             else:
-                self.spec = yaml.safe_load(self.raw_content)
+                # Use safe_load_all to handle multi-document YAML streams
+                # but only process the first document (typical for OpenAPI specs)
+                docs = list(yaml.safe_load_all(self.raw_content))
+                if not docs:
+                    return [], [], {}
+                self.spec = docs[0]
+        except json.JSONDecodeError as e:
+            # Empty or invalid JSON - log at debug level since this is common
+            logger.debug(f"Invalid JSON in {self.file_path}: {e}")
+            return [], [], {}
+        except (yaml.YAMLError, yaml.constructor.ConstructorError, ValueError) as e:
+            # Handle YAML parsing errors including datetime parsing errors
+            # e.g., "second must be in 0..59, not 67" from invalid timestamps
+            logger.debug(f"Invalid YAML in {self.file_path}: {e}")
+            return [], [], {}
         except Exception as e:
-            logger.error(f"Failed to parse OpenAPI spec {self.file_path}: {e}")
+            logger.debug(f"Failed to parse OpenAPI spec {self.file_path}: {e}")
             return [], [], {}
 
         if not isinstance(self.spec, dict):
-            logger.error(f"OpenAPI spec {self.file_path} is not a valid mapping")
+            # Not a valid mapping (could be a list, string, etc.)
+            return [], [], {}
+        
+        # Validate this looks like an OpenAPI spec (has openapi or swagger key)
+        if 'openapi' not in self.spec and 'swagger' not in self.spec:
+            # Not an OpenAPI spec, skip silently
             return [], [], {}
 
         sections: list[OpenAPISection] = []
