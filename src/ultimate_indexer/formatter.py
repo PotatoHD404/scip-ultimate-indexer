@@ -609,7 +609,32 @@ def format_search_symbols_codegraph(
     ranked = sorted(
         symbol_map.values(),
         key=lambda item: (-item.score, item.relative_path, item.display_name),
-    )[:max_results]
+    )
+    selected: list[RankedSymbol] = []
+    selected_ids: set[str] = set()
+    seen_paths: set[str] = set()
+
+    # First pass keeps the strongest symbol from each file so mixed doc/code
+    # results do not collapse back into multiple hits from the same document.
+    for symbol in ranked:
+        if symbol.relative_path in seen_paths:
+            continue
+        selected.append(symbol)
+        selected_ids.add(symbol.symbol_id)
+        seen_paths.add(symbol.relative_path)
+        if len(selected) >= max_results:
+            break
+
+    if len(selected) < max_results:
+        for symbol in ranked:
+            if symbol.symbol_id in selected_ids:
+                continue
+            selected.append(symbol)
+            selected_ids.add(symbol.symbol_id)
+            if len(selected) >= max_results:
+                break
+
+    ranked = selected
     lines = [f"// Search: {query}", ""]
     for symbol in ranked:
         row = symbol_rows.get(symbol.symbol_id)
@@ -668,12 +693,16 @@ def format_important_symbols_codegraph(
     return truncate_text("\n".join(lines).strip(), max_chars)
 
 
-def _tree_label(node: TreeScoreNode) -> str:
+def _tree_label(node: TreeScoreNode, *, include_value_details: bool = False) -> str:
     if node.node_type == "dir":
-        if node.relative_path:
-            return f"{node.name}/"
-        return f"{node.name}/"
+        details: list[str] = []
+        if include_value_details:
+            details.append(f"acc={node.raw_score:.5f}")
+        detail_text = f" ({', '.join(details)})" if details else ""
+        return f"{node.name}/{detail_text}"
     details: list[str] = []
+    if include_value_details:
+        details.append(f"value={node.raw_score:.5f}")
     if node.useful_symbol_count > 0:
         details.append(f"{node.useful_symbol_count} syms")
     if node.source_kind != "code":
@@ -739,13 +768,21 @@ def format_documentation_section(
     return content[:max_chars]
 
 
-def _render_tree_lines(node: TreeScoreNode, prefix: str = "", *, is_last: bool = True) -> list[str]:
+def _render_tree_lines(
+    node: TreeScoreNode,
+    prefix: str = "",
+    *,
+    is_last: bool = True,
+    include_value_details: bool = False,
+) -> list[str]:
     connector = "`-- " if is_last else "|-- "
     score_text = f"{node.score:6.2f}"
-    lines = [f"{prefix}{connector}[{score_text}] {_tree_label(node)}"]
+    lines = [f"{prefix}{connector}[{score_text}] {_tree_label(node, include_value_details=include_value_details)}"]
     child_prefix = f"{prefix}{'    ' if is_last else '|   '}"
     sorted_children = sorted(
         node.children,
+        # Directories are sorted by accumulated descendant score, while files are
+        # sorted by their own value score. Both use the normalized tree score.
         key=lambda child: (child.node_type != "dir", -child.score, child.name.lower()),
     )
     for index, child in enumerate(sorted_children):
@@ -754,6 +791,7 @@ def _render_tree_lines(node: TreeScoreNode, prefix: str = "", *, is_last: bool =
                 child,
                 child_prefix,
                 is_last=index == len(sorted_children) - 1,
+                include_value_details=include_value_details,
             )
         )
     return lines
@@ -764,18 +802,29 @@ def format_scored_tree(
     *,
     max_chars: int | None = 12_000,
     top_k: int | None = None,
+    header_title: str = "Project tree scored by usefulness.",
+    header_description: list[str] | None = None,
+    include_value_details: bool = False,
 ) -> str:
-    header_lines = ["Project tree scored by usefulness."]
+    header_lines = [header_title]
     if top_k is not None and top_k > 0:
         header_lines.append(f"Showing top {top_k} files by PageRank-based score.")
     else:
         header_lines.append("Showing all files.")
-    header_lines.extend([
-        "File score blends symbol rank, strongest symbol, and a small structure fallback.",
-        "Directory score rolls up all descendants.",
-    ])
+    header_lines.extend(
+        header_description
+        or [
+            "File score blends symbol rank, strongest symbol, and a small structure fallback.",
+            "Directory score rolls up all descendants.",
+        ]
+    )
     header = "\n".join(header_lines) + "\n"
-    body_lines = _render_tree_lines(root, prefix="", is_last=True)
+    body_lines = _render_tree_lines(
+        root,
+        prefix="",
+        is_last=True,
+        include_value_details=include_value_details,
+    )
     text = header + "\n".join(body_lines)
     if max_chars is None:
         return text

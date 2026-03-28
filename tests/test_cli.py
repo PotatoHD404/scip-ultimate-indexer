@@ -50,6 +50,21 @@ def test_cli_end_to_end(fixture_project: Path, monkeypatch) -> None:
     assert query_result.exit_code == 0, query_result.stdout
     assert "// pkg/services.py" in query_result.stdout
 
+    tree_result = runner.invoke(
+        app,
+        [
+            "tree",
+            str(fixture_project),
+            "--embedding-backend",
+            "hash",
+            "--cache-dir",
+            str(cache_dir),
+        ],
+    )
+    assert tree_result.exit_code == 0, tree_result.stdout
+    assert "folder accumulation" in tree_result.stdout
+    assert "value=" in tree_result.stdout
+
     top_result = runner.invoke(
         app,
         [

@@ -72,6 +72,22 @@ def test_socraticode_artifact_query(fixture_project: Path, monkeypatch) -> None:
         indexer.close()
 
 
+def test_query_surfaces_documentation_alongside_code_for_mixed_matches(
+    fixture_project: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("ULTIMATE_INDEXER_EMBEDDING_BACKEND", "hash")
+    indexer = UltimateIndexer(fixture_project)
+    try:
+        indexer.index(scip_path=_python_scip_path(fixture_project))
+        groups = indexer.query("users tenant email", limit=2)
+        paths = {group.relative_path for group in groups}
+        assert "docs/schema.md" in paths
+        assert any(path.endswith(".py") for path in paths)
+    finally:
+        indexer.close()
+
+
 def test_index_reports_progress(fixture_project: Path, monkeypatch) -> None:
     monkeypatch.setenv("ULTIMATE_INDEXER_EMBEDDING_BACKEND", "hash")
     events: list[IndexProgress] = []

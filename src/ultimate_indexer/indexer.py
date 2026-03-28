@@ -997,6 +997,9 @@ class UltimateIndexer:
         *,
         max_chars: int | None = 12_000,
         top_k: int | None = None,
+        header_title: str = "Project tree scored by usefulness.",
+        header_description: list[str] | None = None,
+        include_value_details: bool = False,
     ) -> str:
         rows = self.storage.get_tree_score_rows(self.project_id)
         
@@ -1071,7 +1074,31 @@ class UltimateIndexer:
                 current_path = "" if next_parent == "." else next_parent
 
         _normalize_tree_scores(root, root.raw_score)
-        return format_scored_tree(root, max_chars=max_chars, top_k=top_k)
+        return format_scored_tree(
+            root,
+            max_chars=max_chars,
+            top_k=top_k,
+            header_title=header_title,
+            header_description=header_description,
+            include_value_details=include_value_details,
+        )
+
+    def sorted_tree(
+        self,
+        *,
+        max_chars: int | None = 12_000,
+        top_k: int | None = None,
+    ) -> str:
+        return self.scored_tree(
+            max_chars=max_chars,
+            top_k=top_k,
+            header_title="Project tree sorted by folder accumulation and file value.",
+            header_description=[
+                "Folders sort by accumulated descendant score.",
+                "Files sort by their direct value score.",
+            ],
+            include_value_details=True,
+        )
 
     def visualize(self, groups, title: str = "Ultimate Indexer Visualization") -> Path:
         output_path = self.settings.visuals_dir / "query_graph.html"

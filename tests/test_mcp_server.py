@@ -66,6 +66,19 @@ def test_query_project_stays_connected_and_returns_compact_output(fixture_projec
                 assert "score=" not in first.content[0].text
                 assert any(path.name == "index.sqlite3" for path in cache_dir.rglob("index.sqlite3"))
 
+                mixed = await session.call_tool(
+                    "search_symbols",
+                    {
+                        "project": str(fixture_project),
+                        "query": "users tenant email",
+                        "count": 2,
+                        "embedding_backend": "hash",
+                    },
+                )
+                assert mixed.isError is False
+                assert "docs/schema.md" in mixed.content[0].text
+                assert ".py" in mixed.content[0].text
+
                 listed = await session.call_tool(
                     "list_projects",
                     {},
@@ -119,5 +132,16 @@ def test_query_project_stays_connected_and_returns_compact_output(fixture_projec
                 assert "pkg/" in tree.content[0].text
                 assert "docs/" in tree.content[0].text
                 assert "app.py" in tree.content[0].text
+
+                sorted_tree = await session.call_tool(
+                    "sorted_project_tree",
+                    {
+                        "project": str(fixture_project),
+                        "embedding_backend": "hash",
+                    },
+                )
+                assert sorted_tree.isError is False
+                assert "folder accumulation" in sorted_tree.content[0].text
+                assert "value=" in sorted_tree.content[0].text
 
     anyio.run(exercise_mcp)

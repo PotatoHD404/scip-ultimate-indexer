@@ -215,6 +215,31 @@ def visualize(
 
 
 @app.command()
+def tree(
+    project_path: Path,
+    top_k: int | None = typer.Option(None, "--top-k"),
+    max_chars: int | None = typer.Option(12_000, "--max-chars"),
+    embedding_backend: str = typer.Option("auto", "--embedding-backend"),
+    cache_dir: Path | None = typer.Option(None, "--cache-dir"),
+    embedding_api_key: str | None = typer.Option(None, "--embedding-api-key"),
+    embedding_api_endpoint: str | None = typer.Option(None, "--embedding-api-endpoint"),
+    embedding_api_model: str | None = typer.Option(None, "--embedding-api-model"),
+) -> None:
+    indexer = _build_indexer(
+        project_path,
+        embedding_backend,
+        cache_dir,
+        embedding_api_key=embedding_api_key,
+        embedding_api_endpoint=embedding_api_endpoint,
+        embedding_api_model=embedding_api_model,
+    )
+    try:
+        console.print(indexer.sorted_tree(max_chars=max_chars, top_k=top_k))
+    finally:
+        indexer.close()
+
+
+@app.command()
 def mcp(
     transport: str = typer.Option("stdio", "--transport"),
     host: str = typer.Option("127.0.0.1", "--host"),

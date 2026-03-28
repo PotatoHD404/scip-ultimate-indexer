@@ -62,6 +62,8 @@ KIND_BOOSTS = {
     "function": 1.0,
     "method": 1.0,
 }
+QUERY_CACHE_VERSION = 2
+DOCUMENTATION_SOURCE_KIND = "documentation"
 
 
 def _normalize_scores(values: dict[str, float]) -> dict[str, float]:
@@ -101,6 +103,18 @@ def _rankable_query_rows(symbol_rows: dict[str, object]) -> dict[str, object]:
         for symbol_id, row in symbol_rows.items()
         if is_queryable_symbol(str(row["relative_path"]), str(row["kind"]))
     }
+
+
+def _result_source_bucket(row: object | None, fallback_kind: str) -> str:
+    if row is not None:
+        source_kind = str(row["source_kind"] or "").strip()
+        if source_kind == DOCUMENTATION_SOURCE_KIND:
+            return DOCUMENTATION_SOURCE_KIND
+        if str(row["kind"]) in {"Document", "Section"}:
+            return DOCUMENTATION_SOURCE_KIND
+    if fallback_kind in {"Document", "Section"}:
+        return DOCUMENTATION_SOURCE_KIND
+    return "code"
 
 
 def dependency_ordered_pagerank(
@@ -203,6 +217,20 @@ class QueryEngine:
         self._function_body_cache[project_id] = (signature, matrix, rows)
         return matrix, rows
 
+    def _query_vector(self, query: str) -> np.ndarray | None:
+        query_cache_key = f"query::{query}"
+        query_vector = self.storage.get_or_create_embedding(self.provider.model_id, query_cache_key)
+        if query_vector is not None:
+            return query_vector
+        try:
+            query_vector = generate_query_embedding(self.provider, query)
+        except Exception:
+            # Keep retrieval usable when the preferred dense backend is missing at
+            # query time. BM25 and cached hash/local results can still answer.
+            return None
+        self.storage.store_embedding(self.provider.model_id, query_cache_key, query_vector)
+        return query_vector
+
     def _function_metadata_dense_hits(
         self,
         project_id: str,
@@ -213,13 +241,10 @@ class QueryEngine:
         matrix, rows = self._cached_function_metadata_vectors(project_id)
         if matrix.size == 0:
             return []
-        
-        query_cache_key = f"query::{query}"
-        query_vector = self.storage.get_or_create_embedding(self.provider.model_id, query_cache_key)
+
+        query_vector = self._query_vector(query)
         if query_vector is None:
-            query_vector = generate_query_embedding(self.provider, query)
-            self.storage.store_embedding(self.provider.model_id, query_cache_key, query_vector)
-        
+            return []
         if matrix.ndim != 2 or matrix.shape[1] != query_vector.shape[0]:
             return []
         
@@ -257,13 +282,10 @@ class QueryEngine:
         matrix, rows = self._cached_function_body_vectors(project_id)
         if matrix.size == 0:
             return []
-        
-        query_cache_key = f"query::{query}"
-        query_vector = self.storage.get_or_create_embedding(self.provider.model_id, query_cache_key)
+
+        query_vector = self._query_vector(query)
         if query_vector is None:
-            query_vector = generate_query_embedding(self.provider, query)
-            self.storage.store_embedding(self.provider.model_id, query_cache_key, query_vector)
-        
+            return []
         if matrix.ndim != 2 or matrix.shape[1] != query_vector.shape[0]:
             return []
         
@@ -298,11 +320,9 @@ class QueryEngine:
         matrix, rows = self._cached_vectors(project_id)
         if matrix.size == 0:
             return []
-        query_cache_key = f"query::{query}"
-        query_vector = self.storage.get_or_create_embedding(self.provider.model_id, query_cache_key)
+        query_vector = self._query_vector(query)
         if query_vector is None:
-            query_vector = generate_query_embedding(self.provider, query)
-            self.storage.store_embedding(self.provider.model_id, query_cache_key, query_vector)
+            return []
         if matrix.ndim != 2 or matrix.shape[1] != query_vector.shape[0]:
             return []
         scores = cosine_similarity(query_vector, matrix)
@@ -411,6 +431,68 @@ class QueryEngine:
             scores[symbol_id] = max(scores.get(symbol_id, 0.0), float(hit.score))
         return scores
 
+    def _group_source_bucket(
+        self,
+        symbol_rows: dict[str, object],
+        group: FileGroup,
+    ) -> str:
+        for symbol in group.symbols:
+            row = symbol_rows.get(symbol.symbol_id)
+            bucket = _result_source_bucket(row, symbol.kind)
+            if bucket == DOCUMENTATION_SOURCE_KIND:
+                return bucket
+        return "code"
+
+    def _select_groups(
+        self,
+        ordered_groups: list[FileGroup],
+        symbol_rows: dict[str, object],
+        *,
+        limit: int,
+    ) -> list[FileGroup]:
+        if limit <= 0:
+            return []
+        if len(ordered_groups) <= limit or limit == 1:
+            return ordered_groups[:limit]
+
+        selected = list(ordered_groups[:limit])
+        selected_buckets = {
+            self._group_source_bucket(symbol_rows, group)
+            for group in selected
+        }
+        all_buckets = {
+            self._group_source_bucket(symbol_rows, group)
+            for group in ordered_groups
+        }
+
+        # Keep the highest-ranked mix by default, but force one documentation file
+        # into the limited result set when the query matches both code and docs.
+        for missing_bucket in sorted(all_buckets - selected_buckets):
+            replacement = next(
+                (
+                    group
+                    for group in ordered_groups[limit:]
+                    if self._group_source_bucket(symbol_rows, group) == missing_bucket
+                ),
+                None,
+            )
+            if replacement is None:
+                continue
+            replace_index = next(
+                (
+                    index
+                    for index in range(len(selected) - 1, -1, -1)
+                    if self._group_source_bucket(symbol_rows, selected[index]) != missing_bucket
+                ),
+                None,
+            )
+            if replace_index is None:
+                continue
+            selected[replace_index] = replacement
+            selected_buckets.add(missing_bucket)
+
+        return sorted(selected, key=lambda item: (-item.score, item.relative_path))
+
     def search(self, project_id: str, query: str, limit: int = 10) -> list[FileGroup]:
         """
         Search with dual-representation function indexing.
@@ -423,7 +505,9 @@ class QueryEngine:
         5. Rank symbols higher when they match in both indexes.
         """
         signature = self.storage.get_project_signature(project_id) or ""
-        query_hash = sha256(f"{signature}:{self.provider.model_id}:{query}:{limit}".encode("utf-8")).hexdigest()
+        query_hash = sha256(
+            f"{QUERY_CACHE_VERSION}:{signature}:{self.provider.model_id}:{query}:{limit}".encode("utf-8")
+        ).hexdigest()
         cached = self.storage.get_query_cache(project_id, query_hash)
         if cached is not None:
             return self._deserialize_groups(cached)
@@ -603,7 +687,8 @@ class QueryEngine:
             if symbol.symbol_id not in {item.symbol_id for item in group.symbols}:
                 group.symbols.append(symbol)
 
-        results = sorted(grouped.values(), key=lambda item: (-item.score, item.relative_path))[:limit]
+        ordered_groups = sorted(grouped.values(), key=lambda item: (-item.score, item.relative_path))
+        results = self._select_groups(ordered_groups, symbol_rows, limit=limit)
         for group in results:
             group.symbols.sort(key=lambda item: (-item.score, item.display_name))
         self.storage.store_query_cache(project_id, query_hash, self._serialize_groups(results))

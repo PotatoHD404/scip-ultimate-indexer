@@ -17,13 +17,16 @@ poetry install
 poetry run ultimate-indexer index /path/to/project
 poetry run ultimate-indexer query /path/to/project "how is authentication handled?"
 poetry run ultimate-indexer top-symbols /path/to/project --limit 20
+poetry run ultimate-indexer tree /path/to/project
 poetry run ultimate-indexer visualize /path/to/project "auth"
 poetry run ultimate-indexer mcp
 ```
 
 The MCP server also exposes a scored project tree view that ranks files and folders by usefulness using indexed symbol ranks plus lightweight structural fallbacks.
 
-Its MCP tool names now align with the graph-indexer style as well: `list_projects`, `search_symbols`, `get_important_symbols`, `get_project_overview`, and `get_stats`, while keeping `index_project`, `visualize_project`, and `scored_project_tree` as extra helpers. The `mcp` command also accepts graph-indexer-style flags such as `--cache-dir`, `--embedding-model`, `--embedding-n-ctx`, `--transport`, `--host`, and `--port`.
+For value-oriented inspection, the CLI `tree` command and MCP `sorted_project_tree` tool show the same tree with folders sorted by accumulated descendant score and files annotated by direct value.
+
+Its MCP tool names now align with the graph-indexer style as well: `list_projects`, `search_symbols`, `get_important_symbols`, `get_project_overview`, and `get_stats`, while keeping `index_project`, `visualize_project`, `scored_project_tree`, and `sorted_project_tree` as extra helpers. The `mcp` command also accepts graph-indexer-style flags such as `--cache-dir`, `--embedding-model`, `--embedding-n-ctx`, `--transport`, `--host`, and `--port`.
 
 ## Embeddings
 
