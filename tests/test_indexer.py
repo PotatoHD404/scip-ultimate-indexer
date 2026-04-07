@@ -88,6 +88,43 @@ def test_query_surfaces_documentation_alongside_code_for_mixed_matches(
         indexer.close()
 
 
+def test_scoped_query_splits_code_and_docs(
+    fixture_project: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("ULTIMATE_INDEXER_EMBEDDING_BACKEND", "hash")
+    indexer = UltimateIndexer(fixture_project)
+    try:
+        indexer.index(scip_path=_python_scip_path(fixture_project))
+        all_groups = indexer.query("users tenant email", limit=5, scope="all")
+        code_groups = indexer.query("users tenant email", limit=5, scope="code")
+        doc_groups = indexer.query("users tenant email", limit=5, scope="docs")
+        symbol_rows = indexer.storage.get_symbol_rows(indexer.project_id)
+
+        assert any(group.relative_path.endswith(".py") for group in all_groups)
+        assert any(group.relative_path.startswith("docs/") for group in all_groups)
+        assert code_groups
+        assert doc_groups
+        assert all(
+            all(
+                str(symbol_rows[symbol.symbol_id]["source_kind"]) != "documentation"
+                for symbol in group.symbols
+                if symbol.symbol_id in symbol_rows
+            )
+            for group in code_groups
+        )
+        assert all(
+            all(
+                str(symbol_rows[symbol.symbol_id]["source_kind"]) == "documentation"
+                for symbol in group.symbols
+                if symbol.symbol_id in symbol_rows
+            )
+            for group in doc_groups
+        )
+    finally:
+        indexer.close()
+
+
 def test_index_reports_progress(fixture_project: Path, monkeypatch) -> None:
     monkeypatch.setenv("ULTIMATE_INDEXER_EMBEDDING_BACKEND", "hash")
     events: list[IndexProgress] = []

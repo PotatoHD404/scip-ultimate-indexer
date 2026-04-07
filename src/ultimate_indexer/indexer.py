@@ -28,14 +28,14 @@ from .models import (
     ChunkRecord, EdgeRecord, FileRecord, FunctionBodyChunkRecord,
     FunctionMetadataRecord, IndexProgress, IndexSummary, SymbolRecord, TreeScoreNode,
 )
-from .query import QueryEngine, apply_kind_boost, dependency_ordered_pagerank
+from .query import QueryEngine, SearchScope, apply_kind_boost, dependency_ordered_pagerank
 from .ranking_rules import is_queryable_symbol, is_rankable_symbol
 from .scip_parser import ParsedScip, parse_scip_index
 from .scip_runner import ScipRunFailure, StructuredIndexingRequiredError, run_scip_indexers
 from .socraticode import ingest_socraticode_artifacts
 from .storage import Storage
 from .visuals import write_query_visualization
-from .docs.ingest import ingest_documentation
+from .docs.ingest import _discover_document_files, ingest_documentation
 
 
 INDEX_STAGES = (
@@ -85,10 +85,13 @@ def _discover_code_files(project_root: Path, extra_extensions: set[str]) -> list
 
 def _project_signature(
     code_files: list[Path],
+    doc_files: list[Path],
     project_root: Path,
     embedding_backend: str,
     model_path: str | None,
     model_filename: str,
+    embedding_api_endpoint: str | None,
+    embedding_api_model: str | None,
     extra_extensions: set[str],
     max_chunk_lines: int,
     chunk_overlap: int,
@@ -97,10 +100,15 @@ def _project_signature(
     for path in code_files:
         relative = path.relative_to(project_root)
         payload.append(f"{relative}:{path.stat().st_mtime_ns}:{path.stat().st_size}")
+    for path in doc_files:
+        relative = path.relative_to(project_root)
+        payload.append(f"doc::{relative}:{path.stat().st_mtime_ns}:{path.stat().st_size}")
     payload.append(f"embedding-backend:{embedding_backend}")
     payload.append(f"index-format-version:{INDEX_FORMAT_VERSION}")
     payload.append(f"model-path:{model_path or ''}")
     payload.append(f"model-file:{model_filename}")
+    payload.append(f"embedding-api-endpoint:{embedding_api_endpoint or ''}")
+    payload.append(f"embedding-api-model:{embedding_api_model or ''}")
     payload.append(f"extra-extensions:{','.join(sorted(extra_extensions))}")
     payload.append(f"respect-gitignore:{os.getenv('RESPECT_GITIGNORE', 'true')}")
     payload.append(f"ignore-dirs:{os.getenv('IGNORE_DIRS', '')}")
@@ -328,7 +336,11 @@ class UltimateIndexer:
                 api_endpoint=self.settings.embedding_api_endpoint,
                 api_model=self.settings.embedding_api_model,
                 api_key=self.settings.embedding_api_key,
+                batch_size=self.settings.embedding_api_batch_size,
+                timeout_seconds=self.settings.embedding_api_timeout_seconds,
                 max_tokens=self.settings.embedding_api_max_tokens,
+                max_retries=self.settings.embedding_api_max_retries,
+                retry_base_delay_ms=self.settings.embedding_api_retry_base_delay_ms,
             )
             return self._provider
         try:
@@ -490,6 +502,7 @@ class UltimateIndexer:
         scip_warnings: list[str] = []
         self._emit_progress(progress_callback, stage="discover", detail="Scanning project files")
         code_files = _discover_code_files(self.settings.project_root, self.settings.extra_extensions)
+        doc_files_for_signature = _discover_document_files(self.settings.project_root)
         self._emit_progress(
             progress_callback,
             stage="discover",
@@ -500,10 +513,13 @@ class UltimateIndexer:
         )
         signature = _project_signature(
             code_files,
+            doc_files_for_signature,
             self.settings.project_root,
             self.settings.embedding_backend,
             self.settings.model_path,
             self.settings.model_filename,
+            self.settings.embedding_api_endpoint,
+            self.settings.embedding_api_model,
             self.settings.extra_extensions,
             self.settings.max_chunk_lines,
             self.settings.chunk_overlap,
@@ -836,11 +852,48 @@ class UltimateIndexer:
 
         self._embed_chunks(chunks, symbol_lookup, progress_callback=progress_callback)
         self._emit_progress(progress_callback, stage="store", detail="Writing index to SQLite")
-        self.storage.replace_project_contents(
-            self.project_id, files, symbols, edges, chunks,
-            function_metadata=function_metadata_records,
-            function_body_chunks=function_body_records,
-        )
+        existing_file_hashes = self.storage.get_file_hashes(self.project_id)
+        indexed_file_hashes = {record.relative_path: record.content_hash for record in files}
+        changed_paths = {
+            relative_path
+            for relative_path, content_hash in indexed_file_hashes.items()
+            if existing_file_hashes.get(relative_path) != content_hash
+        }
+        removed_paths = set(existing_file_hashes) - set(indexed_file_hashes)
+        if not force and existing_file_hashes:
+            self._emit_progress(
+                progress_callback,
+                stage="store",
+                completed=0,
+                total=1,
+                unit="delta",
+                detail=f"Incremental update: {len(changed_paths)} changed, {len(removed_paths)} removed",
+            )
+
+        if force or not existing_file_hashes:
+            self.storage.replace_project_contents(
+                self.project_id,
+                files,
+                symbols,
+                edges,
+                chunks,
+                function_metadata=function_metadata_records,
+                function_body_chunks=function_body_records,
+            )
+            reused_files = 0
+        else:
+            self.storage.replace_project_contents(
+                self.project_id,
+                files,
+                symbols,
+                edges,
+                chunks,
+                function_metadata=function_metadata_records,
+                function_body_chunks=function_body_records,
+                changed_paths=changed_paths,
+                removed_paths=removed_paths,
+            )
+            reused_files = max(len(indexed_file_hashes) - len(changed_paths), 0)
         self.storage.upsert_project(self.project_id, self.project_id, signature)
         self._emit_progress(
             progress_callback,
@@ -866,16 +919,16 @@ class UltimateIndexer:
             indexed_symbols=len(symbols),
             indexed_edges=len(edges),
             indexed_chunks=len(chunks),
-            reused_files=0,
+            reused_files=reused_files,
             artifact_files=len(artifact_bundle.files),
             documentation_files=len(doc_files),
             warnings=scip_warnings,
         )
 
-    def query(self, text: str, limit: int = 10):
+    def query(self, text: str, limit: int = 10, *, scope: SearchScope = "all"):
         if self._query_engine is None:
             self._query_engine = QueryEngine(self.storage, self._provider_instance())
-        return self._query_engine.search(self.project_id, text, limit=limit)
+        return self._query_engine.search(self.project_id, text, limit=limit, scope=scope)
 
     def top_symbols(self, limit: int = 10):
         return self.storage.get_top_symbols(self.project_id, limit)

@@ -150,48 +150,18 @@ def build_mcp(
 
     atexit.register(close_indexers)
 
-    @server.tool()
-    def index_project(
-        project_path: str,
-        force: bool = False,
-        embedding_backend: str = "auto",
-    ) -> str:
-        resolved_path = Path(project_path).expanduser().resolve()
-        # Indexing also registers the project so follow-up MCP calls can refer to
-        # it by name instead of repeating the full absolute path every time.
-        _register_project(cache_dir, resolved_path)
-        indexer = get_indexer(str(resolved_path), embedding_backend)
-        summary = indexer.index(force=force)
-        return (
-            f"Indexed {summary.indexed_files} files, {summary.indexed_symbols} symbols, "
-            f"{summary.indexed_edges} edges, {summary.indexed_chunks} chunks"
-        )
-
-    @server.tool()
-    def list_projects() -> str:
-        # Keep this output comment-prefixed so code-oriented MCP clients can show
-        # it inline without treating it as source content.
-        projects = _load_registry(cache_dir)
-        if not projects:
-            return "// No projects found. Use index_project first."
-        lines = ["// Available projects:"]
-        for project in projects:
-            lines.append(f"//   {project['name']}  ({project['path']})")
-        return "\n".join(lines)
-
-    @server.tool()
-    def search_symbols(
+    def _render_search(
+        *,
         query: str,
-        project: str | None = None,
-        count: int = 10,
-        kind: str | None = None,
-        hybrid: bool = True,
-        embedding_backend: str = "auto",
+        project: str | None,
+        count: int,
+        kind: str | None,
+        hybrid: bool,
+        embedding_backend: str,
+        scope: str,
     ) -> str:
         indexer = get_indexer(project, embedding_backend)
-        # Run the hybrid search first, then optionally narrow the rendered
-        # symbols by kind while preserving the file-level grouping.
-        groups = indexer.query(query, limit=count)
+        groups = indexer.query(query, limit=count, scope=scope)  # type: ignore[arg-type]
         if kind:
             normalized = _normalized_kind(kind)
             filtered_groups = []
@@ -218,12 +188,124 @@ def build_mcp(
         )
 
     @server.tool()
+    def index_project(
+        project_path: str,
+        force: bool = False,
+        embedding_backend: str = "auto",
+    ) -> str:
+        """Index or refresh a project path for subsequent MCP queries."""
+        resolved_path = Path(project_path).expanduser().resolve()
+        # Indexing also registers the project so follow-up MCP calls can refer to
+        # it by name instead of repeating the full absolute path every time.
+        _register_project(cache_dir, resolved_path)
+        indexer = get_indexer(str(resolved_path), embedding_backend)
+        summary = indexer.index(force=force)
+        return (
+            f"Indexed {summary.indexed_files} files, {summary.indexed_symbols} symbols, "
+            f"{summary.indexed_edges} edges, {summary.indexed_chunks} chunks"
+        )
+
+    @server.tool()
+    def list_projects() -> str:
+        """List indexed projects known to this MCP server."""
+        # Keep this output comment-prefixed so code-oriented MCP clients can show
+        # it inline without treating it as source content.
+        projects = _load_registry(cache_dir)
+        if not projects:
+            return "// No projects found. Use index_project first."
+        lines = ["// Available projects:"]
+        for project in projects:
+            lines.append(f"//   {project['name']}  ({project['path']})")
+        return "\n".join(lines)
+
+    @server.tool()
+    def search_symbols(
+        query: str,
+        project: str | None = None,
+        count: int = 10,
+        kind: str | None = None,
+        hybrid: bool = True,
+        embedding_backend: str = "auto",
+    ) -> str:
+        """Legacy search endpoint; equivalent to search_all."""
+        return _render_search(
+            query=query,
+            project=project,
+            count=count,
+            kind=kind,
+            hybrid=hybrid,
+            embedding_backend=embedding_backend,
+            scope="all",
+        )
+
+    @server.tool()
+    def search_code(
+        query: str,
+        project: str | None = None,
+        count: int = 10,
+        kind: str | None = None,
+        hybrid: bool = True,
+        embedding_backend: str = "auto",
+    ) -> str:
+        """Search only code symbols and code files (excludes documentation sources)."""
+        return _render_search(
+            query=query,
+            project=project,
+            count=count,
+            kind=kind,
+            hybrid=hybrid,
+            embedding_backend=embedding_backend,
+            scope="code",
+        )
+
+    @server.tool()
+    def search_docs(
+        query: str,
+        project: str | None = None,
+        count: int = 10,
+        kind: str | None = None,
+        hybrid: bool = True,
+        embedding_backend: str = "auto",
+    ) -> str:
+        """Search only documentation sources (markdown/OpenAPI/doc symbols)."""
+        return _render_search(
+            query=query,
+            project=project,
+            count=count,
+            kind=kind,
+            hybrid=hybrid,
+            embedding_backend=embedding_backend,
+            scope="docs",
+        )
+
+    @server.tool()
+    def search_all(
+        query: str,
+        project: str | None = None,
+        count: int = 10,
+        kind: str | None = None,
+        hybrid: bool = True,
+        embedding_backend: str = "auto",
+    ) -> str:
+        """Search code and documentation separately, then combine ranked results."""
+        return _render_search(
+            query=query,
+            project=project,
+            count=count,
+            kind=kind,
+            hybrid=hybrid,
+            embedding_backend=embedding_backend,
+            scope="all",
+        )
+
+    @server.tool()
     def get_important_symbols(
         project: str | None = None,
         count: int = 20,
         kind: str | None = None,
         embedding_backend: str = "auto",
     ) -> str:
+        """Return globally important symbols from graph ranks."""
         indexer = get_indexer(project, embedding_backend)
         # This is the global graph view rather than query-relative retrieval.
         rows = indexer.important_symbols(limit=count, kind_filter=kind)
@@ -240,6 +322,7 @@ def build_mcp(
         max_per_kind: int = 15,
         embedding_backend: str = "auto",
     ) -> str:
+        """Return a quick, categorized overview of key project symbols."""
         indexer = get_indexer(project, embedding_backend)
         # Return a compact, category-based summary for quick orientation.
         return indexer.project_overview(max_per_kind=max_per_kind)
@@ -249,6 +332,7 @@ def build_mcp(
         project: str | None = None,
         embedding_backend: str = "auto",
     ) -> str:
+        """Return counts and high-level stats for indexed project data."""
         indexer = get_indexer(project, embedding_backend)
         # Stats stay text-based so clients can show them without extra parsing.
         return indexer.project_stats()
@@ -260,6 +344,7 @@ def build_mcp(
         max_chars: int = 12_000,
         top_k: int | None = None,
     ) -> str:
+        """Render project tree ordered by usefulness score."""
         indexer = get_indexer(project, embedding_backend)
         # The scored tree keeps the original usefulness-focused header and view.
         return indexer.scored_tree(max_chars=max_chars, top_k=top_k)
@@ -271,6 +356,7 @@ def build_mcp(
         max_chars: int = 12_000,
         top_k: int | None = None,
     ) -> str:
+        """Render project tree sorted by folder accumulation and file value."""
         indexer = get_indexer(project, embedding_backend)
         # This variant makes the tree ordering explicit: folders by accumulated
         # descendant value, files by their direct score contribution.
@@ -283,9 +369,10 @@ def build_mcp(
         limit: int = 10,
         embedding_backend: str = "auto",
     ) -> str:
+        """Generate an HTML graph visualization for query results."""
         indexer = get_indexer(project, embedding_backend)
         # Visualization reuses the same grouped query results as search_symbols.
-        groups = indexer.query(query, limit=limit)
+        groups = indexer.query(query, limit=limit, scope="all")
         path = indexer.visualize(groups, title=f"Results for: {query}")
         return str(path)
 

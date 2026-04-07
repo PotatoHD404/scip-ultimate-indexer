@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from collections import defaultdict
 from hashlib import sha256
+from typing import Literal
 
 import numpy as np
 
@@ -64,6 +65,7 @@ KIND_BOOSTS = {
 }
 QUERY_CACHE_VERSION = 2
 DOCUMENTATION_SOURCE_KIND = "documentation"
+SearchScope = Literal["all", "code", "docs"]
 
 
 def _normalize_scores(values: dict[str, float]) -> dict[str, float]:
@@ -110,11 +112,19 @@ def _result_source_bucket(row: object | None, fallback_kind: str) -> str:
         source_kind = str(row["source_kind"] or "").strip()
         if source_kind == DOCUMENTATION_SOURCE_KIND:
             return DOCUMENTATION_SOURCE_KIND
-        if str(row["kind"]) in {"Document", "Section"}:
+        if str(row["kind"]) == "Document":
             return DOCUMENTATION_SOURCE_KIND
-    if fallback_kind in {"Document", "Section"}:
+    if fallback_kind == "Document":
         return DOCUMENTATION_SOURCE_KIND
     return "code"
+
+
+def _scope_allows_bucket(scope: SearchScope, bucket: str) -> bool:
+    if scope == "all":
+        return True
+    if scope == "docs":
+        return bucket == DOCUMENTATION_SOURCE_KIND
+    return bucket != DOCUMENTATION_SOURCE_KIND
 
 
 def dependency_ordered_pagerank(
@@ -493,133 +503,166 @@ class QueryEngine:
 
         return sorted(selected, key=lambda item: (-item.score, item.relative_path))
 
-    def search(self, project_id: str, query: str, limit: int = 10) -> list[FileGroup]:
-        """
-        Search with dual-representation function indexing.
-        
-        Retrieval strategy:
-        1. Search the metadata index for high-precision matches.
-        2. Search the body index for behavioral or implementation matches.
-        3. Search traditional chunks for general code matches.
-        4. Merge hits by symbol.
-        5. Rank symbols higher when they match in both indexes.
-        """
-        signature = self.storage.get_project_signature(project_id) or ""
-        query_hash = sha256(
-            f"{QUERY_CACHE_VERSION}:{signature}:{self.provider.model_id}:{query}:{limit}".encode("utf-8")
-        ).hexdigest()
-        cached = self.storage.get_query_cache(project_id, query_hash)
-        if cached is not None:
-            return self._deserialize_groups(cached)
+    def _merge_scope_groups(
+        self,
+        code_groups: list[FileGroup],
+        doc_groups: list[FileGroup],
+        *,
+        limit: int,
+    ) -> list[FileGroup]:
+        if limit <= 0:
+            return []
+        by_path: dict[str, FileGroup] = {}
+        fused_scores: dict[str, float] = defaultdict(float)
+        rrf_k = 60.0
+
+        for groups in (code_groups, doc_groups):
+            for rank, group in enumerate(groups, start=1):
+                fused_scores[group.relative_path] += 1.0 / (rrf_k + rank)
+                existing = by_path.get(group.relative_path)
+                if existing is None:
+                    by_path[group.relative_path] = FileGroup(
+                        relative_path=group.relative_path,
+                        score=group.score,
+                        symbols=list(group.symbols),
+                    )
+                    continue
+                existing.score = max(existing.score, group.score)
+                known_ids = {symbol.symbol_id for symbol in existing.symbols}
+                for symbol in group.symbols:
+                    if symbol.symbol_id not in known_ids:
+                        existing.symbols.append(symbol)
+                        known_ids.add(symbol.symbol_id)
+                existing.symbols.sort(key=lambda item: (-item.score, item.display_name))
+
+        ordered_paths = sorted(
+            fused_scores,
+            key=lambda path: (-fused_scores[path], path),
+        )
+        merged: list[FileGroup] = []
+        for path in ordered_paths[:limit]:
+            group = by_path[path]
+            group.score = fused_scores[path]
+            merged.append(group)
+        return merged
+
+    def _search_uncached(
+        self,
+        project_id: str,
+        query: str,
+        limit: int,
+        *,
+        scope: SearchScope,
+    ) -> list[FileGroup]:
+        if scope == "all":
+            scope_limit = max(limit * 2, 10)
+            code_results = self._search_uncached(
+                project_id,
+                query,
+                scope_limit,
+                scope="code",
+            )
+            docs_results = self._search_uncached(
+                project_id,
+                query,
+                scope_limit,
+                scope="docs",
+            )
+            return self._merge_scope_groups(code_results, docs_results, limit=limit)
 
         symbol_rows = self.storage.get_symbol_rows(project_id)
         rankable_rows = _rankable_query_rows(symbol_rows)
-        
-        # Collect all symbol scores from different sources
         all_symbol_scores: dict[str, dict[str, float]] = defaultdict(dict)
-        
-        # 1. Function metadata search (BM25 + dense)
-        metadata_bm25_hits = self.storage.search_function_metadata_bm25(project_id, query, max(limit * 4, 16))
-        for hit in metadata_bm25_hits:
-            symbol_id = hit["symbol_id"]
-            all_symbol_scores[symbol_id]["metadata_bm25"] = hit["score"]
-            all_symbol_scores[symbol_id]["metadata"] = hit
-        
-        metadata_dense_hits = self._function_metadata_dense_hits(project_id, query, max(limit * 4, 16))
-        for hit in metadata_dense_hits:
-            symbol_id = hit["symbol_id"]
-            all_symbol_scores[symbol_id]["metadata_dense"] = hit["score"]
-            if "metadata" not in all_symbol_scores[symbol_id]:
+
+        if scope == "code":
+            metadata_bm25_hits = self.storage.search_function_metadata_bm25(project_id, query, max(limit * 4, 16))
+            for hit in metadata_bm25_hits:
+                symbol_id = hit["symbol_id"]
+                all_symbol_scores[symbol_id]["metadata_bm25"] = hit["score"]
                 all_symbol_scores[symbol_id]["metadata"] = hit
-        
-        # 2. Function body search (BM25 + dense)
-        body_bm25_hits = self.storage.search_function_body_bm25(project_id, query, max(limit * 6, 24))
-        for hit in body_bm25_hits:
-            symbol_id = hit["symbol_id"]
-            all_symbol_scores[symbol_id]["body_bm25"] = hit["score"]
-            if "body_hits" not in all_symbol_scores[symbol_id]:
-                all_symbol_scores[symbol_id]["body_hits"] = []
-            all_symbol_scores[symbol_id]["body_hits"].append(hit)
-        
-        body_dense_hits = self._function_body_dense_hits(project_id, query, max(limit * 6, 24))
-        for hit in body_dense_hits:
-            symbol_id = hit["symbol_id"]
-            all_symbol_scores[symbol_id]["body_dense"] = hit["score"]
-            if "body_hits" not in all_symbol_scores[symbol_id]:
-                all_symbol_scores[symbol_id]["body_hits"] = []
-            # Avoid duplicates
-            if not any(h["chunk_id"] == hit["chunk_id"] for h in all_symbol_scores[symbol_id]["body_hits"]):
+
+            metadata_dense_hits = self._function_metadata_dense_hits(project_id, query, max(limit * 4, 16))
+            for hit in metadata_dense_hits:
+                symbol_id = hit["symbol_id"]
+                all_symbol_scores[symbol_id]["metadata_dense"] = hit["score"]
+                if "metadata" not in all_symbol_scores[symbol_id]:
+                    all_symbol_scores[symbol_id]["metadata"] = hit
+
+            body_bm25_hits = self.storage.search_function_body_bm25(project_id, query, max(limit * 6, 24))
+            for hit in body_bm25_hits:
+                symbol_id = hit["symbol_id"]
+                all_symbol_scores[symbol_id]["body_bm25"] = hit["score"]
+                if "body_hits" not in all_symbol_scores[symbol_id]:
+                    all_symbol_scores[symbol_id]["body_hits"] = []
                 all_symbol_scores[symbol_id]["body_hits"].append(hit)
-        
-        # 3. Traditional chunk search (BM25 + dense)
-        canonical_bm25_hits: list[tuple[QueryChunkHit, str]] = []
+
+            body_dense_hits = self._function_body_dense_hits(project_id, query, max(limit * 6, 24))
+            for hit in body_dense_hits:
+                symbol_id = hit["symbol_id"]
+                all_symbol_scores[symbol_id]["body_dense"] = hit["score"]
+                if "body_hits" not in all_symbol_scores[symbol_id]:
+                    all_symbol_scores[symbol_id]["body_hits"] = []
+                if not any(h["chunk_id"] == hit["chunk_id"] for h in all_symbol_scores[symbol_id]["body_hits"]):
+                    all_symbol_scores[symbol_id]["body_hits"].append(hit)
+
         for hit in self.storage.search_bm25(project_id, query, max(limit * 6, 24)):
             canonical_symbol_id = self._canonical_symbol_id(symbol_rows, hit.symbol_id)
-            if canonical_symbol_id in rankable_rows:
-                canonical_bm25_hits.append((hit, canonical_symbol_id))
-                all_symbol_scores[canonical_symbol_id]["chunk_bm25"] = hit.score
+            row = rankable_rows.get(canonical_symbol_id)
+            if row is None:
+                continue
+            bucket = _result_source_bucket(row, str(row["kind"]))
+            if not _scope_allows_bucket(scope, bucket):
+                continue
+            all_symbol_scores[canonical_symbol_id]["chunk_bm25"] = hit.score
 
-        canonical_dense_hits: list[tuple[QueryChunkHit, str]] = []
         for hit in self._dense_hits(project_id, query, max(limit * 6, 24)):
             canonical_symbol_id = self._canonical_symbol_id(symbol_rows, hit.symbol_id)
-            if canonical_symbol_id in rankable_rows:
-                canonical_dense_hits.append((hit, canonical_symbol_id))
-                all_symbol_scores[canonical_symbol_id]["chunk_dense"] = hit.score
+            row = rankable_rows.get(canonical_symbol_id)
+            if row is None:
+                continue
+            bucket = _result_source_bucket(row, str(row["kind"]))
+            if not _scope_allows_bucket(scope, bucket):
+                continue
+            all_symbol_scores[canonical_symbol_id]["chunk_dense"] = hit.score
 
-        # Compute combined scores for each symbol
         def _compute_symbol_score(symbol_id: str) -> float:
             scores = all_symbol_scores.get(symbol_id, {})
-            
-            # Metadata scores (high precision for API shape queries)
             metadata_bm25 = scores.get("metadata_bm25", 0.0)
             metadata_dense = scores.get("metadata_dense", 0.0)
             metadata_score = max(metadata_bm25, metadata_dense) * 0.40
-            
-            # Body scores (behavioral/implementation recall)
             body_bm25 = scores.get("body_bm25", 0.0)
             body_dense = scores.get("body_dense", 0.0)
             body_score = max(body_bm25, body_dense) * 0.30
-            
-            # Chunk scores (traditional)
             chunk_bm25 = scores.get("chunk_bm25", 0.0)
             chunk_dense = scores.get("chunk_dense", 0.0)
             chunk_score = max(chunk_bm25, chunk_dense) * 0.30
-            
-            # Bonus for matching in both metadata and body (dual-representation boost)
             dual_bonus = 0.0
             if metadata_score > 0 and body_score > 0:
                 dual_bonus = 0.15 * min(metadata_score, body_score)
-            
             return metadata_score + body_score + chunk_score + dual_bonus
-        
-        # Normalize and compute final scores
+
         raw_scores = {sid: _compute_symbol_score(sid) for sid in all_symbol_scores}
         if not raw_scores:
             return []
-        
         max_score = max(raw_scores.values())
-        if max_score > 0:
-            normalized_scores = {sid: score / max_score for sid, score in raw_scores.items()}
-        else:
-            normalized_scores = raw_scores
-        
-        # Apply kind boost and pagerank
+        normalized_scores = {sid: score / max_score for sid, score in raw_scores.items()} if max_score > 0 else raw_scores
+
         candidates: dict[str, float] = {}
         for symbol_id, base_score in normalized_scores.items():
             row = rankable_rows.get(symbol_id)
             if row is None:
-                # For function metadata symbols not in symbol_rows, create a synthetic entry
-                meta = all_symbol_scores[symbol_id].get("metadata", {})
-                if meta:
-                    candidates[symbol_id] = base_score * 1.1  # Boost for function symbols
+                if scope == "code":
+                    meta = all_symbol_scores[symbol_id].get("metadata", {})
+                    if meta:
+                        candidates[symbol_id] = base_score * 1.1
                 continue
-            
-            score = base_score
-            score = apply_kind_boost(row, score)
+            bucket = _result_source_bucket(row, str(row["kind"]))
+            if not _scope_allows_bucket(scope, bucket):
+                continue
+            score = apply_kind_boost(row, base_score)
             if score > 0:
                 candidates[symbol_id] = score
-        
-        # Apply pagerank personalization
+
         max_seed = max(normalized_scores.values()) if normalized_scores else 0
         threshold = max(0.35, max_seed * 0.6)
         seed_personalization = {
@@ -627,7 +670,6 @@ class QueryEngine:
             for symbol_id, score in normalized_scores.items()
             if score >= threshold
         }
-        
         if seed_personalization:
             ppr_scores = dependency_ordered_pagerank(
                 symbol_rows,
@@ -636,13 +678,10 @@ class QueryEngine:
                 alpha=0.15,
             )
             normalized_ppr_scores = _normalize_scores(ppr_scores)
-            
-            # Combine with pagerank
             for symbol_id in candidates:
                 ppr = normalized_ppr_scores.get(symbol_id, 0.0)
                 candidates[symbol_id] = candidates[symbol_id] * 0.70 + ppr * 0.30
 
-        # Build ranked results
         ranked: list[RankedSymbol] = []
         for symbol_id, score in sorted(candidates.items(), key=lambda item: (-item[1], item[0])):
             row = rankable_rows.get(symbol_id)
@@ -659,24 +698,24 @@ class QueryEngine:
                         snippet=str(row["snippet"]),
                     )
                 )
-            else:
-                # Use function metadata for symbols not in symbol_rows
-                meta = all_symbol_scores[symbol_id].get("metadata", {})
-                if meta:
-                    ranked.append(
-                        RankedSymbol(
-                            symbol_id=symbol_id,
-                            relative_path=str(meta.get("relative_path", "")),
-                            display_name=str(meta.get("display_name", "")),
-                            kind=str(meta.get("kind", "Function")),
-                            score=score,
-                            signature=str(meta.get("signature", "")),
-                            docstring=str(meta.get("docstring", "")),
-                            snippet=str(meta.get("metadata_content", ""))[:500],
-                        )
+                continue
+            if scope != "code":
+                continue
+            meta = all_symbol_scores[symbol_id].get("metadata", {})
+            if meta:
+                ranked.append(
+                    RankedSymbol(
+                        symbol_id=symbol_id,
+                        relative_path=str(meta.get("relative_path", "")),
+                        display_name=str(meta.get("display_name", "")),
+                        kind=str(meta.get("kind", "Function")),
+                        score=score,
+                        signature=str(meta.get("signature", "")),
+                        docstring=str(meta.get("docstring", "")),
+                        snippet=str(meta.get("metadata_content", ""))[:500],
                     )
+                )
 
-        # Group by file
         grouped: dict[str, FileGroup] = {}
         for symbol in ranked:
             group = grouped.setdefault(
@@ -688,8 +727,32 @@ class QueryEngine:
                 group.symbols.append(symbol)
 
         ordered_groups = sorted(grouped.values(), key=lambda item: (-item.score, item.relative_path))
-        results = self._select_groups(ordered_groups, symbol_rows, limit=limit)
+        if scope != "all":
+            ordered_groups = [
+                group
+                for group in ordered_groups
+                if _scope_allows_bucket(scope, self._group_source_bucket(symbol_rows, group))
+            ]
+        results = ordered_groups[:limit]
         for group in results:
             group.symbols.sort(key=lambda item: (-item.score, item.display_name))
+        return results
+
+    def search(
+        self,
+        project_id: str,
+        query: str,
+        limit: int = 10,
+        *,
+        scope: SearchScope = "all",
+    ) -> list[FileGroup]:
+        signature = self.storage.get_project_signature(project_id) or ""
+        query_hash = sha256(
+            f"{QUERY_CACHE_VERSION}:{signature}:{self.provider.model_id}:{scope}:{query}:{limit}".encode("utf-8")
+        ).hexdigest()
+        cached = self.storage.get_query_cache(project_id, query_hash)
+        if cached is not None:
+            return self._deserialize_groups(cached)
+        results = self._search_uncached(project_id, query, limit, scope=scope)
         self.storage.store_query_cache(project_id, query_hash, self._serialize_groups(results))
         return results

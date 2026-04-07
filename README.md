@@ -19,6 +19,7 @@ poetry run ultimate-indexer query /path/to/project "how is authentication handle
 poetry run ultimate-indexer top-symbols /path/to/project --limit 20
 poetry run ultimate-indexer tree /path/to/project
 poetry run ultimate-indexer visualize /path/to/project "auth"
+poetry run ultimate-indexer tui /path/to/project
 poetry run ultimate-indexer mcp
 ```
 
@@ -26,7 +27,12 @@ The MCP server also exposes a scored project tree view that ranks files and fold
 
 For value-oriented inspection, the CLI `tree` command and MCP `sorted_project_tree` tool show the same tree with folders sorted by accumulated descendant score and files annotated by direct value.
 
-Its MCP tool names now align with the graph-indexer style as well: `list_projects`, `search_symbols`, `get_important_symbols`, `get_project_overview`, and `get_stats`, while keeping `index_project`, `visualize_project`, `scored_project_tree`, and `sorted_project_tree` as extra helpers. The `mcp` command also accepts graph-indexer-style flags such as `--cache-dir`, `--embedding-model`, `--embedding-n-ctx`, `--transport`, `--host`, and `--port`.
+Its MCP tools now expose split retrieval scopes:
+- `search_code` for code-only retrieval
+- `search_docs` for documentation-only retrieval
+- `search_all` to combine independently ranked code+docs results
+
+`search_symbols` remains available as a backward-compatible alias to `search_all`. Other tools include `list_projects`, `get_important_symbols`, `get_project_overview`, `get_stats`, `index_project`, `visualize_project`, `scored_project_tree`, and `sorted_project_tree`. The `mcp` command also accepts graph-indexer-style flags such as `--cache-dir`, `--embedding-model`, `--embedding-n-ctx`, `--transport`, `--host`, and `--port`.
 
 ## Embeddings
 
@@ -48,6 +54,9 @@ Useful debug envs:
 - `ULTIMATE_INDEXER_LLAMA_VERBOSE=true` to expose backend/device logs
 - `ULTIMATE_INDEXER_LLAMA_SUPPRESS_LOGS=false` to stop silencing `llama.cpp` stderr/stdout
 - `ULTIMATE_INDEXER_LLAMA_N_GPU_LAYERS`, `ULTIMATE_INDEXER_LLAMA_N_CTX`, `ULTIMATE_INDEXER_LLAMA_N_BATCH`, and `ULTIMATE_INDEXER_LLAMA_N_UBATCH` to override runtime settings
+- `ULTIMATE_INDEXER_EMBEDDING_API_ENDPOINT`, `ULTIMATE_INDEXER_EMBEDDING_API_MODEL`, and `ULTIMATE_INDEXER_EMBEDDING_API_KEY` for OpenAI-compatible embedding APIs
+- `ULTIMATE_INDEXER_EMBEDDING_API_TIMEOUT_SECONDS`, `ULTIMATE_INDEXER_EMBEDDING_API_MAX_RETRIES`, and `ULTIMATE_INDEXER_EMBEDDING_API_RETRY_BASE_DELAY_MS` to control API resiliency
+- `ULTIMATE_INDEXER_EMBEDDING_API_BATCH_SIZE` and `ULTIMATE_INDEXER_EMBEDDING_API_MAX_TOKENS` to tune API request sizing
 
 ## SCIP support
 

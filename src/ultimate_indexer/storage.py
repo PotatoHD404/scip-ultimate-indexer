@@ -9,7 +9,15 @@ from pathlib import Path
 import numpy as np
 
 from .embeddings import hash_text
-from .models import ChunkRecord, EdgeRecord, FileRecord, FunctionBodyChunkRecord, FunctionMetadataRecord, QueryChunkHit, SymbolRecord
+from .models import (
+    ChunkRecord,
+    EdgeRecord,
+    FileRecord,
+    FunctionBodyChunkRecord,
+    FunctionMetadataRecord,
+    QueryChunkHit,
+    SymbolRecord,
+)
 
 
 def _utcnow() -> str:
@@ -253,29 +261,138 @@ class Storage:
         chunks: Iterable[ChunkRecord],
         function_metadata: Iterable[FunctionMetadataRecord] | None = None,
         function_body_chunks: Iterable[FunctionBodyChunkRecord] | None = None,
+        changed_paths: set[str] | None = None,
+        removed_paths: set[str] | None = None,
     ) -> None:
         files = list(files)
         symbols = list(symbols)
         edges = list(edges)
         chunks = list(chunks)
         function_metadata = list(function_metadata) if function_metadata else []
-        function_body_chunks = list(function_body_chunks) if function_body_chunks else []
+        function_body_chunks = (
+            list(function_body_chunks) if function_body_chunks else []
+        )
+        incremental_mode = changed_paths is not None or removed_paths is not None
+        changed_paths = set(changed_paths or set())
+        removed_paths = set(removed_paths or set())
+        target_paths = changed_paths | removed_paths
+        affected_symbol_ids: set[str] = set()
+
+        if incremental_mode:
+            files = [item for item in files if item.relative_path in changed_paths]
+            symbols = [item for item in symbols if item.relative_path in changed_paths]
+            chunks = [item for item in chunks if item.relative_path in changed_paths]
+            function_metadata = [
+                item for item in function_metadata if item.relative_path in changed_paths
+            ]
+            function_body_chunks = [
+                item for item in function_body_chunks if item.relative_path in changed_paths
+            ]
+            if target_paths:
+                path_placeholders = ",".join("?" for _ in target_paths)
+                old_rows = self.connection.execute(
+                    f"""
+                    SELECT symbol_id
+                    FROM symbols
+                    WHERE project_id = ? AND relative_path IN ({path_placeholders})
+                    """,
+                    (project_id, *sorted(target_paths)),
+                ).fetchall()
+                affected_symbol_ids.update(str(row["symbol_id"]) for row in old_rows)
+            affected_symbol_ids.update(item.symbol_id for item in symbols)
+
         keep_paths = {item.relative_path for item in files}
         with self.connection:
-            self.connection.execute("DELETE FROM edges WHERE project_id = ?", (project_id,))
-            self.connection.execute("DELETE FROM chunk_fts WHERE project_id = ?", (project_id,))
-            self.connection.execute("DELETE FROM chunks WHERE project_id = ?", (project_id,))
-            self.connection.execute("DELETE FROM symbols WHERE project_id = ?", (project_id,))
-            self.connection.execute("DELETE FROM function_metadata_fts WHERE project_id = ?", (project_id,))
-            self.connection.execute("DELETE FROM function_metadata WHERE project_id = ?", (project_id,))
-            self.connection.execute("DELETE FROM function_body_fts WHERE project_id = ?", (project_id,))
-            self.connection.execute("DELETE FROM function_body_chunks WHERE project_id = ?", (project_id,))
             self.connection.execute(
-                "DELETE FROM files WHERE project_id = ? AND relative_path NOT IN ({})".format(
-                    ",".join("?" for _ in keep_paths) if keep_paths else "''"
-                ),
-                (project_id, *sorted(keep_paths)),
+                "DELETE FROM query_cache WHERE project_id = ?", (project_id,)
             )
+            if incremental_mode:
+                if affected_symbol_ids:
+                    symbol_placeholders = ",".join("?" for _ in affected_symbol_ids)
+                    self.connection.execute(
+                        f"""
+                        DELETE FROM edges
+                        WHERE project_id = ?
+                          AND (
+                            source_symbol_id IN ({symbol_placeholders})
+                            OR target_symbol_id IN ({symbol_placeholders})
+                          )
+                        """,
+                        (project_id, *sorted(affected_symbol_ids), *sorted(affected_symbol_ids)),
+                    )
+                if target_paths:
+                    path_placeholders = ",".join("?" for _ in target_paths)
+                    self.connection.execute(
+                        f"""
+                        DELETE FROM chunk_fts
+                        WHERE project_id = ?
+                          AND chunk_id IN (
+                            SELECT chunk_id
+                            FROM chunks
+                            WHERE project_id = ? AND relative_path IN ({path_placeholders})
+                          )
+                        """,
+                        (project_id, project_id, *sorted(target_paths)),
+                    )
+                    self.connection.execute(
+                        f"DELETE FROM chunks WHERE project_id = ? AND relative_path IN ({path_placeholders})",
+                        (project_id, *sorted(target_paths)),
+                    )
+                    self.connection.execute(
+                        f"DELETE FROM symbols WHERE project_id = ? AND relative_path IN ({path_placeholders})",
+                        (project_id, *sorted(target_paths)),
+                    )
+                    self.connection.execute(
+                        f"DELETE FROM function_metadata_fts WHERE project_id = ? AND symbol_id IN (SELECT symbol_id FROM function_metadata WHERE project_id = ? AND relative_path IN ({path_placeholders}))",
+                        (project_id, project_id, *sorted(target_paths)),
+                    )
+                    self.connection.execute(
+                        f"DELETE FROM function_metadata WHERE project_id = ? AND relative_path IN ({path_placeholders})",
+                        (project_id, *sorted(target_paths)),
+                    )
+                    self.connection.execute(
+                        f"DELETE FROM function_body_fts WHERE project_id = ? AND chunk_id IN (SELECT chunk_id FROM function_body_chunks WHERE project_id = ? AND relative_path IN ({path_placeholders}))",
+                        (project_id, project_id, *sorted(target_paths)),
+                    )
+                    self.connection.execute(
+                        f"DELETE FROM function_body_chunks WHERE project_id = ? AND relative_path IN ({path_placeholders})",
+                        (project_id, *sorted(target_paths)),
+                    )
+                    self.connection.execute(
+                        f"DELETE FROM files WHERE project_id = ? AND relative_path IN ({path_placeholders})",
+                        (project_id, *sorted(target_paths)),
+                    )
+            else:
+                self.connection.execute(
+                    "DELETE FROM edges WHERE project_id = ?", (project_id,)
+                )
+                self.connection.execute(
+                    "DELETE FROM chunk_fts WHERE project_id = ?", (project_id,)
+                )
+                self.connection.execute(
+                    "DELETE FROM chunks WHERE project_id = ?", (project_id,)
+                )
+                self.connection.execute(
+                    "DELETE FROM symbols WHERE project_id = ?", (project_id,)
+                )
+                self.connection.execute(
+                    "DELETE FROM function_metadata_fts WHERE project_id = ?", (project_id,)
+                )
+                self.connection.execute(
+                    "DELETE FROM function_metadata WHERE project_id = ?", (project_id,)
+                )
+                self.connection.execute(
+                    "DELETE FROM function_body_fts WHERE project_id = ?", (project_id,)
+                )
+                self.connection.execute(
+                    "DELETE FROM function_body_chunks WHERE project_id = ?", (project_id,)
+                )
+                self.connection.execute(
+                    "DELETE FROM files WHERE project_id = ? AND relative_path NOT IN ({})".format(
+                        ",".join("?" for _ in keep_paths) if keep_paths else "''"
+                    ),
+                    (project_id, *sorted(keep_paths)),
+                )
 
             for file_record in files:
                 self.connection.execute(
@@ -333,6 +450,12 @@ class Storage:
                 )
 
             for edge in edges:
+                if incremental_mode and affected_symbol_ids:
+                    if (
+                        edge.source_symbol_id not in affected_symbol_ids
+                        and edge.target_symbol_id not in affected_symbol_ids
+                    ):
+                        continue
                 self.connection.execute(
                     """
                     INSERT INTO edges(project_id, source_symbol_id, target_symbol_id, edge_type, weight)
@@ -514,7 +637,9 @@ class Storage:
         ).fetchone()
         if row is None:
             return None
-        return np.frombuffer(row["embedding"], dtype=np.float32, count=row["embedding_dim"]).copy()
+        return np.frombuffer(
+            row["embedding"], dtype=np.float32, count=row["embedding_dim"]
+        ).copy()
 
     def store_embedding(self, model_id: str, text: str, vector: np.ndarray) -> None:
         self.connection.execute(
@@ -546,7 +671,9 @@ class Storage:
             (project_id,),
         ).fetchall()
         vectors = [
-            np.frombuffer(row["embedding"], dtype=np.float32, count=row["embedding_dim"]).copy()
+            np.frombuffer(
+                row["embedding"], dtype=np.float32, count=row["embedding_dim"]
+            ).copy()
             for row in rows
         ]
         if not vectors:
@@ -569,7 +696,9 @@ class Storage:
             (project_id,),
         ).fetchall()
         vectors = [
-            np.frombuffer(row["embedding"], dtype=np.float32, count=row["embedding_dim"]).copy()
+            np.frombuffer(
+                row["embedding"], dtype=np.float32, count=row["embedding_dim"]
+            ).copy()
             for row in rows
         ]
         if not vectors:
@@ -593,7 +722,9 @@ class Storage:
             (project_id,),
         ).fetchall()
         vectors = [
-            np.frombuffer(row["embedding"], dtype=np.float32, count=row["embedding_dim"]).copy()
+            np.frombuffer(
+                row["embedding"], dtype=np.float32, count=row["embedding_dim"]
+            ).copy()
             for row in rows
         ]
         if not vectors:
@@ -618,7 +749,11 @@ class Storage:
         limit: int,
     ) -> list[dict]:
         """Search function metadata using BM25."""
-        tokens = [token for token in query.replace("/", " ").replace(".", " ").split() if token]
+        tokens = [
+            token
+            for token in query.replace("/", " ").replace(".", " ").split()
+            if token
+        ]
         if not tokens:
             return []
         fts_query = " ".join(f'"{token}"' for token in tokens)
@@ -649,27 +784,35 @@ class Storage:
                 """,
                 (project_id, f"%{query}%", limit),
             ).fetchall()
-        
+
         results = []
         for idx, row in enumerate(rows):
             raw_rank = float(row["rank"])
             score = 1.0 / (1.0 + max(raw_rank, 0.0) + idx)
-            results.append({
-                "symbol_id": str(row["symbol_id"]),
-                "relative_path": str(row["relative_path"]),
-                "display_name": str(row["display_name"]),
-                "kind": str(row["kind"]),
-                "fully_qualified_name": str(row["fully_qualified_name"]),
-                "signature": str(row["signature"]),
-                "docstring": str(row["docstring"]),
-                "called_functions": json.loads(row["called_functions"]) if row["called_functions"] else [],
-                "referenced_types": json.loads(row["referenced_types"]) if row["referenced_types"] else [],
-                "behavioral_tags": json.loads(row["behavioral_tags"]) if row["behavioral_tags"] else [],
-                "literals": json.loads(row["literals"]) if row["literals"] else [],
-                "score": score,
-                "start_line": int(row["start_line"]),
-                "end_line": int(row["end_line"]),
-            })
+            results.append(
+                {
+                    "symbol_id": str(row["symbol_id"]),
+                    "relative_path": str(row["relative_path"]),
+                    "display_name": str(row["display_name"]),
+                    "kind": str(row["kind"]),
+                    "fully_qualified_name": str(row["fully_qualified_name"]),
+                    "signature": str(row["signature"]),
+                    "docstring": str(row["docstring"]),
+                    "called_functions": json.loads(row["called_functions"])
+                    if row["called_functions"]
+                    else [],
+                    "referenced_types": json.loads(row["referenced_types"])
+                    if row["referenced_types"]
+                    else [],
+                    "behavioral_tags": json.loads(row["behavioral_tags"])
+                    if row["behavioral_tags"]
+                    else [],
+                    "literals": json.loads(row["literals"]) if row["literals"] else [],
+                    "score": score,
+                    "start_line": int(row["start_line"]),
+                    "end_line": int(row["end_line"]),
+                }
+            )
         return results
 
     def search_function_body_bm25(
@@ -679,7 +822,11 @@ class Storage:
         limit: int,
     ) -> list[dict]:
         """Search function body chunks using BM25."""
-        tokens = [token for token in query.replace("/", " ").replace(".", " ").split() if token]
+        tokens = [
+            token
+            for token in query.replace("/", " ").replace(".", " ").split()
+            if token
+        ]
         if not tokens:
             return []
         fts_query = " ".join(f'"{token}"' for token in tokens)
@@ -709,30 +856,38 @@ class Storage:
                 """,
                 (project_id, f"%{query}%", limit),
             ).fetchall()
-        
+
         results = []
         for idx, row in enumerate(rows):
             raw_rank = float(row["rank"])
             score = 1.0 / (1.0 + max(raw_rank, 0.0) + idx)
-            results.append({
-                "chunk_id": str(row["chunk_id"]),
-                "symbol_id": str(row["symbol_id"]),
-                "relative_path": str(row["relative_path"]),
-                "display_name": str(row["display_name"]),
-                "kind": str(row["kind"]),
-                "signature": str(row["signature"]),
-                "chunk_index": int(row["chunk_index"]),
-                "total_chunks": int(row["total_chunks"]),
-                "body": str(row["body"]),
-                "chunk_type": str(row["chunk_type"]),
-                "score": score,
-                "start_line": int(row["start_line"]),
-                "end_line": int(row["end_line"]),
-            })
+            results.append(
+                {
+                    "chunk_id": str(row["chunk_id"]),
+                    "symbol_id": str(row["symbol_id"]),
+                    "relative_path": str(row["relative_path"]),
+                    "display_name": str(row["display_name"]),
+                    "kind": str(row["kind"]),
+                    "signature": str(row["signature"]),
+                    "chunk_index": int(row["chunk_index"]),
+                    "total_chunks": int(row["total_chunks"]),
+                    "body": str(row["body"]),
+                    "chunk_type": str(row["chunk_type"]),
+                    "score": score,
+                    "start_line": int(row["start_line"]),
+                    "end_line": int(row["end_line"]),
+                }
+            )
         return results
 
-    def search_bm25(self, project_id: str, query: str, limit: int) -> list[QueryChunkHit]:
-        tokens = [token for token in query.replace("/", " ").replace(".", " ").split() if token]
+    def search_bm25(
+        self, project_id: str, query: str, limit: int
+    ) -> list[QueryChunkHit]:
+        tokens = [
+            token
+            for token in query.replace("/", " ").replace(".", " ").split()
+            if token
+        ]
         if not tokens:
             return []
         fts_query = " ".join(f'"{token}"' for token in tokens)
@@ -844,7 +999,9 @@ class Storage:
         ).fetchone()
         return None if row is None else str(row["response_json"])
 
-    def store_query_cache(self, project_id: str, query_hash: str, payload: dict) -> None:
+    def store_query_cache(
+        self, project_id: str, query_hash: str, payload: dict
+    ) -> None:
         self.connection.execute(
             """
             INSERT OR REPLACE INTO query_cache(project_id, query_hash, response_json, created_at)

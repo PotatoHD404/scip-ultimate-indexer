@@ -71,6 +71,18 @@ class Settings:
     embedding_api_max_tokens: int | None = field(
         default_factory=lambda: int(os.getenv("ULTIMATE_INDEXER_EMBEDDING_API_MAX_TOKENS", "0")) or None
     )
+    embedding_api_batch_size: int = field(
+        default_factory=lambda: int(os.getenv("ULTIMATE_INDEXER_EMBEDDING_API_BATCH_SIZE", "32"))
+    )
+    embedding_api_timeout_seconds: float = field(
+        default_factory=lambda: float(os.getenv("ULTIMATE_INDEXER_EMBEDDING_API_TIMEOUT_SECONDS", "30.0"))
+    )
+    embedding_api_max_retries: int = field(
+        default_factory=lambda: int(os.getenv("ULTIMATE_INDEXER_EMBEDDING_API_MAX_RETRIES", "3"))
+    )
+    embedding_api_retry_base_delay_ms: int = field(
+        default_factory=lambda: int(os.getenv("ULTIMATE_INDEXER_EMBEDDING_API_RETRY_BASE_DELAY_MS", "500"))
+    )
     edge_weights: dict[str, float] = field(default_factory=lambda: DEFAULT_EDGE_WEIGHTS.copy())
     max_chunk_lines: int = 120
     chunk_overlap: int = 20

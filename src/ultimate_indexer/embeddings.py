@@ -256,6 +256,8 @@ class APIEmbeddingProvider:
     batch_size: int = 32
     timeout_seconds: float = 30.0
     max_tokens: int = DEFAULT_MAX_TOKENS
+    max_retries: int = MAX_RETRIES
+    retry_base_delay_ms: int = BASE_DELAY_MS
     
     def prepare_document_text(self, content: str, file_path: str) -> str:
         return content
@@ -378,11 +380,46 @@ class APIEmbeddingProvider:
         matrix = np.vstack(embeddings)
         return np.mean(matrix, axis=0).astype(np.float32)
     
+    def _parse_embeddings_response(self, result: object, expected: int) -> list[list[float]]:
+        embeddings: list[object]
+        if isinstance(result, dict):
+            if "error" in result:
+                raise RuntimeError(f"Embedding API error response: {result['error']}")
+            if "data" in result and isinstance(result["data"], list):
+                data_items = sorted(
+                    result["data"],
+                    key=lambda item: int(item.get("index", 0)) if isinstance(item, dict) else 0,
+                )
+                embeddings = [item.get("embedding") if isinstance(item, dict) else None for item in data_items]
+            elif "embeddings" in result and isinstance(result["embeddings"], list):
+                embeddings = result["embeddings"]
+            elif "embedding" in result:
+                embeddings = [result["embedding"]]
+            else:
+                raise ValueError(f"Unexpected API response format: {result}")
+        elif isinstance(result, list):
+            embeddings = result
+        else:
+            raise ValueError(f"Unexpected API response type: {type(result)}")
+
+        parsed: list[list[float]] = []
+        for embedding in embeddings:
+            if not isinstance(embedding, list) or not embedding:
+                raise ValueError("Embedding API returned an invalid embedding vector")
+            parsed.append([float(value) for value in embedding])
+        if expected > 1 and len(parsed) != expected:
+            raise ValueError(
+                f"Embedding API returned {len(parsed)} vectors for {expected} inputs"
+            )
+        return parsed
+
     def _call_api(self, texts: list[str]) -> list[list[float]]:
         """Call the embedding API endpoint and return embeddings.
         
         Handles context length errors by automatically splitting oversized texts.
         """
+        if not self.api_endpoint or not self.api_model:
+            raise RuntimeError("Embedding API endpoint and model must both be configured")
         payload = {
             "input": texts,
             "model": self.api_model,
@@ -406,25 +443,7 @@ class APIEmbeddingProvider:
         try:
             with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
                 result = json.loads(response.read().decode("utf-8"))
-                
-                # Handle different API response formats
-                if "data" in result:
-                    # OpenAI-compatible format: {"data": [{"embedding": [...]}]}
-                    embeddings = [item["embedding"] for item in result["data"]]
-                elif "embeddings" in result:
-                    # Alternative format: {"embeddings": [[...]]}
-                    embeddings = result["embeddings"]
-                elif "embedding" in result:
-                    # Single embedding format: {"embedding": [...]}
-                    embeddings = [result["embedding"]]
-                else:
-                    # Try to use the result directly if it's a list
-                    if isinstance(result, list):
-                        embeddings = result
-                    else:
-                        raise ValueError(f"Unexpected API response format: {result}")
-                
-                return embeddings
+                return self._parse_embeddings_response(result, len(texts))
         except urllib.error.HTTPError as e:
             error_body = e.read().decode("utf-8") if e.fp else ""
             
@@ -566,7 +585,13 @@ class APIEmbeddingProvider:
         all_embeddings: list[list[float]] = []
         for start in range(0, len(texts), self.batch_size):
             batch = texts[start:start + self.batch_size]
-            batch_embeddings = self._call_api(batch)
+            batch_embeddings = _with_retry(
+                lambda: self._call_api(batch),
+                label=f"API embedding batch {(start // self.batch_size) + 1}",
+                max_retries=self.max_retries,
+                base_delay_ms=self.retry_base_delay_ms,
+            )
+            assert isinstance(batch_embeddings, list)
             all_embeddings.extend(batch_embeddings)
         
         return [np.asarray(embedding, dtype=np.float32) for embedding in all_embeddings]
@@ -585,6 +610,8 @@ def resolve_api_provider(
     batch_size: int = 32,
     timeout_seconds: float = 30.0,
     max_tokens: int | None = None,
+    max_retries: int = MAX_RETRIES,
+    retry_base_delay_ms: int = BASE_DELAY_MS,
 ) -> APIEmbeddingProvider:
     """Create an API embedding provider from configuration.
     
@@ -610,6 +637,8 @@ def resolve_api_provider(
         batch_size=batch_size,
         timeout_seconds=timeout_seconds,
         max_tokens=max_tokens,
+        max_retries=max_retries,
+        retry_base_delay_ms=retry_base_delay_ms,
     )
 
 

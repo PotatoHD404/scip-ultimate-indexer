@@ -12,6 +12,7 @@ from .indexer import UltimateIndexer
 from .mcp_server import run_mcp
 from .models import IndexProgress
 from .scip_runner import StructuredIndexingRequiredError
+from .tui import run_tui
 
 
 app = typer.Typer(add_completion=False)
@@ -147,6 +148,7 @@ def query(
     embedding_api_key: str | None = typer.Option(None, "--embedding-api-key"),
     embedding_api_endpoint: str | None = typer.Option(None, "--embedding-api-endpoint"),
     embedding_api_model: str | None = typer.Option(None, "--embedding-api-model"),
+    scope: str = typer.Option("all", "--scope", help="Search scope: all, code, docs"),
 ) -> None:
     indexer = _build_indexer(
         project_path,
@@ -157,7 +159,10 @@ def query(
         embedding_api_model=embedding_api_model,
     )
     try:
-        groups = indexer.query(text, limit=limit)
+        normalized_scope = scope.strip().lower()
+        if normalized_scope not in {"all", "code", "docs"}:
+            raise typer.BadParameter("scope must be one of: all, code, docs")
+        groups = indexer.query(text, limit=limit, scope=normalized_scope)  # type: ignore[arg-type]
         console.print(format_groups(indexer.storage, indexer.project_id, groups))
     finally:
         indexer.close()
@@ -258,6 +263,25 @@ def mcp(
         cache_dir=cache_dir,
         embedding_model=embedding_model,
         embedding_n_ctx=embedding_n_ctx,
+        embedding_api_key=embedding_api_key,
+        embedding_api_endpoint=embedding_api_endpoint,
+        embedding_api_model=embedding_api_model,
+    )
+
+
+@app.command()
+def tui(
+    project_path: Path,
+    embedding_backend: str = typer.Option("auto", "--embedding-backend"),
+    cache_dir: Path | None = typer.Option(None, "--cache-dir"),
+    embedding_api_key: str | None = typer.Option(None, "--embedding-api-key"),
+    embedding_api_endpoint: str | None = typer.Option(None, "--embedding-api-endpoint"),
+    embedding_api_model: str | None = typer.Option(None, "--embedding-api-model"),
+) -> None:
+    run_tui(
+        project_path=project_path,
+        embedding_backend=embedding_backend,
+        cache_dir=cache_dir,
         embedding_api_key=embedding_api_key,
         embedding_api_endpoint=embedding_api_endpoint,
         embedding_api_model=embedding_api_model,

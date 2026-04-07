@@ -1,4 +1,5 @@
 """Tests for the documentation ingestion pipeline."""
+
 from __future__ import annotations
 
 import tempfile
@@ -89,16 +90,16 @@ Also an [external link](https://example.com).
 
         # Should find 3 internal links (external is skipped)
         assert len(links) == 3
-        
-        cross_file = [l for l in links if l.link_type == 'cross_file']
+
+        cross_file = [l for l in links if l.link_type == "cross_file"]
         assert len(cross_file) == 1
         assert cross_file[0].target_file == "other.md"
 
-        intra = [l for l in links if l.link_type == 'intra_anchor']
+        intra = [l for l in links if l.link_type == "intra_anchor"]
         assert len(intra) == 1
         assert intra[0].target_anchor == "heading"
 
-        cross_anchor = [l for l in links if l.link_type == 'cross_anchor']
+        cross_anchor = [l for l in links if l.link_type == "cross_anchor"]
         assert len(cross_anchor) == 1
         assert cross_anchor[0].target_file == "other.md"
         assert cross_anchor[0].target_anchor == "details"
@@ -208,14 +209,11 @@ components:
         assert len(sections) >= 3
 
         # Should find $ref link
-        ref_links = [l for l in links if l.link_type == 'openapi_ref']
+        ref_links = [l for l in links if l.link_type == "openapi_ref"]
         assert len(ref_links) >= 1
 
         # Check endpoint content
-        endpoint_sections = [
-            s for s in sections
-            if s.chunk_type == 'openapi_endpoint'
-        ]
+        endpoint_sections = [s for s in sections if s.chunk_type == "openapi_endpoint"]
         assert len(endpoint_sections) == 2
 
 
@@ -225,16 +223,18 @@ class TestDocumentChunker:
     def test_small_sections_not_split(self):
         chunker = DocumentChunker(max_chunk_tokens=1000)
 
-        sections = [{
-            'header': None,
-            'level': 1,
-            'content': "Short content.",
-            'start_line': 0,
-            'end_line': 1,
-            'anchor': "test",
-            'anchors_in_range': ["test"],
-            'chunk_type': 'markdown_section',
-        }]
+        sections = [
+            {
+                "header": None,
+                "level": 1,
+                "content": "Short content.",
+                "start_line": 0,
+                "end_line": 1,
+                "anchor": "test",
+                "anchors_in_range": ["test"],
+                "chunk_type": "markdown_section",
+            }
+        ]
 
         chunks = chunker.chunk_sections("f.md", sections)
         assert len(chunks) == 1
@@ -247,24 +247,24 @@ class TestDocumentChunker:
 
         sections = [
             {
-                'header': SectionHeader(1, "Guide", "guide", 0, "f.md"),
-                'level': 1,
-                'content': "# Guide\nIntro.",
-                'start_line': 0,
-                'end_line': 2,
-                'anchor': "guide",
-                'anchors_in_range': [],
-                'chunk_type': 'markdown_section',
+                "header": SectionHeader(1, "Guide", "guide", 0, "f.md"),
+                "level": 1,
+                "content": "# Guide\nIntro.",
+                "start_line": 0,
+                "end_line": 2,
+                "anchor": "guide",
+                "anchors_in_range": [],
+                "chunk_type": "markdown_section",
             },
             {
-                'header': SectionHeader(2, "Setup", "setup", 2, "f.md"),
-                'level': 2,
-                'content': "## Setup\nSteps.",
-                'start_line': 2,
-                'end_line': 4,
-                'anchor': "setup",
-                'anchors_in_range': [],
-                'chunk_type': 'markdown_section',
+                "header": SectionHeader(2, "Setup", "setup", 2, "f.md"),
+                "level": 2,
+                "content": "## Setup\nSteps.",
+                "start_line": 2,
+                "end_line": 4,
+                "anchor": "setup",
+                "anchors_in_range": [],
+                "chunk_type": "markdown_section",
             },
         ]
 
@@ -305,25 +305,26 @@ class TestLinkResolver:
         resolver.register_file("b.md", [chunk_b], {"section": 0})
 
         # Use ParsedLink objects instead of dicts
-        links = [ParsedLink(
-            source_file='a.md',
-            source_anchor='test',
-            target_raw='b.md#section',
-            target_file='b.md',
-            target_anchor='section',
-            link_type='cross_anchor',
-            context_text='other',
-        )]
+        links = [
+            ParsedLink(
+                source_file="a.md",
+                source_anchor="test",
+                target_raw="b.md#section",
+                target_file="b.md",
+                target_anchor="section",
+                link_type="cross_anchor",
+                context_text="other",
+            )
+        ]
 
         edges = resolver.resolve_links(
-            links, "a.md",
-            {'cross_anchor': 1.0, 'cross_file': 1.0, 'intra_anchor': 0.5}
+            links, "a.md", {"cross_anchor": 1.0, "cross_file": 1.0, "intra_anchor": 0.5}
         )
 
         assert len(edges) == 1
-        assert edges[0]['source_chunk_id'] == "a#1"
-        assert edges[0]['target_chunk_id'] == "b#1"
-        assert edges[0]['edge_type'] == 'cross_anchor'
+        assert edges[0]["source_chunk_id"] == "a#1"
+        assert edges[0]["target_chunk_id"] == "b#1"
+        assert edges[0]["edge_type"] == "cross_anchor"
 
 
 class TestDocumentGraph:
@@ -492,3 +493,26 @@ Returns a list of users.
             assert len(files) == 2
             assert len(symbols) >= 4  # At least 2 files + 2 documents
             assert len(chunks) >= 2
+
+    def test_doc_dir_aliases_do_not_duplicate_files(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir).resolve()
+            docs_dir = tmp_path / "docs"
+            docs_dir.mkdir()
+            (docs_dir / "guide.md").write_text("# Guide\n\nHello\n")
+
+            alias_dir = tmp_path / "Docs"
+            try:
+                alias_dir.symlink_to(docs_dir, target_is_directory=True)
+            except OSError:
+                pytest.skip("symlinks are not supported in this environment")
+
+            files, symbols, edges, chunks = ingest_documentation(
+                project_id="test-project",
+                project_root=tmp_path,
+            )
+
+            assert [file.relative_path for file in files] == ["docs/guide.md"]
+            assert len(symbols) >= 1
+            assert len(edges) >= 0
+            assert len(chunks) >= 1

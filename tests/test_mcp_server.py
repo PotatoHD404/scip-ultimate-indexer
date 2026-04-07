@@ -67,7 +67,7 @@ def test_query_project_stays_connected_and_returns_compact_output(fixture_projec
                 assert any(path.name == "index.sqlite3" for path in cache_dir.rglob("index.sqlite3"))
 
                 mixed = await session.call_tool(
-                    "search_symbols",
+                    "search_all",
                     {
                         "project": str(fixture_project),
                         "query": "users tenant email",
@@ -78,6 +78,31 @@ def test_query_project_stays_connected_and_returns_compact_output(fixture_projec
                 assert mixed.isError is False
                 assert "docs/schema.md" in mixed.content[0].text
                 assert ".py" in mixed.content[0].text
+
+                docs_only = await session.call_tool(
+                    "search_docs",
+                    {
+                        "project": str(fixture_project),
+                        "query": "users tenant email",
+                        "count": 3,
+                        "embedding_backend": "hash",
+                    },
+                )
+                assert docs_only.isError is False
+                assert "docs/schema.md" in docs_only.content[0].text
+                assert ".py" not in docs_only.content[0].text
+
+                code_only = await session.call_tool(
+                    "search_code",
+                    {
+                        "project": str(fixture_project),
+                        "query": "users tenant email",
+                        "count": 3,
+                        "embedding_backend": "hash",
+                    },
+                )
+                assert code_only.isError is False
+                assert ".py" in code_only.content[0].text
 
                 listed = await session.call_tool(
                     "list_projects",

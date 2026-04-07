@@ -1,0 +1,550 @@
+{
+  "project_path": "/Users/potatohd/Documents/git/code-context/test-manual-project",
+  "summary": {
+    "indexed_files": 9,
+    "indexed_symbols": 72,
+    "indexed_edges": 82,
+    "indexed_chunks": 70,
+    "documentation_files": 4,
+    "warnings": []
+  },
+  "counts": {
+    "files": 9,
+    "symbols": 72,
+    "edges": 82,
+    "chunks": 70,
+    "documentation_like_files": 5
+  },
+  "duplicates": {
+    "files_by_relative_path": {},
+    "symbols_by_symbol_id": {},
+    "chunks_by_chunk_id": {},
+    "edges_exact": {},
+    "edges_same_endpoints_and_type": {}
+  },
+  "graph_checks": {
+    "missing_edge_endpoints": [],
+    "self_loops": [],
+    "isolated_non_file_symbols": []
+  },
+  "docs_files": [
+    {
+      "relative_path": "README.md",
+      "source_kind": "code",
+      "language": "markdown"
+    },
+    {
+      "relative_path": "docs/README.md",
+      "source_kind": "documentation",
+      "language": "markdown"
+    },
+    {
+      "relative_path": "docs/api.md",
+      "source_kind": "documentation",
+      "language": "markdown"
+    },
+    {
+      "relative_path": "docs/contributing.md",
+      "source_kind": "documentation",
+      "language": "markdown"
+    },
+    {
+      "relative_path": "docs/faq.md",
+      "source_kind": "documentation",
+      "language": "markdown"
+    }
+  ],
+  "query_results": {
+    "authentication": {
+      "doc_hits_in_top_6": 3,
+      "results": [
+        {
+          "relative_path": "src/auth.py",
+          "score": 1.0,
+          "doc_hit": false,
+          "symbols": [
+            {
+              "display_name": "create_auth_service",
+              "kind": "Function",
+              "score": 1.0
+            },
+            {
+              "display_name": "__init__",
+              "kind": "Method",
+              "score": 0.634163
+            },
+            {
+              "display_name": "_generate_token",
+              "kind": "Method",
+              "score": 0.394273
+            }
+          ]
+        },
+        {
+          "relative_path": "tests/test_auth.py",
+          "score": 0.362278,
+          "doc_hit": false,
+          "symbols": [
+            {
+              "display_name": "test_authenticate_failure",
+              "kind": "Method",
+              "score": 0.362278
+            },
+            {
+              "display_name": "test_authenticate_success",
+              "kind": "Method",
+              "score": 0.256012
+            },
+            {
+              "display_name": "test_factory_function",
+              "kind": "Function",
+              "score": 0.144862
+            }
+          ]
+        },
+        {
+          "relative_path": "src/database.py",
+          "score": 0.079521,
+          "doc_hit": false,
+          "symbols": [
+            {
+              "display_name": "close_all",
+              "kind": "Method",
+              "score": 0.079521
+            },
+            {
+              "display_name": "__init__",
+              "kind": "Method",
+              "score": 0.039745
+            },
+            {
+              "display_name": "DatabasePool",
+              "kind": "Class",
+              "score": 0.032485
+            }
+          ]
+        },
+        {
+          "relative_path": "docs/faq.md",
+          "score": 0.04957,
+          "doc_hit": true,
+          "symbols": [
+            {
+              "display_name": "faq",
+              "kind": "Document",
+              "score": 0.04957
+            }
+          ]
+        },
+        {
+          "relative_path": "docs/api.md",
+          "score": 0.024785,
+          "doc_hit": true,
+          "symbols": [
+            {
+              "display_name": "api",
+              "kind": "Document",
+              "score": 0.024785
+            }
+          ]
+        },
+        {
+          "relative_path": "README.md",
+          "score": 0.023369,
+          "doc_hit": true,
+          "symbols": [
+            {
+              "display_name": "README:1",
+              "kind": "Section",
+              "score": 0.023369
+            }
+          ]
+        }
+      ]
+    },
+    "database connection pooling": {
+      "doc_hits_in_top_6": 3,
+      "results": [
+        {
+          "relative_path": "docs/faq.md",
+          "score": 1.0,
+          "doc_hit": true,
+          "symbols": [
+            {
+              "display_name": "faq",
+              "kind": "Document",
+              "score": 1.0
+            }
+          ]
+        },
+        {
+          "relative_path": "docs/README.md",
+          "score": 0.8025,
+          "doc_hit": true,
+          "symbols": [
+            {
+              "display_name": "README",
+              "kind": "Document",
+              "score": 0.8025
+            }
+          ]
+        },
+        {
+          "relative_path": "tests/test_auth.py",
+          "score": 0.791378,
+          "doc_hit": false,
+          "symbols": [
+            {
+              "display_name": "test_session_management",
+              "kind": "Method",
+              "score": 0.791378
+            },
+            {
+              "display_name": "test_init",
+              "kind": "Method",
+              "score": 0.410867
+            },
+            {
+              "display_name": "test_authenticate_success",
+              "kind": "Method",
+              "score": 0.273281
+            }
+          ]
+        },
+        {
+          "relative_path": "src/database.py",
+          "score": 0.671717,
+          "doc_hit": false,
+          "symbols": [
+            {
+              "display_name": "create_database_pool",
+              "kind": "Function",
+              "score": 0.671717
+            },
+            {
+              "display_name": "initialize",
+              "kind": "Method",
+              "score": 0.164854
+            },
+            {
+              "display_name": "DatabasePool",
+              "kind": "Class",
+              "score": 0.10678
+            }
+          ]
+        },
+        {
+          "relative_path": "src/auth.py",
+          "score": 0.274457,
+          "doc_hit": false,
+          "symbols": [
+            {
+              "display_name": "__init__",
+              "kind": "Method",
+              "score": 0.274457
+            },
+            {
+              "display_name": "validate_session",
+              "kind": "Method",
+              "score": 0.246822
+            },
+            {
+              "display_name": "_generate_token",
+              "kind": "Method",
+              "score": 0.182804
+            }
+          ]
+        },
+        {
+          "relative_path": "README.md",
+          "score": 0.131312,
+          "doc_hit": true,
+          "symbols": [
+            {
+              "display_name": "README:1",
+              "kind": "Section",
+              "score": 0.131312
+            }
+          ]
+        }
+      ]
+    },
+    "installation pip install": {
+      "doc_hits_in_top_6": 3,
+      "results": [
+        {
+          "relative_path": "docs/faq.md",
+          "score": 1.0,
+          "doc_hit": true,
+          "symbols": [
+            {
+              "display_name": "faq",
+              "kind": "Document",
+              "score": 1.0
+            }
+          ]
+        },
+        {
+          "relative_path": "docs/README.md",
+          "score": 0.8025,
+          "doc_hit": true,
+          "symbols": [
+            {
+              "display_name": "README",
+              "kind": "Document",
+              "score": 0.8025
+            }
+          ]
+        },
+        {
+          "relative_path": "src/database.py",
+          "score": 0.601118,
+          "doc_hit": false,
+          "symbols": [
+            {
+              "display_name": "initialize",
+              "kind": "Method",
+              "score": 0.601118
+            },
+            {
+              "display_name": "create_database_pool",
+              "kind": "Function",
+              "score": 0.157742
+            },
+            {
+              "display_name": "__init__",
+              "kind": "Method",
+              "score": 0.032912
+            }
+          ]
+        },
+        {
+          "relative_path": "tests/test_auth.py",
+          "score": 0.398127,
+          "doc_hit": false,
+          "symbols": [
+            {
+              "display_name": "test_factory_function",
+              "kind": "Function",
+              "score": 0.398127
+            },
+            {
+              "display_name": "test_session_management",
+              "kind": "Method",
+              "score": 0.280584
+            },
+            {
+              "display_name": "test_authenticate_failure",
+              "kind": "Method",
+              "score": 0.138013
+            }
+          ]
+        },
+        {
+          "relative_path": "src/auth.py",
+          "score": 0.163578,
+          "doc_hit": false,
+          "symbols": [
+            {
+              "display_name": "_generate_token",
+              "kind": "Method",
+              "score": 0.163578
+            },
+            {
+              "display_name": "__init__",
+              "kind": "Method",
+              "score": 0.156501
+            },
+            {
+              "display_name": "create_auth_service",
+              "kind": "Function",
+              "score": 0.151459
+            }
+          ]
+        },
+        {
+          "relative_path": "docs/api.md",
+          "score": 0.008134,
+          "doc_hit": true,
+          "symbols": [
+            {
+              "display_name": "api",
+              "kind": "Document",
+              "score": 0.008134
+            }
+          ]
+        }
+      ]
+    },
+    "pull request contributing": {
+      "doc_hits_in_top_6": 3,
+      "results": [
+        {
+          "relative_path": "docs/contributing.md",
+          "score": 1.0,
+          "doc_hit": true,
+          "symbols": [
+            {
+              "display_name": "contributing",
+              "kind": "Document",
+              "score": 1.0
+            }
+          ]
+        },
+        {
+          "relative_path": "src/auth.py",
+          "score": 0.248969,
+          "doc_hit": false,
+          "symbols": [
+            {
+              "display_name": "authenticate",
+              "kind": "Method",
+              "score": 0.248969
+            },
+            {
+              "display_name": "create_auth_service",
+              "kind": "Function",
+              "score": 0.175358
+            },
+            {
+              "display_name": "__init__",
+              "kind": "Method",
+              "score": 0.09808
+            }
+          ]
+        },
+        {
+          "relative_path": "tests/test_auth.py",
+          "score": 0.184274,
+          "doc_hit": false,
+          "symbols": [
+            {
+              "display_name": "test_factory_function",
+              "kind": "Function",
+              "score": 0.184274
+            },
+            {
+              "display_name": "TestAuthenticationService",
+              "kind": "Class",
+              "score": 0.059764
+            },
+            {
+              "display_name": "test_authenticate_failure",
+              "kind": "Method",
+              "score": 0.042449
+            }
+          ]
+        },
+        {
+          "relative_path": "src/database.py",
+          "score": 0.175701,
+          "doc_hit": false,
+          "symbols": [
+            {
+              "display_name": "DatabasePool",
+              "kind": "Class",
+              "score": 0.175701
+            },
+            {
+              "display_name": "execute_query",
+              "kind": "Method",
+              "score": 0.0924
+            },
+            {
+              "display_name": "__init__",
+              "kind": "Method",
+              "score": 0.067162
+            }
+          ]
+        },
+        {
+          "relative_path": "docs/api.md",
+          "score": 0.016316,
+          "doc_hit": true,
+          "symbols": [
+            {
+              "display_name": "api",
+              "kind": "Document",
+              "score": 0.016316
+            }
+          ]
+        },
+        {
+          "relative_path": "docs/faq.md",
+          "score": 0.012695,
+          "doc_hit": true,
+          "symbols": [
+            {
+              "display_name": "faq",
+              "kind": "Document",
+              "score": 0.012695
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "top_symbols": [
+    {
+      "display_name": "README",
+      "kind": "Document",
+      "relative_path": "docs/README.md",
+      "global_rank": 0.094174
+    },
+    {
+      "display_name": "api",
+      "kind": "Document",
+      "relative_path": "docs/api.md",
+      "global_rank": 0.09211
+    },
+    {
+      "display_name": "DatabasePool",
+      "kind": "Class",
+      "relative_path": "src/database.py",
+      "global_rank": 0.071807
+    },
+    {
+      "display_name": "AuthenticationService",
+      "kind": "Class",
+      "relative_path": "src/auth.py",
+      "global_rank": 0.061779
+    },
+    {
+      "display_name": "contributing",
+      "kind": "Document",
+      "relative_path": "docs/contributing.md",
+      "global_rank": 0.059623
+    },
+    {
+      "display_name": "TestAuthenticationService",
+      "kind": "Class",
+      "relative_path": "tests/test_auth.py",
+      "global_rank": 0.059551
+    },
+    {
+      "display_name": "faq",
+      "kind": "Document",
+      "relative_path": "docs/faq.md",
+      "global_rank": 0.040131
+    },
+    {
+      "display_name": "create_database_pool",
+      "kind": "Function",
+      "relative_path": "src/database.py",
+      "global_rank": 0.024065
+    },
+    {
+      "display_name": "create_auth_service",
+      "kind": "Function",
+      "relative_path": "src/auth.py",
+      "global_rank": 0.020955
+    },
+    {
+      "display_name": "test_factory_function",
+      "kind": "Function",
+      "relative_path": "tests/test_auth.py",
+      "global_rank": 0.019302
+    }
+  ],
+  "scored_tree": "Project tree scored by usefulness.\nShowing top 10 files by PageRank-based score.\nFile score blends symbol rank, strongest symbol, and a small structure fallback.\nDirectory score rolls up all descendants.\n`-- [100.00] test-manual-project/\n    |-- [ 43.83] docs/\n    |   |-- [ 14.12] README.md (1 syms, documentation)\n    |   |-- [ 13.85] api.md (1 syms, documentation)\n    |   |-- [  9.39] contributing.md (1 syms, documentation)\n    |   `-- [  6.48] faq.md (1 syms, documentation)\n    |-- [ 36.32] src/\n    |   |-- [ 19.11] database.py (7 syms)\n    |   `-- [ 17.21] auth.py (8 syms)\n    |-- [ 19.45] tests/\n    |   `-- [ 19.45] test_auth.py (6 syms)\n    |-- [  0.20] README.md\n    `-- [  0.20] requirements.txt"
+}
