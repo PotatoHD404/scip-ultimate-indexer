@@ -8,6 +8,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from .formatter import (
+    format_context_window,
     format_important_symbols_codegraph,
     format_search_symbols_codegraph,
 )
@@ -110,7 +111,12 @@ def build_mcp(
             return "local"
         return "auto"
 
-    def get_indexer(project: str | None, embedding_backend: str) -> UltimateIndexer:
+    def get_indexer(
+        project: str | None,
+        embedding_backend: str,
+        *,
+        auto_refresh: bool = True,
+    ) -> UltimateIndexer:
         resolved_path = _resolve_project_path(cache_dir, project)
         backend = _backend_for_request(embedding_backend)
         cache_key = (str(resolved_path), backend)
@@ -138,6 +144,11 @@ def build_mcp(
                 os.environ["ULTIMATE_INDEXER_LLAMA_N_BATCH"] = str(embedding_n_ctx)
                 os.environ["ULTIMATE_INDEXER_LLAMA_N_UBATCH"] = str(embedding_n_ctx)
             indexers[cache_key] = indexer
+        # Auto-refresh: re-index incrementally if any files changed since the
+        # last index run.  Skipped for index_project (auto_refresh=False) to
+        # avoid a redundant pre-scan before the explicit index call.
+        if auto_refresh:
+            indexer.refresh_if_stale()
         return indexer
 
     def close_indexers() -> None:
@@ -184,7 +195,7 @@ def build_mcp(
             query,
             groups,
             max_results=count,
-            max_chars=0,
+            max_tokens=0,
         )
 
     @server.tool()
@@ -193,12 +204,42 @@ def build_mcp(
         force: bool = False,
         embedding_backend: str = "auto",
     ) -> str:
-        """Index or refresh a project path for subsequent MCP queries."""
+        """Index or re-index a project so it can be queried by other tools.
+
+        Runs SCIP indexers for supported languages (Python, TypeScript, Go,
+        Rust, …), builds a symbol graph with weighted edges, embeds chunks, and
+        computes global PageRank scores.  Incremental re-indexing only
+        re-processes files whose content hash has changed.  The project is
+        registered in the server registry so subsequent calls can reference it
+        by name instead of full path.
+
+        Parameters
+        ----------
+        project_path:
+            Absolute (or ``~``-relative) path to the repository root.  Must be
+            a directory that contains source files.
+        force:
+            ``True`` — delete all cached data and re-index from scratch.
+            ``False`` (default) — skip unchanged files; fastest for routine
+            refreshes after small edits.
+        embedding_backend:
+            Which embedding provider to use.
+            ``"auto"`` — pick the best available (API > local GGUF > hash).
+            ``"local"`` — llama-cpp GGUF model from the models/ directory.
+            ``"api"`` — remote HTTP embedding endpoint configured via env vars.
+            ``"hash"`` — deterministic hash vectors; no model required
+            (degrades semantic search quality).
+
+        When to use
+        -----------
+        Call once before using any search or overview tool.  Re-call after
+        adding files or changing the embedding backend.
+        """
         resolved_path = Path(project_path).expanduser().resolve()
-        # Indexing also registers the project so follow-up MCP calls can refer to
-        # it by name instead of repeating the full absolute path every time.
         _register_project(cache_dir, resolved_path)
-        indexer = get_indexer(str(resolved_path), embedding_backend)
+        # auto_refresh=False: the explicit index() call below handles everything;
+        # running refresh_if_stale first would redundantly scan files twice.
+        indexer = get_indexer(str(resolved_path), embedding_backend, auto_refresh=False)
         summary = indexer.index(force=force)
         return (
             f"Indexed {summary.indexed_files} files, {summary.indexed_symbols} symbols, "
@@ -207,9 +248,18 @@ def build_mcp(
 
     @server.tool()
     def list_projects() -> str:
-        """List indexed projects known to this MCP server."""
-        # Keep this output comment-prefixed so code-oriented MCP clients can show
-        # it inline without treating it as source content.
+        """List all projects registered with this MCP server.
+
+        Returns a comment-prefixed list of project names and their absolute
+        paths.  A project is registered automatically the first time
+        ``index_project`` is called for it.
+
+        When to use
+        -----------
+        Use to discover which project names can be passed to the ``project``
+        parameter of other tools, or to check whether a project has been
+        indexed yet.
+        """
         projects = _load_registry(cache_dir)
         if not projects:
             return "// No projects found. Use index_project first."
@@ -227,7 +277,32 @@ def build_mcp(
         hybrid: bool = True,
         embedding_backend: str = "auto",
     ) -> str:
-        """Legacy search endpoint; equivalent to search_all."""
+        """Search both code and documentation (legacy alias for ``search_all``).
+
+        Prefer ``search_all`` for new code; this tool exists for backwards
+        compatibility.
+
+        Parameters
+        ----------
+        query:
+            Natural-language or identifier search string.
+        project:
+            Project name or absolute path.  Optional when only one project is
+            indexed.
+        count:
+            Maximum number of file groups to return (default 10).
+        kind:
+            Filter results to a single symbol kind, e.g. ``"Function"``,
+            ``"Class"``, ``"Interface"``.  Case-insensitive.  ``None`` returns
+            all kinds.
+        hybrid:
+            ``True`` (default) — blend BM25 lexical search with dense
+            embedding similarity and re-rank with Personalized PageRank.
+            ``False`` — return only the top ``count`` results without
+            re-ranking.
+        embedding_backend:
+            Embedding backend; see ``index_project`` for accepted values.
+        """
         return _render_search(
             query=query,
             project=project,
@@ -247,7 +322,37 @@ def build_mcp(
         hybrid: bool = True,
         embedding_backend: str = "auto",
     ) -> str:
-        """Search only code symbols and code files (excludes documentation sources)."""
+        """Search only code symbols and source files (excludes documentation).
+
+        Runs BM25 + dense embedding search over function metadata, function
+        bodies, and generic symbol chunks, then re-ranks with Personalized
+        PageRank seeded by the top query matches.  Results are grouped by file.
+
+        Parameters
+        ----------
+        query:
+            Natural-language or identifier search string.
+        project:
+            Project name or absolute path.  Optional when only one project is
+            indexed.
+        count:
+            Maximum number of file groups to return (default 10).
+        kind:
+            Restrict to one symbol kind: ``"Function"``, ``"Class"``,
+            ``"Struct"``, ``"Interface"``, ``"Method"``, ``"Enum"``, etc.
+            Case-insensitive.  ``None`` returns all code kinds.
+        hybrid:
+            ``True`` (default) — full hybrid BM25 + dense + PPR pipeline.
+            ``False`` — top-``count`` results without PPR re-ranking.
+        embedding_backend:
+            Embedding backend; see ``index_project`` for accepted values.
+
+        When to use
+        -----------
+        Use when the query is about source code behaviour, APIs, or
+        implementation details and you do not need documentation results.
+        Use ``search_all`` when you want both code and docs combined.
+        """
         return _render_search(
             query=query,
             project=project,
@@ -267,7 +372,34 @@ def build_mcp(
         hybrid: bool = True,
         embedding_backend: str = "auto",
     ) -> str:
-        """Search only documentation sources (markdown/OpenAPI/doc symbols)."""
+        """Search only documentation sources (Markdown, OpenAPI specs).
+
+        Restricts retrieval to symbols whose ``source_kind`` is
+        ``"documentation"`` or whose kind is ``"Document"`` / ``"Section"``.
+
+        Parameters
+        ----------
+        query:
+            Natural-language search string describing the documentation topic.
+        project:
+            Project name or absolute path.  Optional when only one project is
+            indexed.
+        count:
+            Maximum number of file groups to return (default 10).
+        kind:
+            Filter to a doc kind such as ``"Document"`` or ``"Section"``.
+            Usually left as ``None``.
+        hybrid:
+            ``True`` (default) — BM25 + dense + PPR pipeline.
+            ``False`` — pure ranking without PPR.
+        embedding_backend:
+            Embedding backend; see ``index_project`` for accepted values.
+
+        When to use
+        -----------
+        Use when looking for explanations, guides, or API specs rather than
+        source code.  Use ``search_all`` to get both code and docs together.
+        """
         return _render_search(
             query=query,
             project=project,
@@ -287,7 +419,36 @@ def build_mcp(
         hybrid: bool = True,
         embedding_backend: str = "auto",
     ) -> str:
-        """Search code and documentation separately, then combine ranked results."""
+        """Search code and documentation, then merge results with RRF ranking.
+
+        Runs separate code and docs searches (each with BM25 + dense + PPR),
+        then merges the two ranked lists using Reciprocal Rank Fusion (k=60)
+        so the most relevant results from either source surface first.
+
+        Parameters
+        ----------
+        query:
+            Natural-language or identifier search string.
+        project:
+            Project name or absolute path.  Optional when only one project is
+            indexed.
+        count:
+            Maximum number of file groups in the merged result (default 10).
+            Each sub-search retrieves up to ``count * 2`` candidates before
+            merging.
+        kind:
+            Optionally restrict to one symbol kind.  Applied after merging.
+        hybrid:
+            ``True`` (default) — full pipeline.
+            ``False`` — skip PPR re-ranking.
+        embedding_backend:
+            Embedding backend; see ``index_project`` for accepted values.
+
+        When to use
+        -----------
+        Default search tool.  Use when you are unsure whether the answer lives
+        in code or documentation, or when both are relevant.
+        """
         return _render_search(
             query=query,
             project=project,
@@ -305,15 +466,41 @@ def build_mcp(
         kind: str | None = None,
         embedding_backend: str = "auto",
     ) -> str:
-        """Return globally important symbols from graph ranks."""
+        """Return the top symbols by global graph PageRank importance.
+
+        Uses pre-computed global PageRank scores (with kind boosts applied)
+        rather than a query-driven search.  Results reflect the architectural
+        centrality of each symbol in the codebase — heavily called or
+        implemented symbols rank higher.
+
+        Parameters
+        ----------
+        project:
+            Project name or absolute path.  Optional when only one project is
+            indexed.
+        count:
+            Number of symbols to return (default 20).  All returned symbols
+            have ``global_rank > 0``.
+        kind:
+            Restrict to a single kind, e.g. ``"Interface"``, ``"Struct"``,
+            ``"Function"``.  Case-insensitive.  ``None`` returns all kinds.
+        embedding_backend:
+            Embedding backend; see ``index_project`` for accepted values.
+
+        When to use
+        -----------
+        Use to understand the most architecturally significant parts of the
+        codebase without a specific search query.  Useful for orientation,
+        code review, or determining where to focus a refactoring effort.
+        For a richer token-budget-aware view use ``get_context`` instead.
+        """
         indexer = get_indexer(project, embedding_backend)
-        # This is the global graph view rather than query-relative retrieval.
         rows = indexer.important_symbols(limit=count, kind_filter=kind)
         return format_important_symbols_codegraph(
             indexer.storage,
             indexer.project_id,
             rows,
-            max_chars=0,
+            max_tokens=0,
         )
 
     @server.tool()
@@ -322,9 +509,31 @@ def build_mcp(
         max_per_kind: int = 15,
         embedding_backend: str = "auto",
     ) -> str:
-        """Return a quick, categorized overview of key project symbols."""
+        """Return a categorized overview of the most important project symbols.
+
+        Groups symbols into four buckets — Interfaces, Structs/Classes,
+        Functions/Methods, Constants — and lists up to ``max_per_kind`` entries
+        from each bucket ordered by global PageRank.
+
+        Parameters
+        ----------
+        project:
+            Project name or absolute path.  Optional when only one project is
+            indexed.
+        max_per_kind:
+            Maximum symbols per category (default 15).  Increase for larger
+            codebases; decrease for tighter output.
+        embedding_backend:
+            Embedding backend; see ``index_project`` for accepted values.
+
+        When to use
+        -----------
+        Use for a quick orientation at the start of a session.  Gives a
+        categorized table-of-contents without requiring a query.  For a
+        token-budget-aware snapshot prefer ``get_context``; for a ranked flat
+        list prefer ``get_important_symbols``.
+        """
         indexer = get_indexer(project, embedding_backend)
-        # Return a compact, category-based summary for quick orientation.
         return indexer.project_overview(max_per_kind=max_per_kind)
 
     @server.tool()
@@ -332,35 +541,100 @@ def build_mcp(
         project: str | None = None,
         embedding_backend: str = "auto",
     ) -> str:
-        """Return counts and high-level stats for indexed project data."""
+        """Return counts and high-level statistics for an indexed project.
+
+        Includes total files, symbols, edges, embedded chunks, symbol kind
+        breakdown, and top folders by file count.
+
+        Parameters
+        ----------
+        project:
+            Project name or absolute path.  Optional when only one project is
+            indexed.
+        embedding_backend:
+            Embedding backend; see ``index_project`` for accepted values.
+
+        When to use
+        -----------
+        Use to verify that a project has been indexed correctly, check coverage
+        after adding new files, or diagnose unexpected search behaviour.
+        """
         indexer = get_indexer(project, embedding_backend)
-        # Stats stay text-based so clients can show them without extra parsing.
         return indexer.project_stats()
 
     @server.tool()
     def scored_project_tree(
         project: str | None = None,
         embedding_backend: str = "auto",
-        max_chars: int = 12_000,
+        max_tokens: int = 3_000,
         top_k: int | None = None,
     ) -> str:
-        """Render project tree ordered by usefulness score."""
+        """Render a project file tree scored by symbol usefulness.
+
+        Each file receives a score that blends the sum and maximum of its
+        symbols' global PageRank values plus small bonuses for symbol count and
+        chunk count.  Directory scores roll up all descendant files.  The tree
+        is sorted so the most useful directories/files appear at the top.
+
+        Parameters
+        ----------
+        project:
+            Project name or absolute path.  Optional when only one project is
+            indexed.
+        embedding_backend:
+            Embedding backend; see ``index_project`` for accepted values.
+        max_tokens:
+            Maximum output size in tokens as counted by ``count_tokens``
+            (default 3 000).  Lines are removed from the end until the output
+            fits; a ``// ... truncated`` note is appended when trimmed.
+            Pass 0 for unlimited output.
+        top_k:
+            When set, show only the top *k* files by score rather than the full
+            tree.  Useful for focusing on the most important entry points.
+
+        When to use
+        -----------
+        Use to understand which files are the structural core of a project
+        before diving into code.  Differs from ``sorted_project_tree`` only in
+        the header text; both use the same ranking algorithm.
+        """
         indexer = get_indexer(project, embedding_backend)
-        # The scored tree keeps the original usefulness-focused header and view.
-        return indexer.scored_tree(max_chars=max_chars, top_k=top_k)
+        return indexer.scored_tree(max_tokens=max_tokens, top_k=top_k)
 
     @server.tool()
     def sorted_project_tree(
         project: str | None = None,
         embedding_backend: str = "auto",
-        max_chars: int = 12_000,
+        max_tokens: int = 3_000,
         top_k: int | None = None,
     ) -> str:
-        """Render project tree sorted by folder accumulation and file value."""
+        """Render a project file tree sorted by accumulated descendant score.
+
+        Identical algorithm to ``scored_project_tree`` — directories are sorted
+        by accumulated descendant PageRank, files by their direct score — but
+        this variant's header makes the sorting criterion explicit (accumulated
+        value vs. direct value) which helps when explaining the tree to users.
+
+        Parameters
+        ----------
+        project:
+            Project name or absolute path.  Optional when only one project is
+            indexed.
+        embedding_backend:
+            Embedding backend; see ``index_project`` for accepted values.
+        max_tokens:
+            Maximum output size in tokens (default 3 000).  Pass 0 for
+            unlimited.
+        top_k:
+            Limit to the top *k* highest-scoring files.
+
+        When to use
+        -----------
+        Prefer over ``scored_project_tree`` when you want to explain to a user
+        why specific directories or files rank highly.
+        """
         indexer = get_indexer(project, embedding_backend)
-        # This variant makes the tree ordering explicit: folders by accumulated
-        # descendant value, files by their direct score contribution.
-        return indexer.sorted_tree(max_chars=max_chars, top_k=top_k)
+        return indexer.sorted_tree(max_tokens=max_tokens, top_k=top_k)
 
     @server.tool()
     def visualize_project(
@@ -369,12 +643,91 @@ def build_mcp(
         limit: int = 10,
         embedding_backend: str = "auto",
     ) -> str:
-        """Generate an HTML graph visualization for query results."""
+        """Generate an interactive HTML graph for query results and return its path.
+
+        Runs ``search_all`` for the given query, then renders the top-``limit``
+        file groups as a force-directed node-link diagram (D3.js) written to
+        the project's ``.ultimate_indexer/visuals/`` directory.
+
+        Parameters
+        ----------
+        query:
+            Search query whose results become the graph nodes.
+        project:
+            Project name or absolute path.  Optional when only one project is
+            indexed.
+        limit:
+            Number of file groups (and their symbols/edges) to include in the
+            graph (default 10).  Higher values produce denser graphs.
+        embedding_backend:
+            Embedding backend; see ``index_project`` for accepted values.
+
+        When to use
+        -----------
+        Use when you want to visually explore how the symbols matching a query
+        relate to each other through the call/type/import graph.  The returned
+        file path can be opened in a browser.
+        """
         indexer = get_indexer(project, embedding_backend)
-        # Visualization reuses the same grouped query results as search_symbols.
         groups = indexer.query(query, limit=limit, scope="all")
         path = indexer.visualize(groups, title=f"Results for: {query}")
         return str(path)
+
+    @server.tool()
+    def get_context(
+        project: str | None = None,
+        symbol_tokens: int = 8192,
+        doc_tokens: int = 2048,
+        embedding_backend: str = "auto",
+    ) -> str:
+        """Return a compact code context window packed to a Qwen-token budget.
+
+        Produces two sections assembled by greedy packing — never plain
+        truncation — so the output fits as many meaningful symbols and docs as
+        possible within the token budget:
+
+        **Symbols section** (up to *symbol_tokens* Qwen tokens)
+        Functions, methods, interfaces, structs, classes, traits, enums, type
+        aliases, constants, and properties ordered by graph PageRank.  Each
+        entry is one signature line preceded by a location comment::
+
+            // QualifiedName  (Kind)  path:line
+            func DoSomething(x int) error
+
+        **Docs section** (up to *doc_tokens* Qwen tokens)
+        Top-ranked documentation symbols (markdown files, OpenAPI specs) with
+        a one-line summary.
+
+        Parameters
+        ----------
+        project:
+            Project name or absolute path.  Optional when only one project is
+            indexed.  Use ``list_projects`` to see available names.
+        symbol_tokens:
+            Maximum token budget for the symbols section (default 8 192).
+            Counted via tiktoken cl100k_base (Qwen2-compatible BPE) when
+            tiktoken is installed, otherwise approximated at 3.5 chars/token.
+        doc_tokens:
+            Maximum Qwen-token budget for the documentation section (default
+            2 048).  Set to 0 to omit docs entirely.
+        embedding_backend:
+            Embedding backend for the indexer instance.  ``"auto"`` selects
+            the best available backend (API > local GGUF > hash fallback).
+
+        When to use
+        -----------
+        Use ``get_context`` when you need a broad structural overview of the
+        whole project — for example at the start of a coding session — and want
+        a single, token-efficient snapshot rather than a query-driven result.
+        For targeted searches prefer ``search_code`` or ``search_all``.
+        """
+        indexer = get_indexer(project, embedding_backend)
+        return format_context_window(
+            indexer.storage,
+            indexer.project_id,
+            symbol_tokens=symbol_tokens,
+            doc_tokens=doc_tokens,
+        )
 
     return server
 

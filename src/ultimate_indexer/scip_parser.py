@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 import re
@@ -195,6 +196,76 @@ def _best_enclosing_definition(
     return None if best_choice is None else best_choice[2]
 
 
+_MIN_EXTERNAL_REFS = 2  # minimum distinct-file references to include an external stub
+
+
+def _infer_external_kind(scip_symbol: str) -> str:
+    """Infer a SymbolInformation.Kind name from the SCIP sigil of the last descriptor."""
+    parts = scip_symbol.rstrip().split()
+    if not parts:
+        return "Unknown"
+    last = parts[-1]
+    # Member of a named type  (e.g. `Handler#Write().` or `Handler#field.`)
+    if "#" in last:
+        tail = last.rsplit("#", 1)[1]
+        if "(" in tail:
+            return "Method"
+        if tail and tail != ".":
+            return "Field"
+        # Bare `TypeName#` — type descriptor with no member suffix
+        return "Interface"
+    if "(" in last:
+        return "Function"
+    if last.endswith("#"):
+        return "Interface"
+    if last.endswith("."):
+        return "Variable"
+    if last.endswith("/"):
+        return "Module"
+    return "Struct"
+
+
+def _parse_external_package(scip_symbol: str) -> str:
+    """Return a package path suitable for use as a relative_path prefix.
+
+    SCIP format: ``<scheme> <pkg_mgr> <module> <version> <...descriptors>``
+
+    Namespace descriptors (ending with ``/``) appear between the version token
+    and the final type/member descriptor.  Their joined path is the canonical
+    package import path.
+    """
+    parts = scip_symbol.strip().split()
+    if len(parts) < 5:
+        return "external"
+    descriptors = parts[4:]
+    # Namespace descriptors end with '/'; they precede the type/member descriptor.
+    pkg_parts = [p.rstrip("/") for p in descriptors[:-1] if p.endswith("/")]
+    if pkg_parts:
+        return "/".join(pkg_parts)
+    # Fallback: use all middle descriptors (non-final) as a path
+    middle = [p.rstrip("/#.") for p in descriptors[:-1] if p.rstrip("/#.")]
+    if middle:
+        return "/".join(middle)
+    # Last resort: module path
+    return parts[2] if len(parts) > 2 else "external"
+
+
+def _parse_external_display_name(scip_symbol: str) -> str:
+    """Extract a short human-readable name from the last descriptor of a SCIP symbol."""
+    parts = scip_symbol.strip().split()
+    if not parts:
+        return "unknown"
+    last = parts[-1]
+    # Strip sigils and method parens
+    name = last.rstrip("#/.")
+    if name.endswith("()"):
+        name = name[:-2]
+    # For member descriptors like `Handler#Write().`, keep the member part
+    if "#" in name:
+        name = name.rsplit("#", 1)[1] or name.rsplit("#", 1)[0]
+    return name or last
+
+
 def parse_scip_index(
     project_id: str,
     project_root: Path,
@@ -212,6 +283,74 @@ def parse_scip_index(
     edges: list[EdgeRecord] = []
     symbols_by_key: dict[str, SymbolRecord] = {}
     def_ranges: dict[str, list[tuple[tuple[int, int, int, int], str, int]]] = {}
+
+    # Pre-pass 1: collect every non-local SCIP symbol string defined anywhere in
+    # the index.  This lets relationship edges (implements, inherits, references)
+    # reference symbols from OTHER files without being silently dropped — the
+    # previous per-document declared_symbol_ids check only allowed same-file
+    # targets, breaking cross-file interface implementations.
+    all_global_scip_symbols: set[str] = {
+        info.symbol
+        for doc in index.documents
+        for info in doc.symbols
+        if not info.symbol.startswith("local ")
+    }
+
+    # Pre-pass 2: count external symbol references and identify impl/inherits targets.
+    # External symbols (not declared in this index) that are referenced often, or that
+    # are targeted by structural relationships (implements/inherits), get lightweight
+    # stub SymbolRecords so they participate in PageRank and search.
+    external_ref_files: dict[str, set[str]] = defaultdict(set)
+    external_impl_targets: set[str] = set()
+
+    for _doc in index.documents:
+        _abs = str((source_root / _doc.relative_path).resolve())
+        try:
+            _rp = Path(_abs).resolve().relative_to(project_root.resolve()).as_posix()
+        except ValueError:
+            _rp = _doc.relative_path
+
+        for _occ in _doc.occurrences:
+            _sym = _occ.symbol
+            if _sym.startswith("local ") or _sym in all_global_scip_symbols:
+                continue
+            external_ref_files[_sym].add(_rp)
+
+        for _info in _doc.symbols:
+            for _rel in _info.relationships:
+                _rs = _rel.symbol
+                if _rs.startswith("local ") or _rs in all_global_scip_symbols:
+                    continue
+                if bool(_rel.is_implementation) or bool(_rel.is_type_definition):
+                    external_impl_targets.add(_rs)
+
+    # Create stubs for qualifying external symbols (frequently referenced OR structural).
+    qualifying_externals: set[str] = (
+        {sym for sym, files in external_ref_files.items() if len(files) >= _MIN_EXTERNAL_REFS}
+        | external_impl_targets
+    )
+    for _ext_sym in qualifying_externals:
+        _pkg = _parse_external_package(_ext_sym)
+        _rel_path = f"_external/{_pkg}"
+        _kind = _infer_external_kind(_ext_sym)
+        _dname = _parse_external_display_name(_ext_sym)
+        _stub = SymbolRecord(
+            project_id=project_id,
+            symbol_id=_ext_sym,
+            scip_symbol=_ext_sym,
+            display_name=_dname,
+            kind=_kind,
+            relative_path=_rel_path,
+            start_line=0,
+            end_line=0,
+            signature=_dname,
+            docstring="",
+            snippet="",
+            enclosing_symbol_id="",
+            source_kind="external",
+        )
+        symbols.append(_stub)
+        symbols_by_key[_ext_sym] = _stub
 
     for document in index.documents:
         document_relative_path = document.relative_path
@@ -258,16 +397,20 @@ def parse_scip_index(
 
         defs: list[tuple[tuple[int, int, int, int], str, int]] = []
         occurrences = list(document.occurrences)
-        for occurrence in occurrences:
-            role = getattr(occurrence, "symbol_roles", getattr(occurrence, "role", 0))
+        # Pre-build O(1) lookup: normalized_symbol_id → its definition occurrence.
+        # Without this, the per-symbol search below would be O(symbols × occurrences).
+        def_occurrence_map: dict[str, object] = {}
+        for occ in occurrences:
+            role = getattr(occ, "symbol_roles", getattr(occ, "role", 0))
             if role & scip_pb2.Definition:
-                full_range = tuple(occurrence.enclosing_range or occurrence.range or [0, 0, 0, 0])
-                normalized_definition_id = _normalize_symbol_id(relative_path, occurrence.symbol)
+                nid = _normalize_symbol_id(relative_path, occ.symbol)
+                def_occurrence_map[nid] = occ
+                full_range = tuple(occ.enclosing_range or occ.range or [0, 0, 0, 0])
                 priority = _definition_priority(
-                    normalized_definition_id,
-                    declared_symbol_kinds.get(normalized_definition_id, "Unknown"),
+                    nid,
+                    declared_symbol_kinds.get(nid, "Unknown"),
                 )
-                defs.append((full_range, normalized_definition_id, priority))
+                defs.append((full_range, nid, priority))
         def_ranges[relative_path] = defs
 
         for info in document.symbols:
@@ -276,15 +419,7 @@ def parse_scip_index(
             normalized_symbol_id = _normalize_symbol_id(relative_path, info.symbol)
             if normalized_symbol_id in symbols_by_key:
                 continue
-            occurrence = next(
-                (
-                    occ
-                    for occ in occurrences
-                    if _normalize_symbol_id(relative_path, occ.symbol) == normalized_symbol_id
-                    and (getattr(occ, "symbol_roles", 0) & scip_pb2.Definition)
-                ),
-                None,
-            )
+            occurrence = def_occurrence_map.get(normalized_symbol_id)
             start_line, end_line = _range_to_lines(list(occurrence.enclosing_range or occurrence.range if occurrence else []))
             signature = info.signature_documentation.text or info.display_name or info.symbol
             docstring = "\n".join(part for part in info.documentation if part)
@@ -348,9 +483,17 @@ def parse_scip_index(
                 )
             )
             for relationship in info.relationships:
-                related_symbol = _normalize_symbol_id(relative_path, relationship.symbol)
-                if related_symbol not in declared_symbol_ids:
-                    continue
+                related_raw = relationship.symbol
+                related_symbol = _normalize_symbol_id(relative_path, related_raw)
+                # Local symbols are file-scoped; check against same-file declarations.
+                # Global symbols may live in any file; check against the full index or
+                # the external stubs we just created.
+                if related_symbol.startswith("local::"):
+                    if related_symbol not in declared_symbol_ids:
+                        continue
+                else:
+                    if related_raw not in all_global_scip_symbols and related_raw not in symbols_by_key:
+                        continue
                 if bool(relationship.is_implementation):
                     relation_type = "implements"
                 elif bool(relationship.is_type_definition):

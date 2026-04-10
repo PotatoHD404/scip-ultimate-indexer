@@ -265,99 +265,48 @@ class APIEmbeddingProvider:
     def prepare_query_text(self, text: str) -> str:
         return text
     
-    def _split_text_for_api(self, text: str) -> list[str]:
-        """Split a long text into chunks that fit within the API token limit.
-        
-        This method splits text intelligently:
-        1. First tries to split at paragraph boundaries (double newlines)
-        2. Falls back to sentence boundaries if paragraphs are too long
-        3. Falls back to character-based splitting as last resort
-        
-        Each chunk includes attribution metadata to maintain graph context.
-        
-        Args:
-            text: The text to split
-            
-        Returns:
-            List of text chunks, each within the token limit
+    def _find_split_point(self, text: str) -> int:
+        """Return the best character position to split *text* at, or 0 if none found.
+
+        Tries split boundaries in preference order:
+        1. Paragraph (double newline)
+        2. Sentence end (.!?)
+        3. Line boundary
+        4. Word boundary
+
+        Only accepts a split that leaves at least 30 % of the text on the left
+        side so chunks stay reasonably large.
         """
-        max_chars = self.max_tokens * CHARS_PER_TOKEN
-        
-        # If text fits within limit, return as-is
+        threshold = len(text) * 0.3
+        for pattern in (r'\n\s*\n', r'(?<=[.!?])\s+', r'\n', r'\s'):
+            for match in reversed(list(re.finditer(pattern, text))):
+                if match.start() > threshold:
+                    return match.end()
+        return 0
+
+    def _split_text(self, text: str, max_tokens: int) -> list[str]:
+        """Split *text* into chunks that each fit within *max_tokens*.
+
+        Uses boundary-aware splitting (paragraph → sentence → line → word) to
+        avoid cutting in the middle of a logical unit.  Returns ``[text]`` when
+        the input already fits.
+        """
+        max_chars = max_tokens * CHARS_PER_TOKEN
         if len(text) <= max_chars:
             return [text]
-        
         chunks: list[str] = []
         remaining = text
-        
         while len(remaining) > max_chars:
-            # Try to split at paragraph boundary
-            split_point = self._find_split_point(remaining[:max_chars], remaining[max_chars:])
-            
+            split_point = self._find_split_point(remaining[:max_chars])
             if split_point > 0:
-                chunk = remaining[:split_point].strip()
-                remaining = remaining[split_point:].lstrip()
+                chunk, remaining = remaining[:split_point].strip(), remaining[split_point:].lstrip()
             else:
-                # No good split point found, force split at max_chars
-                chunk = remaining[:max_chars].strip()
-                remaining = remaining[max_chars:].lstrip()
-            
+                chunk, remaining = remaining[:max_chars].strip(), remaining[max_chars:].lstrip()
             if chunk:
                 chunks.append(chunk)
-        
-        # Add any remaining text
         if remaining.strip():
             chunks.append(remaining.strip())
-        
         return chunks
-    
-    def _find_split_point(self, text: str, remainder: str) -> int:
-        """Find the best split point in the text.
-        
-        Searches for split points in order of preference:
-        1. Paragraph boundaries (double newlines)
-        2. Sentence boundaries (. ! ?)
-        3. Line boundaries
-        4. Word boundaries
-        
-        Args:
-            text: The text to find a split point in
-            remainder: The text after the split point
-            
-        Returns:
-            Character position for the split, or 0 if no good split found
-        """
-        # Try paragraph boundaries first
-        paragraph_matches = list(re.finditer(r'\n\s*\n', text))
-        if paragraph_matches:
-            # Use the last paragraph break that leaves some content
-            for match in reversed(paragraph_matches):
-                if match.start() > len(text) * 0.3:  # At least 30% of max
-                    return match.end()
-        
-        # Try sentence boundaries
-        sentence_pattern = r'(?<=[.!?])\s+'
-        sentence_matches = list(re.finditer(sentence_pattern, text))
-        if sentence_matches:
-            for match in reversed(sentence_matches):
-                if match.start() > len(text) * 0.3:
-                    return match.end()
-        
-        # Try line boundaries
-        line_matches = list(re.finditer(r'\n', text))
-        if line_matches:
-            for match in reversed(line_matches):
-                if match.start() > len(text) * 0.3:
-                    return match.end()
-        
-        # Try word boundaries
-        word_matches = list(re.finditer(r'\s', text))
-        if word_matches:
-            for match in reversed(word_matches):
-                if match.start() > len(text) * 0.3:
-                    return match.end()
-        
-        return 0
     
     def _aggregate_embeddings(self, embeddings: list[np.ndarray]) -> np.ndarray:
         """Aggregate multiple embeddings into a single vector.
@@ -458,117 +407,65 @@ class APIEmbeddingProvider:
             raise RuntimeError(f"Failed to parse API response: {e}") from e
     
     def _handle_context_length_error(self, texts: list[str], error_body: str) -> list[list[float]]:
-        """Handle context length errors by splitting texts into smaller chunks.
-        
-        This method is called when the API returns a 400 error indicating the
-        input is too long. It splits the texts into smaller pieces and processes
-        them individually.
-        
-        Args:
-            texts: List of texts that caused the error
-            error_body: The error response body from the API
-            
-        Returns:
-            List of embeddings for all texts
+        """Re-embed *texts* after a 400 context-length error by splitting each one.
+
+        Extracts the actual limit from the error body when available (uses 80 %
+        of it to stay safe), otherwise falls back to 1 024 tokens.
         """
-        # Try to extract the actual token limit from the error message
         match = re.search(r"maximum context length is (\d+) tokens", error_body)
-        if match:
-            api_max_tokens = int(match.group(1))
-            # Use 80% of the reported limit to be safe
-            effective_max_tokens = int(api_max_tokens * 0.8)
-        else:
-            # Fall back to a very conservative default
-            effective_max_tokens = 1024
-        
+        effective_max_tokens = int(int(match.group(1)) * 0.8) if match else 1024
+
         all_embeddings: list[list[float]] = []
-        
         for text in texts:
-            # Split text into smaller chunks based on the effective limit
-            text_chunks = self._split_text_for_api_with_tokens(text, effective_max_tokens)
-            
+            text_chunks = self._split_text(text, effective_max_tokens)
             if len(text_chunks) == 1:
-                # Process single chunk normally
-                chunk_embeddings = self._call_api([text_chunks[0]])
-                all_embeddings.extend(chunk_embeddings)
+                all_embeddings.extend(self._call_api(text_chunks))
             else:
-                # Process each chunk and aggregate embeddings
-                chunk_embeddings_list = []
-                for chunk in text_chunks:
-                    chunk_emb = self._call_api([chunk])
-                    chunk_embeddings_list.append(np.asarray(chunk_emb[0], dtype=np.float32))
-                
-                # Aggregate embeddings using mean pooling
-                if chunk_embeddings_list:
-                    aggregated = self._aggregate_embeddings(chunk_embeddings_list)
-                    all_embeddings.append(aggregated.tolist())
-        
+                chunk_vecs = [
+                    np.asarray(self._call_api([chunk])[0], dtype=np.float32)
+                    for chunk in text_chunks
+                ]
+                all_embeddings.append(self._aggregate_embeddings(chunk_vecs).tolist())
         return all_embeddings
-    
-    def _split_text_for_api_with_tokens(self, text: str, max_tokens: int) -> list[str]:
-        """Split text into chunks that fit within a token limit.
-        
-        Similar to _split_text_for_api but uses a specific token limit.
-        
-        Args:
-            text: The text to split
-            max_tokens: Maximum tokens per chunk
-            
-        Returns:
-            List of text chunks
-        """
-        max_chars = max_tokens * CHARS_PER_TOKEN
-        
-        # If text fits within limit, return as-is
-        if len(text) <= max_chars:
-            return [text]
-        
-        chunks: list[str] = []
-        remaining = text
-        
-        while len(remaining) > max_chars:
-            # Try to split at paragraph boundary
-            split_point = self._find_split_point(remaining[:max_chars], remaining[max_chars:])
-            
-            if split_point > 0:
-                chunk = remaining[:split_point].strip()
-                remaining = remaining[split_point:].lstrip()
-            else:
-                # No good split point found, force split at max_chars
-                chunk = remaining[:max_chars].strip()
-                remaining = remaining[max_chars:].lstrip()
-            
-            if chunk:
-                chunks.append(chunk)
-        
-        # Add any remaining text
-        if remaining.strip():
-            chunks.append(remaining.strip())
-        
-        return chunks
-    
+
     def embed(self, texts: Sequence[str]) -> list[np.ndarray]:
+        """Embed a sequence of texts, batching those that need no splitting.
+
+        Texts that fit within the API token limit are collected and sent as a
+        single batched request.  Texts that exceed the limit are split, embedded
+        chunk-by-chunk, and mean-pooled back to one vector.  This avoids N
+        separate single-item API calls for the common case.
+        """
         texts_list = list(texts)
         if not texts_list:
             return []
-        
-        all_embeddings: list[np.ndarray] = []
-        
-        for text in texts_list:
-            # Split long texts into chunks that fit within API token limits
-            text_chunks = self._split_text_for_api(text)
-            
-            if len(text_chunks) == 1:
-                # Text fits within limit, process normally
-                chunk_embeddings = self._embed_with_batching(text_chunks)
-                all_embeddings.extend(chunk_embeddings)
+
+        # Classify each input: fits in one chunk vs. needs splitting.
+        single_indices: list[int] = []
+        single_texts: list[str] = []
+        multi_chunks: dict[int, list[str]] = {}
+        for i, text in enumerate(texts_list):
+            chunks = self._split_text(text, self.max_tokens)
+            if len(chunks) == 1:
+                single_indices.append(i)
+                single_texts.append(chunks[0])
             else:
-                # Text was split, aggregate embeddings from all chunks
-                chunk_embeddings = self._embed_with_batching(text_chunks)
-                aggregated = self._aggregate_embeddings(chunk_embeddings)
-                all_embeddings.append(aggregated)
-        
-        return all_embeddings
+                multi_chunks[i] = chunks
+
+        results: list[np.ndarray | None] = [None] * len(texts_list)
+
+        # Batch-embed all single-chunk texts in one API call sequence.
+        if single_texts:
+            batch_embeddings = self._embed_with_batching(single_texts)
+            for idx, emb in zip(single_indices, batch_embeddings):
+                results[idx] = emb
+
+        # Split texts: embed each chunk set and aggregate.
+        for i, chunks in multi_chunks.items():
+            chunk_embs = self._embed_with_batching(chunks)
+            results[i] = self._aggregate_embeddings(chunk_embs)
+
+        return [e for e in results if e is not None]
     
     def _embed_with_batching(self, texts: list[str]) -> list[np.ndarray]:
         """Embed a list of texts with API batching support.

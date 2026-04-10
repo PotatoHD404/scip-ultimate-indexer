@@ -139,6 +139,52 @@ def dependency_ordered_pagerank(
     if not rankable_ids:
         return {}
 
+    # ------------------------------------------------------------------
+    # Edge promotion: when a non-rankable node (Variable, Field, Parameter,
+    # Unknown …) appears in an edge, walk its enclosing_symbol_id chain
+    # until we reach a rankable ancestor.  This means type references
+    # through parameters and struct fields contribute to the rank of
+    # their containing function/struct rather than being silently dropped.
+    # ------------------------------------------------------------------
+    _ancestor_cache: dict[str, str | None] = {}
+
+    def _resolve_ancestor(sid: str) -> str | None:
+        """Return the nearest rankable ancestor of *sid* (or *sid* itself)."""
+        if sid in _ancestor_cache:
+            return _ancestor_cache[sid]
+        if sid in rankable_ids:
+            _ancestor_cache[sid] = sid
+            return sid
+        # Walk the enclosing chain — guard against cycles.
+        current = sid
+        chain: list[str] = []
+        while current not in rankable_ids:
+            if current in _ancestor_cache:
+                resolved = _ancestor_cache[current]
+                # Back-fill the entire chain so future lookups are O(1).
+                for chained in chain:
+                    _ancestor_cache[chained] = resolved
+                _ancestor_cache[sid] = resolved
+                return resolved
+            chain.append(current)
+            row = symbol_rows.get(current)
+            if row is None:
+                for chained in chain:
+                    _ancestor_cache[chained] = None
+                _ancestor_cache[sid] = None
+                return None
+            parent = str(row["enclosing_symbol_id"] or "")
+            if not parent or parent == current:
+                for chained in chain:
+                    _ancestor_cache[chained] = None
+                _ancestor_cache[sid] = None
+                return None
+            current = parent
+        for chained in chain:
+            _ancestor_cache[chained] = current
+        _ancestor_cache[sid] = current
+        return current
+
     reoriented_edges: list[tuple[str, str, float]] = []
 
     def _add_weight(source: str, target: str, weight: float) -> None:
@@ -147,32 +193,60 @@ def dependency_ordered_pagerank(
         reoriented_edges.append((source, target, weight))
 
     for edge in edge_rows:
-        source = str(edge["source_symbol_id"])
-        target = str(edge["target_symbol_id"])
-        if source not in rankable_ids or target not in rankable_ids:
+        raw_source = str(edge["source_symbol_id"])
+        raw_target = str(edge["target_symbol_id"])
+
+        source = _resolve_ancestor(raw_source)
+        target = _resolve_ancestor(raw_target)
+
+        # Drop if either end has no rankable ancestor, or promotion
+        # collapsed both ends to the same node (self-loop adds no information).
+        if source is None or target is None or source == target:
             continue
+
         edge_type = str(edge["edge_type"])
         base_weight = float(edge["weight"])
         if base_weight <= 0:
             continue
+
+        # Apply a mild discount when either endpoint was promoted so that
+        # indirect relationships count slightly less than direct ones.
+        was_promoted = raw_source != source or raw_target != target
+        promotion_factor = 0.75 if was_promoted else 1.0
+
         if edge_type in DEPENDENCY_EDGE_TYPES:
-            _add_weight(target, source, base_weight)
-            _add_weight(source, target, base_weight * 0.10)
+            w = base_weight * promotion_factor
+            # Rank flows caller → callee (callee is "depended on").
+            # Tiny backflow (2 %) keeps graph connected but does not let callers
+            # accumulate meaningful rank from what they use — only being called
+            # by many things matters for rank.
+            _add_weight(source, target, w)
+            _add_weight(target, source, w * 0.02)
             continue
         if edge_type in COMPOSITIONAL_EDGE_TYPES:
             source_kind = _symbol_kind(rankable_rows[source])
             target_kind = _symbol_kind(rankable_rows[target])
+            # For `Container --contains--> Member` edges, asymmetric weights:
+            # members' usage reflects on their owning type (strong member→container),
+            # while the container distributes only a tiny signal downward so that
+            # large containers (e.g. test suites with 60+ methods) don't inflate
+            # their own rank purely by containing many low-rank items.
             if source_kind in TYPE_CONTAINER_KINDS and target_kind in TYPE_MEMBER_KINDS:
-                factor = 0.85
+                container_w = base_weight * 0.85 * promotion_factor
+                _add_weight(target, source, container_w)        # member → container (strong)
+                _add_weight(source, target, container_w * 0.05) # container → member (very weak)
             elif target_kind in TYPE_CONTAINER_KINDS and source_kind in TYPE_MEMBER_KINDS:
-                factor = 0.85
+                container_w = base_weight * 0.85 * promotion_factor
+                _add_weight(source, target, container_w)        # member → container (strong)
+                _add_weight(target, source, container_w * 0.05) # container → member (very weak)
             else:
-                factor = 0.20
-            _add_weight(source, target, base_weight * factor)
-            _add_weight(target, source, base_weight * factor)
+                w = base_weight * 0.20 * promotion_factor
+                _add_weight(source, target, w)
+                _add_weight(target, source, w)
             continue
-        _add_weight(target, source, base_weight * 0.5)
-        _add_weight(source, target, base_weight * 0.10)
+        w = base_weight * promotion_factor
+        _add_weight(source, target, w * 0.5)
+        _add_weight(target, source, w * 0.02)
 
     filtered_personalization = None
     if personalization:
@@ -625,20 +699,34 @@ class QueryEngine:
                 continue
             all_symbol_scores[canonical_symbol_id]["chunk_dense"] = hit.score
 
+        def _blend(a: float, b: float) -> float:
+            # Keep the stronger signal dominant (65 %) while still capturing
+            # the complementary weaker signal (35 %).  Using plain max() would
+            # discard the second source entirely.
+            hi, lo = (a, b) if a >= b else (b, a)
+            return hi * 0.65 + lo * 0.35
+
         def _compute_symbol_score(symbol_id: str) -> float:
             scores = all_symbol_scores.get(symbol_id, {})
             metadata_bm25 = scores.get("metadata_bm25", 0.0)
             metadata_dense = scores.get("metadata_dense", 0.0)
-            metadata_score = max(metadata_bm25, metadata_dense) * 0.40
             body_bm25 = scores.get("body_bm25", 0.0)
             body_dense = scores.get("body_dense", 0.0)
-            body_score = max(body_bm25, body_dense) * 0.30
             chunk_bm25 = scores.get("chunk_bm25", 0.0)
             chunk_dense = scores.get("chunk_dense", 0.0)
-            chunk_score = max(chunk_bm25, chunk_dense) * 0.30
-            dual_bonus = 0.0
-            if metadata_score > 0 and body_score > 0:
-                dual_bonus = 0.15 * min(metadata_score, body_score)
+
+            meta_raw = _blend(metadata_bm25, metadata_dense)
+            body_raw = _blend(body_bm25, body_dense)
+            chunk_raw = _blend(chunk_bm25, chunk_dense)
+
+            metadata_score = meta_raw * 0.40
+            body_score = body_raw * 0.30
+            chunk_score = chunk_raw * 0.30
+
+            # Bonus when both name/signature and body signals agree — based on
+            # pre-weight raw scores so the bonus is meaningful in magnitude.
+            dual_bonus = 0.12 * min(meta_raw, body_raw) if meta_raw > 0 and body_raw > 0 else 0.0
+
             return metadata_score + body_score + chunk_score + dual_bonus
 
         raw_scores = {sid: _compute_symbol_score(sid) for sid in all_symbol_scores}

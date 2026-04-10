@@ -3,12 +3,11 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from collections import Counter, defaultdict
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable
-
-import networkx as nx
 
 from .constants import MAX_FILE_BYTES, SPECIAL_FILES, is_indexable_filename
 from .config import Settings
@@ -29,7 +28,7 @@ from .models import (
     FunctionMetadataRecord, IndexProgress, IndexSummary, SymbolRecord, TreeScoreNode,
 )
 from .query import QueryEngine, SearchScope, apply_kind_boost, dependency_ordered_pagerank
-from .ranking_rules import is_queryable_symbol, is_rankable_symbol
+from .ranking_rules import is_external_symbol, is_queryable_symbol, is_rankable_symbol
 from .scip_parser import ParsedScip, parse_scip_index
 from .scip_runner import ScipRunFailure, StructuredIndexingRequiredError, run_scip_indexers
 from .socraticode import ingest_socraticode_artifacts
@@ -319,6 +318,8 @@ class UltimateIndexer:
         self.storage = Storage(self.settings.database_path)
         self._provider = None
         self._query_engine: QueryEngine | None = None
+        # Timestamp of the last file-staleness check; 0.0 = never checked.
+        self._last_stale_check: float = 0.0
 
     def close(self) -> None:
         self.storage.close()
@@ -492,6 +493,40 @@ class UltimateIndexer:
         else:
             boosted = {}
         self.storage.set_global_ranks(self.project_id, boosted)
+
+    def refresh_if_stale(self, max_age_seconds: float = 30.0) -> bool:
+        """Re-index incrementally if any project files changed since last index.
+
+        Rate-limited: the staleness check runs at most once per
+        *max_age_seconds*.  When nothing has changed the call returns in
+        milliseconds — ``index()`` detects matching mtime+size signatures and
+        exits without reading any file contents.  When files were modified,
+        added, or removed, an incremental re-index runs automatically.
+
+        Returns ``True`` if a re-index was triggered, ``False`` otherwise.
+
+        Called automatically by the MCP server before every query tool so the
+        index stays fresh while the server is long-running.
+        """
+        now = time.monotonic()
+        if now - self._last_stale_check < max_age_seconds:
+            return False
+        self._last_stale_check = now
+
+        # Only auto-refresh if the project has been indexed at least once.
+        if not self.storage.get_file_hashes(self.project_id):
+            return False
+
+        # index() computes _project_signature() from st_mtime_ns + st_size
+        # (no file reads).  If nothing changed the signature matches the stored
+        # one and index() returns immediately.  If it differs, incremental
+        # processing kicks in automatically.
+        try:
+            self.index(progress_callback=None)
+            return True
+        except Exception:
+            # Never let a background refresh crash a query.
+            return False
 
     def index(
         self,
@@ -938,9 +973,23 @@ class UltimateIndexer:
         *,
         limit: int = 20,
         kind_filter: str | None = None,
+        include_external: bool = False,
     ):
+        """Return the top-ranked symbols for the project.
+
+        External library stubs are excluded by default (``include_external=False``).
+        They remain in the graph and influence project symbol ranking, but the
+        "important symbols" output is meant to reflect the project's own
+        architecture, not third-party library inventory.
+        """
         symbol_rows = self.storage.get_symbol_rows(self.project_id)
         normalized_filter = _normalized_kind(kind_filter) if kind_filter else None
+
+        def _is_eligible(row) -> bool:
+            rp = str(row["relative_path"])
+            if not include_external and is_external_symbol(rp):
+                return False
+            return True
 
         def _fallback_positive_rows():
             rows = [
@@ -948,6 +997,7 @@ class UltimateIndexer:
                 for row in symbol_rows.values()
                 if str(row["kind"]) not in {"File", "Module", "Unknown"}
                 and float(row["global_rank"]) > 0
+                and _is_eligible(row)
                 and (
                     normalized_filter is None
                     or _normalized_kind(str(row["kind"])) == normalized_filter
@@ -960,6 +1010,7 @@ class UltimateIndexer:
             symbol_id: row
             for symbol_id, row in symbol_rows.items()
             if is_rankable_symbol(str(row["relative_path"]), str(row["kind"]))
+            and _is_eligible(row)
         }
         if normalized_filter:
             rankable_rows = {
@@ -986,6 +1037,7 @@ class UltimateIndexer:
             row
             for row in symbol_rows.values()
             if is_rankable_symbol(str(row["relative_path"]), str(row["kind"]))
+            and not is_external_symbol(str(row["relative_path"]))
             and float(row["global_rank"]) > 0
         ]
         rankable_rows.sort(key=lambda row: (-float(row["global_rank"]), str(row["display_name"])))
@@ -1048,7 +1100,7 @@ class UltimateIndexer:
     def scored_tree(
         self,
         *,
-        max_chars: int | None = 12_000,
+        max_tokens: int | None = 3_000,
         top_k: int | None = None,
         header_title: str = "Project tree scored by usefulness.",
         header_description: list[str] | None = None,
@@ -1129,7 +1181,7 @@ class UltimateIndexer:
         _normalize_tree_scores(root, root.raw_score)
         return format_scored_tree(
             root,
-            max_chars=max_chars,
+            max_tokens=max_tokens,
             top_k=top_k,
             header_title=header_title,
             header_description=header_description,
@@ -1139,11 +1191,11 @@ class UltimateIndexer:
     def sorted_tree(
         self,
         *,
-        max_chars: int | None = 12_000,
+        max_tokens: int | None = 3_000,
         top_k: int | None = None,
     ) -> str:
         return self.scored_tree(
-            max_chars=max_chars,
+            max_tokens=max_tokens,
             top_k=top_k,
             header_title="Project tree sorted by folder accumulation and file value.",
             header_description=[

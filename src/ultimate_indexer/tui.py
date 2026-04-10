@@ -111,8 +111,8 @@ def run_tui(
                 console.print(indexer.project_stats())
                 continue
             if action == 7:
-                max_chars = IntPrompt.ask("Max chars", default=12_000)
-                console.print(indexer.sorted_tree(max_chars=max_chars))
+                max_tokens = IntPrompt.ask("Max tokens", default=3_000)
+                console.print(indexer.sorted_tree(max_tokens=max_tokens))
                 continue
             console.print("[yellow]Unknown action[/yellow]")
     finally:

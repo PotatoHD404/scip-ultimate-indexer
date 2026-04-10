@@ -54,6 +54,12 @@ _DOCSTRING_NAME_PATTERNS = (
 )
 
 
+def is_external_symbol(relative_path: str) -> bool:
+    """Return True for symbols that are library stubs (not from project source)."""
+    return relative_path.startswith("_external/")
+
+
+
 def is_generated_path(relative_path: str) -> bool:
     normalized = relative_path.replace("\\", "/")
     path = PurePosixPath(normalized)
@@ -71,6 +77,10 @@ def is_generated_path(relative_path: str) -> bool:
 
 
 def is_rankable_symbol(relative_path: str, kind: str) -> bool:
+    # External library stubs always participate in PageRank so that project
+    # symbols which implement/call widely-used library types rank higher.
+    if is_external_symbol(relative_path):
+        return True
     if kind in NON_RANKABLE_KINDS:
         # Allow documentation kinds even if they're in the non-rankable set
         if kind in DOC_RANKABLE_KINDS:
@@ -83,6 +93,10 @@ def is_rankable_symbol(relative_path: str, kind: str) -> bool:
 
 
 def is_queryable_symbol(relative_path: str, kind: str) -> bool:
+    # External library stubs are queryable so they can surface in search when
+    # they happen to rank highly (e.g. http.Handler implemented many times).
+    if is_external_symbol(relative_path):
+        return True
     if kind in NON_QUERYABLE_KINDS:
         # Allow documentation kinds even if they're in the non-queryable set
         if kind in DOC_QUERYABLE_KINDS:

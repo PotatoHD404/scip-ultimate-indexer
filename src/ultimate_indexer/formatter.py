@@ -6,6 +6,34 @@ import re
 from .models import FileGroup, RankedSymbol, TreeScoreNode
 from .storage import Storage
 
+# ---------------------------------------------------------------------------
+# Token counting — tiktoken (Qwen2-compatible cl100k_base) with char fallback
+# ---------------------------------------------------------------------------
+# Qwen2 uses a BPE tokenizer very close to GPT-4's cl100k_base.
+# tiktoken is a lightweight C extension with no model weights — just BPE
+# tables — so it loads in milliseconds and adds no inference overhead.
+try:
+    import tiktoken as _tiktoken
+    _enc = _tiktoken.get_encoding("cl100k_base")
+
+    def count_tokens(text: str) -> int:
+        """Return the token count for *text* using tiktoken cl100k_base.
+
+        cl100k_base is the GPT-4 / Qwen2-compatible BPE encoding.  Counts are
+        within ±5 % of the true Qwen2 count for typical code content.
+        """
+        return len(_enc.encode(text, disallowed_special=()))
+
+except ImportError:
+    _CHARS_PER_TOKEN = 3.5  # empirical ratio for mixed code/prose
+
+    def count_tokens(text: str) -> int:  # type: ignore[misc]
+        """Estimate token count via character ratio (tiktoken not installed).
+
+        Install ``tiktoken`` for accurate counts: ``pip install tiktoken``.
+        """
+        return max(1, round(len(text) / _CHARS_PER_TOKEN))
+
 
 CLASS_LIKE_KINDS = {"Class", "Struct", "Interface", "Trait", "Enum"}
 TYPE_LIKE_KINDS = CLASS_LIKE_KINDS | {"TypeAlias"}
@@ -22,6 +50,24 @@ def _comment_prefix(relative_path: str) -> str:
 
 def _is_go_path(relative_path: str) -> bool:
     return relative_path.endswith(".go")
+
+
+def _is_external_path(relative_path: str) -> bool:
+    return relative_path.startswith("_external/")
+
+
+def _path_label(relative_path: str, start_line: int = 0) -> str:
+    """Return a human-readable location string for a symbol header comment.
+
+    External library stubs render as ``[library] <package>`` since they have
+    no real source file.  Project symbols render as ``<path>:<line>``.
+    """
+    if _is_external_path(relative_path):
+        pkg = relative_path[len("_external/"):]
+        return f"[library] {pkg}"
+    if start_line > 0:
+        return f"{relative_path}:{start_line}"
+    return relative_path
 
 
 def _meaningful_doc_lines(docstring: str) -> list[str]:
@@ -403,10 +449,29 @@ def format_groups(
     return "\n".join(lines).strip()
 
 
-def truncate_text(text: str, max_chars: int, *, note_prefix: str = "//") -> str:
-    _ = max_chars
-    _ = note_prefix
-    return text
+def truncate_to_tokens(text: str, max_tokens: int, *, note_prefix: str = "//") -> str:
+    """Trim *text* to fit within *max_tokens* as counted by ``count_tokens``.
+
+    Lines are removed from the end until the remaining text fits, so the
+    output is always a clean line-by-line prefix of the input.  A trailing
+    comment marks the cut so consumers know the output is incomplete.
+    Pass ``max_tokens <= 0`` to disable trimming.
+    """
+    if max_tokens <= 0 or count_tokens(text) <= max_tokens:
+        return text
+    note = f"\n{note_prefix} ... truncated"
+    note_tokens = count_tokens(note)
+    budget = max_tokens - note_tokens
+    lines = text.splitlines()
+    kept: list[str] = []
+    used = 0
+    for line in lines:
+        cost = count_tokens(line + "\n")
+        if used + cost > budget:
+            break
+        kept.append(line)
+        used += cost
+    return "\n".join(kept) + note
 
 
 def format_groups_compact(
@@ -416,7 +481,7 @@ def format_groups_compact(
     *,
     max_files: int = 5,
     max_symbols_per_file: int = 2,
-    max_chars: int = 4_000,
+    max_tokens: int = 1_200,
 ) -> str:
     text = format_groups(
         storage=storage,
@@ -424,7 +489,7 @@ def format_groups_compact(
         groups=groups[:max_files],
         max_symbols_per_file=max_symbols_per_file,
     )
-    return truncate_text(text, max_chars)
+    return truncate_to_tokens(text, max_tokens)
 
 
 def format_top_symbols(rows: list, *, include_scores: bool = True) -> str:
@@ -556,6 +621,10 @@ def _symbol_declaration_block(
     pretty_signature = _pretty_signature(kind, display_name, signature, docstring, snippet)
     comment_prefix = _comment_prefix(relative_path)
 
+    # External library stubs have no source; render just the signature name.
+    if _is_external_path(relative_path):
+        return [display_name]
+
     lines: list[str] = []
     doc_lines = [
         line
@@ -596,7 +665,7 @@ def format_search_symbols_codegraph(
     groups: list[FileGroup],
     *,
     max_results: int = 10,
-    max_chars: int = 0,
+    max_tokens: int = 0,
 ) -> str:
     symbol_rows = storage.get_symbol_rows(project_id)
     symbol_map: dict[str, RankedSymbol] = {}
@@ -640,8 +709,9 @@ def format_search_symbols_codegraph(
         row = symbol_rows.get(symbol.symbol_id)
         kind = str(row["kind"]) if row is not None else symbol.kind
         relative_path = str(row["relative_path"]) if row is not None else symbol.relative_path
+        start_line = int(row["start_line"]) if row is not None else 0
         qualified = _qualified_display_name(symbol.symbol_id, symbol.display_name, symbol_rows)
-        lines.append(f"// {qualified}  ({kind})  {relative_path}")
+        lines.append(f"// {qualified}  ({kind})  {_path_label(relative_path, start_line)}")
         include_members = kind in {"Class", "Struct", "Interface", "Trait", "Enum", "TypeAlias"}
         lines.extend(
             _symbol_declaration_block(
@@ -653,7 +723,7 @@ def format_search_symbols_codegraph(
             )
         )
         lines.append("")
-    return truncate_text("\n".join(lines).strip(), max_chars)
+    return truncate_to_tokens("\n".join(lines).strip(), max_tokens)
 
 
 def format_important_symbols_codegraph(
@@ -661,7 +731,7 @@ def format_important_symbols_codegraph(
     project_id: str,
     rows: list,
     *,
-    max_chars: int = 0,
+    max_tokens: int = 0,
 ) -> str:
     symbol_rows = storage.get_symbol_rows(project_id)
     lines = [f"// Top {len(rows)} symbols", ""]
@@ -677,8 +747,9 @@ def format_important_symbols_codegraph(
             docstring=str(row["docstring"]),
             snippet=str(row["snippet"]),
         )
+        start_line = int(row["start_line"]) if "start_line" in row.keys() else 0
         qualified = _qualified_display_name(symbol_id, symbol.display_name, symbol_rows)
-        lines.append(f"// #{index}  {qualified}  ({symbol.kind})  {symbol.relative_path}")
+        lines.append(f"// #{index}  {qualified}  ({symbol.kind})  {_path_label(symbol.relative_path, start_line)}")
         include_members = symbol.kind in {"Class", "Struct", "Interface", "Trait", "Enum", "TypeAlias"}
         lines.extend(
             _symbol_declaration_block(
@@ -690,7 +761,7 @@ def format_important_symbols_codegraph(
             )
         )
         lines.append("")
-    return truncate_text("\n".join(lines).strip(), max_chars)
+    return truncate_to_tokens("\n".join(lines).strip(), max_tokens)
 
 
 def _tree_label(node: TreeScoreNode, *, include_value_details: bool = False) -> str:
@@ -715,57 +786,48 @@ def format_documentation_section(
     storage: Storage,
     project_id: str,
     relative_path: str,
-    max_chars: int = 4000,
+    max_tokens: int = 1_200,
 ) -> str:
-    """Format a documentation file for output.
-    
-    This provides a markdown-formatted view of documentation content,
-    preserving the original structure and adding context from the graph.
+    """Format a documentation file for output, trimmed to *max_tokens*.
+
+    Markdown files are returned as-is (trimmed by token budget).  OpenAPI
+    specs are rendered as a structured comment hierarchy of Document/Section
+    symbols before trimming.
     """
     file_row = storage.get_file(project_id, relative_path)
     if file_row is None:
         return f"// Documentation not found: {relative_path}"
-    
+
     content = str(file_row["content"])
-    source_kind = str(file_row.get("source_kind", "documentation"))
-    
-    # For markdown files, return content with minimal processing
-    if relative_path.endswith(('.md', '.markdown')):
-        return content[:max_chars]
-    
-    # For OpenAPI specs, format as structured output
-    if relative_path.endswith(('.yaml', '.yml', '.json')):
+
+    if relative_path.endswith((".md", ".markdown")):
+        return truncate_to_tokens(content, max_tokens)
+
+    if relative_path.endswith((".yaml", ".yml", ".json")):
         lines = [f"# OpenAPI Specification: {relative_path}", ""]
-        
-        # Get symbols for this file
         symbol_rows = storage.get_symbol_rows(project_id)
         file_symbols = [
             row for row in symbol_rows.values()
             if str(row["relative_path"]) == relative_path
             and str(row["kind"]) in DOC_KINDS
         ]
-        
-        # Group by kind
         docs = [s for s in file_symbols if str(s["kind"]) == "Document"]
         sections = [s for s in file_symbols if str(s["kind"]) == "Section"]
-        
         for doc in docs:
             docstring = str(doc["docstring"])
             if docstring:
                 lines.append(f"## {str(doc['display_name'])}")
                 lines.append(docstring)
                 lines.append("")
-        
         for section in sorted(sections, key=lambda s: float(s["start_line"])):
             lines.append(f"### {str(section['display_name'])}")
             snippet = str(section["snippet"])[:500]
             if snippet:
                 lines.append(snippet)
             lines.append("")
-        
-        return "\n".join(lines)[:max_chars]
-    
-    return content[:max_chars]
+        return truncate_to_tokens("\n".join(lines), max_tokens)
+
+    return truncate_to_tokens(content, max_tokens)
 
 
 def _render_tree_lines(
@@ -800,7 +862,7 @@ def _render_tree_lines(
 def format_scored_tree(
     root: TreeScoreNode,
     *,
-    max_chars: int | None = 12_000,
+    max_tokens: int | None = 3_000,
     top_k: int | None = None,
     header_title: str = "Project tree scored by usefulness.",
     header_description: list[str] | None = None,
@@ -826,6 +888,141 @@ def format_scored_tree(
         include_value_details=include_value_details,
     )
     text = header + "\n".join(body_lines)
-    if max_chars is None:
+    if max_tokens is None:
         return text
-    return truncate_text(text, max_chars)
+    return truncate_to_tokens(text, max_tokens)
+
+
+# ---------------------------------------------------------------------------
+# Context-window formatter — greedy token packing
+# ---------------------------------------------------------------------------
+
+# Symbol kinds shown in the symbol section (functions, named types, globals).
+_CONTEXT_SYMBOL_KINDS = {
+    "Function", "Method",
+    "Interface", "Struct", "Class", "Trait", "Enum", "TypeAlias",
+    "Constant", "Const", "Property",
+}
+
+
+def _context_symbol_block(
+    row: object,
+    symbol_rows: dict[str, object],
+) -> str:
+    """Render one symbol as a compact signature line with location comment.
+
+    Format::
+
+        // QualifiedName  (Kind)  path:line
+        signature_or_display_name
+    """
+    symbol_id = str(row["symbol_id"])
+    kind = str(row["kind"])
+    relative_path = str(row["relative_path"])
+    start_line = int(row["start_line"])
+    qualified = _qualified_display_name(symbol_id, str(row["display_name"]), symbol_rows)
+    # External library stubs: no source snippet, just the name.
+    if _is_external_path(relative_path):
+        return f"// {qualified}  ({kind})  {_path_label(relative_path)}\n{str(row['display_name'])}"
+    sig = _pretty_signature(
+        kind=kind,
+        display_name=str(row["display_name"]),
+        signature=str(row["signature"]),
+        docstring=str(row["docstring"]),
+        snippet=str(row["snippet"]),
+    ).strip()
+    # Include the first docstring line only when it adds information beyond the sig.
+    doc_lines = _meaningful_doc_lines(str(row["docstring"]))
+    doc_note = ""
+    if doc_lines and doc_lines[0].strip() != sig:
+        # Condense to a single brief comment (≤ 120 chars).
+        brief = doc_lines[0][:120]
+        comment_prefix = _comment_prefix(relative_path)
+        doc_note = f"\n{comment_prefix} {brief}"
+    return f"// {qualified}  ({kind})  {_path_label(relative_path, start_line)}{doc_note}\n{sig}"
+
+
+def _context_doc_block(row: object) -> str:
+    """Render one documentation symbol as a compact summary block."""
+    relative_path = str(row["relative_path"])
+    docstring = str(row["docstring"])
+    display_name = str(row["display_name"])
+    first_para = next(
+        (line for line in docstring.splitlines() if line.strip()),
+        display_name,
+    )[:200]
+    return f"// doc  {relative_path}\n// {first_para}"
+
+
+def format_context_window(
+    storage: "Storage",
+    project_id: str,
+    *,
+    symbol_tokens: int = 8192,
+    doc_tokens: int = 2048,
+) -> str:
+    """Return a compact context window packed to a Qwen-token budget.
+
+    Two sections are assembled greedily:
+
+    * **Symbols** (up to *symbol_tokens* Qwen tokens): top-ranked functions,
+      methods, interfaces, structs, classes, traits, enums, type aliases,
+      constants, and properties — one signature per line with a location
+      comment header.  Symbols are ordered by ``global_rank`` descending so
+      the most architecturally important symbols appear first.
+
+    * **Docs** (up to *doc_tokens* Qwen tokens): top-ranked ``Document``
+      symbols with a one-line summary.
+
+    The function never simply truncates a symbol mid-block; it stops before
+    adding a block that would exceed the remaining budget.  The total output
+    therefore fits in approximately ``symbol_tokens + doc_tokens`` Qwen tokens.
+    """
+    symbol_rows = storage.get_symbol_rows(project_id)
+
+    # --- Symbol section ---
+    rankable = [
+        row
+        for row in symbol_rows.values()
+        if str(row["kind"]) in _CONTEXT_SYMBOL_KINDS
+        and float(row["global_rank"]) > 0
+    ]
+    rankable.sort(key=lambda r: (-float(r["global_rank"]), str(r["display_name"])))
+
+    sym_lines: list[str] = ["// Symbols (by graph rank)"]
+    sym_budget = symbol_tokens - count_tokens(sym_lines[0])
+    for row in rankable:
+        block = _context_symbol_block(row, symbol_rows)
+        cost = count_tokens(block) + 1  # +1 for the blank separator
+        if cost > sym_budget:
+            break
+        sym_lines.append(block)
+        sym_lines.append("")
+        sym_budget -= cost
+
+    # --- Doc section ---
+    doc_rows = [
+        row
+        for row in symbol_rows.values()
+        if str(row["kind"]) == "Document"
+        and float(row["global_rank"]) > 0
+    ]
+    doc_rows.sort(key=lambda r: (-float(r["global_rank"]), str(r["relative_path"])))
+
+    doc_lines: list[str] = ["// Docs (by graph rank)"]
+    doc_budget = doc_tokens - count_tokens(doc_lines[0])
+    for row in doc_rows:
+        block = _context_doc_block(row)
+        cost = count_tokens(block) + 1
+        if cost > doc_budget:
+            break
+        doc_lines.append(block)
+        doc_lines.append("")
+        doc_budget -= cost
+
+    parts: list[str] = []
+    if len(sym_lines) > 1:
+        parts.append("\n".join(sym_lines).rstrip())
+    if len(doc_lines) > 1:
+        parts.append("\n".join(doc_lines).rstrip())
+    return "\n\n".join(parts)

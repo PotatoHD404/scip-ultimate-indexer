@@ -959,29 +959,41 @@ class Storage:
         ).fetchall()
 
     def set_global_ranks(self, project_id: str, ranks: dict[str, float]) -> None:
+        # Two statements: bulk-reset then batch-update — avoids N individual round-trips.
         with self.connection:
             self.connection.execute(
                 "UPDATE symbols SET global_rank = 0.0 WHERE project_id = ?",
                 (project_id,),
             )
-            for symbol_id, score in ranks.items():
-                self.connection.execute(
-                    """
-                    UPDATE symbols
-                    SET global_rank = ?
-                    WHERE project_id = ? AND symbol_id = ?
-                    """,
-                    (score, project_id, symbol_id),
-                )
+            self.connection.executemany(
+                "UPDATE symbols SET global_rank = ? WHERE project_id = ? AND symbol_id = ?",
+                [(score, project_id, sid) for sid, score in ranks.items()],
+            )
 
-    def get_top_symbols(self, project_id: str, limit: int) -> list[sqlite3.Row]:
+    def get_top_symbols(
+        self,
+        project_id: str,
+        limit: int,
+        *,
+        include_external: bool = False,
+    ) -> list[sqlite3.Row]:
+        """Return the top-ranked symbols for a project.
+
+        By default external library stubs (source_kind='external') are excluded.
+        They participate in PageRank to correctly boost project symbols that use
+        widely-adopted APIs, but the "important project symbols" output should
+        reflect project architecture, not library inventory.  Pass
+        ``include_external=True`` to include them.
+        """
+        extra = "" if include_external else "AND source_kind != 'external'"
         return self.connection.execute(
-            """
+            f"""
             SELECT *
             FROM symbols
             WHERE project_id = ?
               AND kind NOT IN ('File', 'Artifact', 'ArtifactConfig', 'ArtifactSection', 'Section', 'Module', 'Unknown')
               AND global_rank > 0
+              {extra}
             ORDER BY global_rank DESC, display_name ASC
             LIMIT ?
             """,

@@ -223,7 +223,7 @@ def visualize(
 def tree(
     project_path: Path,
     top_k: int | None = typer.Option(None, "--top-k"),
-    max_chars: int | None = typer.Option(12_000, "--max-chars"),
+    max_tokens: int | None = typer.Option(3_000, "--max-tokens"),
     embedding_backend: str = typer.Option("auto", "--embedding-backend"),
     cache_dir: Path | None = typer.Option(None, "--cache-dir"),
     embedding_api_key: str | None = typer.Option(None, "--embedding-api-key"),
@@ -239,7 +239,7 @@ def tree(
         embedding_api_model=embedding_api_model,
     )
     try:
-        console.print(indexer.sorted_tree(max_chars=max_chars, top_k=top_k))
+        console.print(indexer.sorted_tree(max_tokens=max_tokens, top_k=top_k))
     finally:
         indexer.close()
 
