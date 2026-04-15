@@ -165,7 +165,7 @@ def _chunk_to_record(
         project_id=project_id,
         chunk_id=chunk.chunk_id
         or sha256(
-            f"{chunk.file_path}:{chunk.content[:200]}:{chunk.start_line}".encode()
+            f"{chunk.file_path}:{chunk.chunk_type}:{chunk.anchor or chunk.breadcrumb or f'line:{chunk.start_line}-{chunk.end_line}'}:{chunk.metadata.get('sub_chunk', 0) if chunk.metadata else 0}".encode()
         ).hexdigest()[:32],
         relative_path=chunk.file_path,
         symbol_id=doc_symbol_id,
@@ -419,11 +419,13 @@ def ingest_documentation(
         # Chunk the sections
         doc_chunks = chunker.chunk_sections(rel_path, sections_parsed)
 
-        # Generate chunk IDs
+        # Generate chunk IDs using anchor (section name) when available
         for chunk in doc_chunks:
             if not chunk.chunk_id:
+                section_key = chunk.anchor or chunk.breadcrumb or f"line:{chunk.start_line}-{chunk.end_line}"
+                sub_chunk = chunk.metadata.get("sub_chunk", 0) if chunk.metadata else 0
                 chunk.chunk_id = sha256(
-                    f"{chunk.file_path}:{chunk.content[:200]}:{chunk.start_line}".encode()
+                    f"{chunk.file_path}:{chunk.chunk_type}:{section_key}:{sub_chunk}".encode()
                 ).hexdigest()[:32]
 
         file_data.append((rel_path, doc_chunks, links, anchors))
