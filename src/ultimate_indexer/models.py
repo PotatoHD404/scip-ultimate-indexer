@@ -57,6 +57,11 @@ class ChunkRecord:
     embedding: bytes | None = None
     embedding_dim: int = 0
     embedding_model_id: str = ""
+    # Transient: extra vocabulary terms indexed into FTS only (not a DB column,
+    # not displayed). Bridges code<->query vocabulary for lexical search.
+    fts_expansion: str = ""
+    # Transient: structural context prepended to the dense embedding text only.
+    context_header: str = ""
 
 
 @dataclass(slots=True)
@@ -87,6 +92,8 @@ class FunctionMetadataRecord:
     embedding: bytes | None = None
     embedding_dim: int = 0
     embedding_model_id: str = ""
+    # Transient: extra vocabulary terms indexed into FTS only (see ChunkRecord).
+    fts_expansion: str = ""
 
 
 @dataclass(slots=True)

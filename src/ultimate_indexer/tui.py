@@ -16,7 +16,7 @@ console = Console()
 
 def _build_indexer(
     project_path: Path,
-    embedding_backend: str,
+    embedding_backend: str | None,
     cache_dir: Path | None,
     embedding_api_key: str | None,
     embedding_api_endpoint: str | None,
@@ -39,7 +39,7 @@ def _build_indexer(
 def run_tui(
     *,
     project_path: Path,
-    embedding_backend: str,
+    embedding_backend: str | None,
     cache_dir: Path | None,
     embedding_api_key: str | None,
     embedding_api_endpoint: str | None,

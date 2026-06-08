@@ -7,8 +7,9 @@ import os
 import re
 import sys
 import time
-import urllib.request
 import urllib.error
+import urllib.parse
+import urllib.request
 from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -362,13 +363,20 @@ class APIEmbeddingProvider:
             )
         return parsed
 
-    def _call_api(self, texts: list[str]) -> list[list[float]]:
+    def _call_api(self, texts: list[str], allow_context_split: bool = True) -> list[list[float]]:
         """Call the embedding API endpoint and return embeddings.
-        
+
         Handles context length errors by automatically splitting oversized texts.
+        ``allow_context_split=False`` disables that retry so the splitter cannot
+        recurse into itself indefinitely when a chunk is still over the limit.
         """
         if not self.api_endpoint or not self.api_model:
             raise RuntimeError("Embedding API endpoint and model must both be configured")
+        scheme = urllib.parse.urlparse(self.api_endpoint).scheme.lower()
+        if scheme not in ("http", "https"):
+            raise RuntimeError(
+                f"Embedding API endpoint must be an http(s) URL, got scheme {scheme!r}"
+            )
         payload = {
             "input": texts,
             "model": self.api_model,
@@ -397,9 +405,13 @@ class APIEmbeddingProvider:
             error_body = e.read().decode("utf-8") if e.fp else ""
             
             # Check if this is a context length error - handle by splitting texts
-            if e.code == 400 and ("maximum context length" in error_body or "context length" in error_body):
+            if (
+                allow_context_split
+                and e.code == 400
+                and ("maximum context length" in error_body or "context length" in error_body)
+            ):
                 return self._handle_context_length_error(texts, error_body)
-            
+
             raise RuntimeError(f"API request failed with status {e.code}: {error_body}") from e
         except urllib.error.URLError as e:
             raise RuntimeError(f"API request failed: {e.reason}") from e
@@ -418,11 +430,19 @@ class APIEmbeddingProvider:
         all_embeddings: list[list[float]] = []
         for text in texts:
             text_chunks = self._split_text(text, effective_max_tokens)
+            # Re-embed sub-chunks with context-split DISABLED so a chunk that is
+            # still over the real (tokenizer) limit fails loudly instead of
+            # recursing into this handler forever.
             if len(text_chunks) == 1:
-                all_embeddings.extend(self._call_api(text_chunks))
+                all_embeddings.extend(
+                    self._call_api(text_chunks, allow_context_split=False)
+                )
             else:
                 chunk_vecs = [
-                    np.asarray(self._call_api([chunk])[0], dtype=np.float32)
+                    np.asarray(
+                        self._call_api([chunk], allow_context_split=False)[0],
+                        dtype=np.float32,
+                    )
                     for chunk in text_chunks
                 ]
                 all_embeddings.append(self._aggregate_embeddings(chunk_vecs).tolist())

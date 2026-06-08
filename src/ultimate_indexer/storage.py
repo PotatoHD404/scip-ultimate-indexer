@@ -24,6 +24,27 @@ def _utcnow() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _bm25_max_magnitude(rows: Iterable[sqlite3.Row]) -> float:
+    """Largest relevance magnitude in a result set (SQLite bm25 is negative-better)."""
+    return max((max(-float(row["rank"]), 0.0) for row in rows), default=0.0)
+
+
+def _normalized_bm25_score(raw_rank: float, max_magnitude: float, idx: int) -> float:
+    """Map a SQLite fts5 bm25() value to a [0,1] score comparable to cosine.
+
+    bm25() is negative-better, so the relevance magnitude is ``-raw_rank``. We
+    normalize by the best magnitude in the set so the top hit is 1.0 and the rest
+    scale by relative strength. This preserves bm25 magnitude (unlike the old
+    ``1/(1+max(raw_rank,0)+idx)`` which clamped every match to 0 and collapsed to
+    result ordinal) while staying robust on tiny corpora where absolute bm25
+    magnitudes are near zero. The LIKE fallback (all ranks 0) keeps a positional
+    ordering.
+    """
+    if max_magnitude > 0.0:
+        return max(-raw_rank, 0.0) / max_magnitude
+    return 1.0 / (1.0 + idx)
+
+
 class Storage:
     def __init__(self, database_path: Path) -> None:
         self.database_path = database_path
@@ -43,6 +64,7 @@ class Storage:
                 project_id TEXT PRIMARY KEY,
                 root_path TEXT NOT NULL,
                 signature TEXT DEFAULT '',
+                config_signature TEXT DEFAULT '',
                 indexed_at TEXT NOT NULL
             );
 
@@ -206,35 +228,63 @@ class Storage:
                 PRIMARY KEY (project_id, query_hash)
             );
 
+            CREATE TABLE IF NOT EXISTS cochange (
+                project_id TEXT NOT NULL,
+                path_a TEXT NOT NULL,
+                path_b TEXT NOT NULL,
+                weight REAL NOT NULL,
+                PRIMARY KEY (project_id, path_a, path_b)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(project_id, relative_path);
+            CREATE INDEX IF NOT EXISTS idx_cochange_a ON cochange(project_id, path_a);
+            CREATE INDEX IF NOT EXISTS idx_cochange_b ON cochange(project_id, path_b);
             CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(project_id, source_symbol_id);
             CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(project_id, target_symbol_id);
             CREATE INDEX IF NOT EXISTS idx_chunks_symbol ON chunks(project_id, symbol_id);
+            CREATE INDEX IF NOT EXISTS idx_chunks_path ON chunks(project_id, relative_path);
             CREATE INDEX IF NOT EXISTS idx_function_metadata_symbol ON function_metadata(project_id, symbol_id);
             CREATE INDEX IF NOT EXISTS idx_function_body_symbol ON function_body_chunks(project_id, symbol_id);
             """
         )
-        chunk_columns = {
-            str(row["name"])
-            for row in self.connection.execute("PRAGMA table_info(chunks)").fetchall()
+        # Backfill columns added in later releases so a database created by an
+        # older version keeps working after an upgrade (CREATE TABLE IF NOT EXISTS
+        # never alters an existing table, and missing columns crash at query time).
+        # All declarations are nullable/defaulted, which SQLite requires for
+        # ALTER TABLE ADD COLUMN on a populated table.
+        expected_columns: dict[str, dict[str, str]] = {
+            "projects": {"config_signature": "TEXT DEFAULT ''"},
+            "chunks": {"embedding_model_id": "TEXT NOT NULL DEFAULT ''"},
+            "symbols": {"global_rank": "REAL DEFAULT 0.0"},
+            "function_metadata": {"embedding_model_id": "TEXT NOT NULL DEFAULT ''"},
+            "function_body_chunks": {"embedding_model_id": "TEXT NOT NULL DEFAULT ''"},
         }
-        if "embedding_model_id" not in chunk_columns:
-            self.connection.execute(
-                "ALTER TABLE chunks ADD COLUMN embedding_model_id TEXT NOT NULL DEFAULT ''"
-            )
+        for table, columns in expected_columns.items():
+            existing = {
+                str(row["name"])
+                for row in self.connection.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            for name, declaration in columns.items():
+                if name not in existing:
+                    self.connection.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {name} {declaration}"
+                    )
         self.connection.commit()
 
-    def upsert_project(self, project_id: str, root_path: str, signature: str) -> None:
+    def upsert_project(
+        self, project_id: str, root_path: str, signature: str, config_signature: str = ""
+    ) -> None:
         self.connection.execute(
             """
-            INSERT INTO projects(project_id, root_path, signature, indexed_at)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO projects(project_id, root_path, signature, config_signature, indexed_at)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(project_id) DO UPDATE SET
                 root_path=excluded.root_path,
                 signature=excluded.signature,
+                config_signature=excluded.config_signature,
                 indexed_at=excluded.indexed_at
             """,
-            (project_id, root_path, signature, _utcnow()),
+            (project_id, root_path, signature, config_signature, _utcnow()),
         )
         self.connection.commit()
 
@@ -244,6 +294,13 @@ class Storage:
             (project_id,),
         ).fetchone()
         return None if row is None else str(row["signature"])
+
+    def get_project_config_signature(self, project_id: str) -> str | None:
+        row = self.connection.execute(
+            "SELECT config_signature FROM projects WHERE project_id = ?",
+            (project_id,),
+        ).fetchone()
+        return None if row is None else str(row["config_signature"])
 
     def get_file_hashes(self, project_id: str) -> dict[str, str]:
         rows = self.connection.execute(
@@ -507,7 +564,7 @@ class Storage:
                         chunk.relative_path,
                         chunk.symbol_name,
                         chunk.artifact_name or "",
-                        chunk.content,
+                        chunk.content + (f"\n{chunk.fts_expansion}" if chunk.fts_expansion else ""),
                     ),
                 )
 
@@ -569,7 +626,7 @@ class Storage:
                         json.dumps(meta.behavioral_tags),
                         json.dumps(meta.literals),
                         meta.docstring,
-                        meta.metadata_content,
+                        meta.metadata_content + (f"\n{meta.fts_expansion}" if meta.fts_expansion else ""),
                     ),
                 )
 
@@ -621,6 +678,43 @@ class Storage:
                     ),
                 )
 
+    def replace_cochange(self, project_id: str, pairs: dict[tuple[str, str], float]) -> None:
+        """Replace the git co-change coupling rows for a project."""
+        self.connection.execute("DELETE FROM cochange WHERE project_id = ?", (project_id,))
+        if pairs:
+            self.connection.executemany(
+                "INSERT OR REPLACE INTO cochange(project_id, path_a, path_b, weight) VALUES (?, ?, ?, ?)",
+                [(project_id, a, b, float(weight)) for (a, b), weight in pairs.items()],
+            )
+        self.connection.commit()
+
+    def get_cochange_neighbors(self, project_id: str, paths: Iterable[str]) -> dict[str, float]:
+        """Paths co-changing with any of *paths*, mapped to their max coupling weight."""
+        focus = list(dict.fromkeys(p for p in paths if p))
+        if not focus:
+            return {}
+        placeholders = ",".join("?" for _ in focus)
+        rows = self.connection.execute(
+            f"""
+            SELECT path_b AS other, weight FROM cochange
+            WHERE project_id = ? AND path_a IN ({placeholders})
+            UNION ALL
+            SELECT path_a AS other, weight FROM cochange
+            WHERE project_id = ? AND path_b IN ({placeholders})
+            """,
+            (project_id, *focus, project_id, *focus),
+        ).fetchall()
+        focus_set = set(focus)
+        neighbors: dict[str, float] = {}
+        for row in rows:
+            other = str(row["other"])
+            if other in focus_set:
+                continue
+            weight = float(row["weight"])
+            if weight > neighbors.get(other, 0.0):
+                neighbors[other] = weight
+        return neighbors
+
     def get_or_create_embedding(
         self,
         model_id: str,
@@ -660,16 +754,19 @@ class Storage:
     def load_chunk_vectors(
         self,
         project_id: str,
+        embedding_model_id: str | None = None,
     ) -> tuple[np.ndarray, list[sqlite3.Row]]:
-        rows = self.connection.execute(
-            """
-            SELECT chunk_id, relative_path, symbol_id, symbol_name, content, start_line, end_line, embedding, embedding_dim
-            FROM chunks
-            WHERE project_id = ? AND embedding IS NOT NULL
-            ORDER BY chunk_id
-            """,
-            (project_id,),
-        ).fetchall()
+        sql = (
+            "SELECT chunk_id, relative_path, symbol_id, symbol_name, content, "
+            "start_line, end_line, embedding, embedding_dim FROM chunks "
+            "WHERE project_id = ? AND embedding IS NOT NULL"
+        )
+        params: list[object] = [project_id]
+        if embedding_model_id is not None:
+            sql += " AND embedding_model_id = ?"
+            params.append(embedding_model_id)
+        sql += " ORDER BY chunk_id"
+        rows = self.connection.execute(sql, params).fetchall()
         vectors = [
             np.frombuffer(
                 row["embedding"], dtype=np.float32, count=row["embedding_dim"]
@@ -683,18 +780,21 @@ class Storage:
     def load_function_metadata_vectors(
         self,
         project_id: str,
+        embedding_model_id: str | None = None,
     ) -> tuple[np.ndarray, list[sqlite3.Row]]:
         """Load function metadata vectors for dense search."""
-        rows = self.connection.execute(
-            """
-            SELECT symbol_id, relative_path, display_name, kind, fully_qualified_name,
-                   signature, docstring, metadata_content, start_line, end_line, embedding, embedding_dim
-            FROM function_metadata
-            WHERE project_id = ? AND embedding IS NOT NULL
-            ORDER BY symbol_id
-            """,
-            (project_id,),
-        ).fetchall()
+        sql = (
+            "SELECT symbol_id, relative_path, display_name, kind, fully_qualified_name, "
+            "signature, docstring, metadata_content, start_line, end_line, embedding, "
+            "embedding_dim FROM function_metadata "
+            "WHERE project_id = ? AND embedding IS NOT NULL"
+        )
+        params: list[object] = [project_id]
+        if embedding_model_id is not None:
+            sql += " AND embedding_model_id = ?"
+            params.append(embedding_model_id)
+        sql += " ORDER BY symbol_id"
+        rows = self.connection.execute(sql, params).fetchall()
         vectors = [
             np.frombuffer(
                 row["embedding"], dtype=np.float32, count=row["embedding_dim"]
@@ -708,19 +808,21 @@ class Storage:
     def load_function_body_vectors(
         self,
         project_id: str,
+        embedding_model_id: str | None = None,
     ) -> tuple[np.ndarray, list[sqlite3.Row]]:
         """Load function body chunk vectors for dense search."""
-        rows = self.connection.execute(
-            """
-            SELECT chunk_id, symbol_id, relative_path, display_name, kind, signature,
-                   chunk_index, total_chunks, body, chunk_type, start_line, end_line,
-                   content, embedding, embedding_dim
-            FROM function_body_chunks
-            WHERE project_id = ? AND embedding IS NOT NULL
-            ORDER BY symbol_id, chunk_index
-            """,
-            (project_id,),
-        ).fetchall()
+        sql = (
+            "SELECT chunk_id, symbol_id, relative_path, display_name, kind, signature, "
+            "chunk_index, total_chunks, body, chunk_type, start_line, end_line, "
+            "content, embedding, embedding_dim FROM function_body_chunks "
+            "WHERE project_id = ? AND embedding IS NOT NULL"
+        )
+        params: list[object] = [project_id]
+        if embedding_model_id is not None:
+            sql += " AND embedding_model_id = ?"
+            params.append(embedding_model_id)
+        sql += " ORDER BY symbol_id, chunk_index"
+        rows = self.connection.execute(sql, params).fetchall()
         vectors = [
             np.frombuffer(
                 row["embedding"], dtype=np.float32, count=row["embedding_dim"]
@@ -786,9 +888,10 @@ class Storage:
             ).fetchall()
 
         results = []
+        bm25_hi = _bm25_max_magnitude(rows)
         for idx, row in enumerate(rows):
             raw_rank = float(row["rank"])
-            score = 1.0 / (1.0 + max(raw_rank, 0.0) + idx)
+            score = _normalized_bm25_score(raw_rank, bm25_hi, idx)
             results.append(
                 {
                     "symbol_id": str(row["symbol_id"]),
@@ -858,9 +961,10 @@ class Storage:
             ).fetchall()
 
         results = []
+        bm25_hi = _bm25_max_magnitude(rows)
         for idx, row in enumerate(rows):
             raw_rank = float(row["rank"])
-            score = 1.0 / (1.0 + max(raw_rank, 0.0) + idx)
+            score = _normalized_bm25_score(raw_rank, bm25_hi, idx)
             results.append(
                 {
                     "chunk_id": str(row["chunk_id"]),
@@ -917,9 +1021,10 @@ class Storage:
                 (project_id, f"%{query}%", limit),
             ).fetchall()
         hits = []
+        bm25_hi = _bm25_max_magnitude(rows)
         for idx, row in enumerate(rows):
             raw_rank = float(row["rank"])
-            score = 1.0 / (1.0 + max(raw_rank, 0.0) + idx)
+            score = _normalized_bm25_score(raw_rank, bm25_hi, idx)
             hits.append(
                 QueryChunkHit(
                     chunk_id=str(row["chunk_id"]),

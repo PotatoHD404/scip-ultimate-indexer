@@ -13,10 +13,20 @@ from .formatter import (
     format_search_symbols_codegraph,
 )
 from .indexer import UltimateIndexer
+from .scip_runner import StructuredIndexingRequiredError
 
 
 def _normalized_kind(kind: str) -> str:
     return kind.replace("_", "").replace("-", "").lower()
+
+
+def _not_indexed_message(indexer: UltimateIndexer) -> str | None:
+    if indexer.storage.get_project_signature(indexer.project_id) is None:
+        return (
+            f"// No index found for {indexer.project_id}. "
+            "Run the index_project tool for this project first."
+        )
+    return None
 
 
 def _registry_path(cache_dir: Path) -> Path:
@@ -80,7 +90,7 @@ def _resolve_project_path(cache_dir: Path, project: str | None) -> Path:
 
 def build_mcp(
     *,
-    cache_dir: Path | str = ".scip_indexes",
+    cache_dir: Path | str | None = None,
     embedding_model: str = "models/coderankembed-q8_0.gguf",
     embedding_n_ctx: int = 2048,
     host: str = "127.0.0.1",
@@ -89,9 +99,17 @@ def build_mcp(
     embedding_api_endpoint: str | None = None,
     embedding_api_model: str | None = None,
 ) -> FastMCP:
-    cache_dir = Path(cache_dir).resolve()
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    index_cache_dir = cache_dir
+    # When cache_dir is None, per-project SQLite indexes live at
+    # <project>/.ultimate_indexer (index_cache_dir=None) — matching the CLI so a
+    # project indexed via `ultimate-indexer index` is visible here.  The shared
+    # project registry then needs a stable home of its own.
+    if cache_dir is None:
+        index_cache_dir: Path | None = None
+        registry_dir = Path.home() / ".cache" / "ultimate_indexer"
+    else:
+        index_cache_dir = Path(cache_dir).resolve()
+        registry_dir = index_cache_dir
+    registry_dir.mkdir(parents=True, exist_ok=True)
     server = FastMCP(
         "scip-ultimate-indexer",
         log_level="WARNING",
@@ -117,7 +135,7 @@ def build_mcp(
         *,
         auto_refresh: bool = True,
     ) -> UltimateIndexer:
-        resolved_path = _resolve_project_path(cache_dir, project)
+        resolved_path = _resolve_project_path(registry_dir, project)
         backend = _backend_for_request(embedding_backend)
         cache_key = (str(resolved_path), backend)
         indexer = indexers.get(cache_key)
@@ -170,9 +188,18 @@ def build_mcp(
         hybrid: bool,
         embedding_backend: str,
         scope: str,
+        focus: list[str] | None = None,
     ) -> str:
         indexer = get_indexer(project, embedding_backend)
-        groups = indexer.query(query, limit=count, scope=scope)  # type: ignore[arg-type]
+        not_indexed = _not_indexed_message(indexer)
+        if not_indexed is not None:
+            return not_indexed
+        groups = indexer.query(
+            query,
+            limit=count,
+            scope=scope,  # type: ignore[arg-type]
+            focus_paths=tuple(focus or ()),
+        )
         if kind:
             normalized = _normalized_kind(kind)
             filtered_groups = []
@@ -236,11 +263,14 @@ def build_mcp(
         adding files or changing the embedding backend.
         """
         resolved_path = Path(project_path).expanduser().resolve()
-        _register_project(cache_dir, resolved_path)
+        _register_project(registry_dir, resolved_path)
         # auto_refresh=False: the explicit index() call below handles everything;
         # running refresh_if_stale first would redundantly scan files twice.
         indexer = get_indexer(str(resolved_path), embedding_backend, auto_refresh=False)
-        summary = indexer.index(force=force)
+        try:
+            summary = indexer.index(force=force)
+        except StructuredIndexingRequiredError as exc:
+            return exc.render_message()
         return (
             f"Indexed {summary.indexed_files} files, {summary.indexed_symbols} symbols, "
             f"{summary.indexed_edges} edges, {summary.indexed_chunks} chunks"
@@ -260,7 +290,7 @@ def build_mcp(
         parameter of other tools, or to check whether a project has been
         indexed yet.
         """
-        projects = _load_registry(cache_dir)
+        projects = _load_registry(registry_dir)
         if not projects:
             return "// No projects found. Use index_project first."
         lines = ["// Available projects:"]
@@ -276,6 +306,7 @@ def build_mcp(
         kind: str | None = None,
         hybrid: bool = True,
         embedding_backend: str = "auto",
+        focus: list[str] | None = None,
     ) -> str:
         """Search both code and documentation (legacy alias for ``search_all``).
 
@@ -311,6 +342,7 @@ def build_mcp(
             hybrid=hybrid,
             embedding_backend=embedding_backend,
             scope="all",
+            focus=focus,
         )
 
     @server.tool()
@@ -321,6 +353,7 @@ def build_mcp(
         kind: str | None = None,
         hybrid: bool = True,
         embedding_backend: str = "auto",
+        focus: list[str] | None = None,
     ) -> str:
         """Search only code symbols and source files (excludes documentation).
 
@@ -361,6 +394,7 @@ def build_mcp(
             hybrid=hybrid,
             embedding_backend=embedding_backend,
             scope="code",
+            focus=focus,
         )
 
     @server.tool()
@@ -371,6 +405,7 @@ def build_mcp(
         kind: str | None = None,
         hybrid: bool = True,
         embedding_backend: str = "auto",
+        focus: list[str] | None = None,
     ) -> str:
         """Search only documentation sources (Markdown, OpenAPI specs).
 
@@ -408,6 +443,7 @@ def build_mcp(
             hybrid=hybrid,
             embedding_backend=embedding_backend,
             scope="docs",
+            focus=focus,
         )
 
     @server.tool()
@@ -418,6 +454,7 @@ def build_mcp(
         kind: str | None = None,
         hybrid: bool = True,
         embedding_backend: str = "auto",
+        focus: list[str] | None = None,
     ) -> str:
         """Search code and documentation, then merge results with RRF ranking.
 
@@ -457,6 +494,7 @@ def build_mcp(
             hybrid=hybrid,
             embedding_backend=embedding_backend,
             scope="all",
+            focus=focus,
         )
 
     @server.tool()
@@ -495,6 +533,9 @@ def build_mcp(
         For a richer token-budget-aware view use ``get_context`` instead.
         """
         indexer = get_indexer(project, embedding_backend)
+        not_indexed = _not_indexed_message(indexer)
+        if not_indexed is not None:
+            return not_indexed
         rows = indexer.important_symbols(limit=count, kind_filter=kind)
         return format_important_symbols_codegraph(
             indexer.storage,
@@ -534,6 +575,9 @@ def build_mcp(
         list prefer ``get_important_symbols``.
         """
         indexer = get_indexer(project, embedding_backend)
+        not_indexed = _not_indexed_message(indexer)
+        if not_indexed is not None:
+            return not_indexed
         return indexer.project_overview(max_per_kind=max_per_kind)
 
     @server.tool()
@@ -722,6 +766,9 @@ def build_mcp(
         For targeted searches prefer ``search_code`` or ``search_all``.
         """
         indexer = get_indexer(project, embedding_backend)
+        not_indexed = _not_indexed_message(indexer)
+        if not_indexed is not None:
+            return not_indexed
         return format_context_window(
             indexer.storage,
             indexer.project_id,
@@ -737,7 +784,7 @@ def run_mcp(
     transport: str = "stdio",
     host: str = "127.0.0.1",
     port: int = 8000,
-    cache_dir: Path | str = ".scip_indexes",
+    cache_dir: Path | str | None = None,
     embedding_model: str = "models/coderankembed-q8_0.gguf",
     embedding_n_ctx: int = 2048,
     embedding_api_key: str | None = None,

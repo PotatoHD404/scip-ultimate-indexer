@@ -1,17 +1,47 @@
 from __future__ import annotations
 
 import json
+import os
 from collections import defaultdict
+from dataclasses import dataclass, field
 from hashlib import sha256
 from typing import Literal
 
 import numpy as np
 
+from . import hyde, reranker
+from .config import _env_bool, _env_float, _env_int
+from .model_providers import resolve_hyde_generator, resolve_rerank_provider
 from .embeddings import EmbeddingProvider, cosine_similarity, generate_query_embedding
 from .models import FileGroup, QueryChunkHit, RankedSymbol
 from .pagerank import weighted_pagerank
 from .ranking_rules import is_queryable_symbol
 from .storage import Storage
+
+
+@dataclass(slots=True)
+class QueryConfig:
+    """Query-time retrieval feature flags (Tier-1 search upgrades)."""
+
+    # HyDE: expand NL queries with a hypothetical code snippet before embedding.
+    enable_hyde: bool = field(default_factory=lambda: _env_bool("ULTIMATE_INDEXER_ENABLE_HYDE", True))
+    hyde_blend: float = field(default_factory=lambda: _env_float("ULTIMATE_INDEXER_HYDE_BLEND", 0.5))
+    # Two-stage rerank of fused candidates.
+    enable_reranker: bool = field(default_factory=lambda: _env_bool("ULTIMATE_INDEXER_ENABLE_RERANKER", True))
+    rerank_top_k: int = field(default_factory=lambda: _env_int("ULTIMATE_INDEXER_RERANK_TOP_K", 30))
+    rerank_blend: float = field(default_factory=lambda: _env_float("ULTIMATE_INDEXER_RERANK_BLEND", 0.5))
+    # Weight of git co-change neighbours when the caller supplies focus files.
+    cochange_weight: float = field(default_factory=lambda: _env_float("ULTIMATE_INDEXER_COCHANGE_WEIGHT", 0.5))
+    # Optional model-backed variants. When an endpoint+model is configured the
+    # cross-encoder rerank / LLM HyDE is used; otherwise the deterministic
+    # feature reranker / template HyDE is used (and any runtime error falls back).
+    rerank_endpoint: str | None = field(default_factory=lambda: os.getenv("ULTIMATE_INDEXER_RERANK_API_ENDPOINT"))
+    rerank_model: str | None = field(default_factory=lambda: os.getenv("ULTIMATE_INDEXER_RERANK_API_MODEL"))
+    rerank_api_key: str | None = field(default_factory=lambda: os.getenv("ULTIMATE_INDEXER_RERANK_API_KEY"))
+    hyde_endpoint: str | None = field(default_factory=lambda: os.getenv("ULTIMATE_INDEXER_HYDE_API_ENDPOINT"))
+    hyde_model: str | None = field(default_factory=lambda: os.getenv("ULTIMATE_INDEXER_HYDE_API_MODEL"))
+    hyde_api_key: str | None = field(default_factory=lambda: os.getenv("ULTIMATE_INDEXER_HYDE_API_KEY"))
+    hyde_max_tokens: int = field(default_factory=lambda: _env_int("ULTIMATE_INDEXER_HYDE_MAX_TOKENS", 256))
 
 DEPRECATED_KINDS = {
     "Variable",
@@ -63,7 +93,7 @@ KIND_BOOSTS = {
     "function": 1.0,
     "method": 1.0,
 }
-QUERY_CACHE_VERSION = 2
+QUERY_CACHE_VERSION = 3
 DOCUMENTATION_SOURCE_KIND = "documentation"
 SearchScope = Literal["all", "code", "docs"]
 
@@ -265,9 +295,26 @@ def dependency_ordered_pagerank(
 
 
 class QueryEngine:
-    def __init__(self, storage: Storage, provider: EmbeddingProvider) -> None:
+    def __init__(
+        self,
+        storage: Storage,
+        provider: EmbeddingProvider,
+        config: QueryConfig | None = None,
+    ) -> None:
         self.storage = storage
         self.provider = provider
+        self.config = config or QueryConfig()
+        self._rerank_provider = resolve_rerank_provider(
+            endpoint=self.config.rerank_endpoint,
+            model=self.config.rerank_model,
+            api_key=self.config.rerank_api_key,
+        )
+        self._hyde_generator = resolve_hyde_generator(
+            endpoint=self.config.hyde_endpoint,
+            model=self.config.hyde_model,
+            api_key=self.config.hyde_api_key,
+            max_tokens=self.config.hyde_max_tokens,
+        )
         self._vector_cache: dict[str, tuple[str | None, np.ndarray, list]] = {}
         self._function_metadata_cache: dict[str, tuple[str | None, np.ndarray, list]] = {}
         self._function_body_cache: dict[str, tuple[str | None, np.ndarray, list]] = {}
@@ -277,7 +324,7 @@ class QueryEngine:
         cached = self._vector_cache.get(project_id)
         if cached is not None and cached[0] == signature:
             return cached[1], cached[2]
-        matrix, rows = self.storage.load_chunk_vectors(project_id)
+        matrix, rows = self.storage.load_chunk_vectors(project_id, self.provider.model_id)
         self._vector_cache[project_id] = (signature, matrix, rows)
         return matrix, rows
 
@@ -287,7 +334,7 @@ class QueryEngine:
         cached = self._function_metadata_cache.get(project_id)
         if cached is not None and cached[0] == signature:
             return cached[1], cached[2]
-        matrix, rows = self.storage.load_function_metadata_vectors(project_id)
+        matrix, rows = self.storage.load_function_metadata_vectors(project_id, self.provider.model_id)
         self._function_metadata_cache[project_id] = (signature, matrix, rows)
         return matrix, rows
 
@@ -297,23 +344,61 @@ class QueryEngine:
         cached = self._function_body_cache.get(project_id)
         if cached is not None and cached[0] == signature:
             return cached[1], cached[2]
-        matrix, rows = self.storage.load_function_body_vectors(project_id)
+        matrix, rows = self.storage.load_function_body_vectors(project_id, self.provider.model_id)
         self._function_body_cache[project_id] = (signature, matrix, rows)
         return matrix, rows
 
-    def _query_vector(self, query: str) -> np.ndarray | None:
-        query_cache_key = f"query::{query}"
-        query_vector = self.storage.get_or_create_embedding(self.provider.model_id, query_cache_key)
-        if query_vector is not None:
-            return query_vector
+    def _embed_cached(self, cache_text: str, gen_text: str) -> np.ndarray | None:
+        vec = self.storage.get_or_create_embedding(self.provider.model_id, cache_text)
+        if vec is not None:
+            return vec
         try:
-            query_vector = generate_query_embedding(self.provider, query)
+            vec = generate_query_embedding(self.provider, gen_text)
         except Exception:
             # Keep retrieval usable when the preferred dense backend is missing at
             # query time. BM25 and cached hash/local results can still answer.
             return None
-        self.storage.store_embedding(self.provider.model_id, query_cache_key, query_vector)
-        return query_vector
+        self.storage.store_embedding(self.provider.model_id, cache_text, vec)
+        return vec
+
+    def _query_vector(self, query: str) -> np.ndarray | None:
+        base = self._embed_cached(f"query::{query}", query)
+        if base is None:
+            return None
+        # HyDE: for natural-language queries, blend in the embedding of a
+        # hypothetical code snippet so the query lands closer to real code.
+        if not (
+            self.config.enable_hyde
+            and self.config.hyde_blend > 0.0
+            and hyde.looks_like_natural_language(query)
+        ):
+            return base
+        hypo_text = self._hypothetical_text(query)
+        hypo = self._embed_cached(
+            f"hyde::{sha256(hypo_text.encode('utf-8')).hexdigest()}", hypo_text
+        )
+        if hypo is None or hypo.shape != base.shape:
+            return base
+        blend = min(max(self.config.hyde_blend, 0.0), 1.0)
+
+        def _unit(vec: np.ndarray) -> np.ndarray:
+            norm = float(np.linalg.norm(vec))
+            return vec / norm if norm > 0 else vec
+
+        combined = (1.0 - blend) * _unit(base) + blend * _unit(hypo)
+        return combined.astype(np.float32)
+
+    def _hypothetical_text(self, query: str) -> str:
+        """The HyDE hypothetical document: LLM-generated when configured, else a
+        deterministic template. Any generation error degrades to the template."""
+        if self._hyde_generator is not None:
+            try:
+                generated = self._hyde_generator.generate(query)
+            except Exception:
+                generated = ""
+            if generated.strip():
+                return generated
+        return hyde.hypothetical_code(query)
 
     def _function_metadata_dense_hits(
         self,
@@ -620,6 +705,104 @@ class QueryEngine:
             merged.append(group)
         return merged
 
+    def _apply_focus_personalization(
+        self,
+        project_id: str,
+        rankable_rows: dict[str, object],
+        seed_personalization: dict[str, float],
+        focus_paths: tuple[str, ...],
+    ) -> None:
+        """Add focus files (and their git co-change neighbours) to the PPR seeds."""
+        focus_set = set(focus_paths)
+        for symbol_id, row in rankable_rows.items():
+            if str(row["relative_path"]) in focus_set:
+                seed_personalization[symbol_id] = max(
+                    seed_personalization.get(symbol_id, 0.0), 1.0
+                )
+        neighbors = self.storage.get_cochange_neighbors(project_id, focus_paths)
+        if not neighbors:
+            return
+        weight_scale = max(self.config.cochange_weight, 0.0)
+        for symbol_id, row in rankable_rows.items():
+            coupling = neighbors.get(str(row["relative_path"]))
+            if coupling is None:
+                continue
+            value = coupling * weight_scale
+            if value > 0:
+                seed_personalization[symbol_id] = max(
+                    seed_personalization.get(symbol_id, 0.0), value
+                )
+
+    def _rerank(self, query: str, ranked: list[RankedSymbol]) -> list[RankedSymbol]:
+        # The cheap feature reranker scores every candidate; the model
+        # (cross-encoder) reranker is rate/cost-limited to the top-K and the rest
+        # is kept strictly below it.
+        use_model = self._rerank_provider is not None
+        if use_model:
+            cap = max(self.config.rerank_top_k, 1)
+            head, tail = ranked[:cap], ranked[cap:]
+        else:
+            head, tail = ranked, []
+        items = [
+            reranker.RerankItem(
+                id=symbol.symbol_id,
+                name=symbol.display_name,
+                signature=symbol.signature,
+                docstring=symbol.docstring,
+                snippet=symbol.snippet,
+                path=symbol.relative_path,
+                kind=symbol.kind,
+                stage1=symbol.score,
+            )
+            for symbol in head
+        ]
+        scores: dict[str, float] | None = None
+        if use_model:
+            scores = self._model_rerank_scores(query, head)
+        if scores is None:
+            scores = reranker.feature_scores(query, items)
+        order = reranker.combine(items, scores, blend=self.config.rerank_blend)
+        by_id = {symbol.symbol_id: symbol for symbol in head}
+        reranked: list[RankedSymbol] = []
+        for symbol_id, final in order:
+            symbol = by_id[symbol_id]
+            symbol.score = final
+            reranked.append(symbol)
+        if tail:
+            floor = min((symbol.score for symbol in reranked), default=0.0)
+            tail_max = max((symbol.score for symbol in tail), default=0.0)
+            if tail_max > 0.0 and floor > 0.0:
+                scale = (floor * 0.99) / tail_max
+                for symbol in tail:
+                    symbol.score *= scale
+        return reranked + tail
+
+    def _model_rerank_scores(
+        self, query: str, symbols: list[RankedSymbol]
+    ) -> dict[str, float] | None:
+        """Per-symbol rerank scores from the cross-encoder, min-max normalised to
+        [0,1]; ``None`` on any error so the feature reranker takes over."""
+        if self._rerank_provider is None or not symbols:
+            return None
+        documents = [self._rerank_document_text(symbol) for symbol in symbols]
+        try:
+            raw = self._rerank_provider.score(query, documents)
+        except Exception:
+            return None
+        if len(raw) != len(symbols):
+            return None
+        lo, hi = min(raw), max(raw)
+        span = hi - lo
+        return {
+            symbol.symbol_id: ((value - lo) / span if span > 0 else 1.0)
+            for symbol, value in zip(symbols, raw)
+        }
+
+    @staticmethod
+    def _rerank_document_text(symbol: RankedSymbol) -> str:
+        parts = [symbol.display_name, symbol.signature, symbol.docstring, symbol.snippet]
+        return "\n".join(part for part in parts if part)[:2000]
+
     def _search_uncached(
         self,
         project_id: str,
@@ -627,6 +810,7 @@ class QueryEngine:
         limit: int,
         *,
         scope: SearchScope,
+        focus_paths: tuple[str, ...] = (),
     ) -> list[FileGroup]:
         if scope == "all":
             scope_limit = max(limit * 2, 10)
@@ -635,12 +819,14 @@ class QueryEngine:
                 query,
                 scope_limit,
                 scope="code",
+                focus_paths=focus_paths,
             )
             docs_results = self._search_uncached(
                 project_id,
                 query,
                 scope_limit,
                 scope="docs",
+                focus_paths=focus_paths,
             )
             return self._merge_scope_groups(code_results, docs_results, limit=limit)
 
@@ -758,6 +944,12 @@ class QueryEngine:
             for symbol_id, score in normalized_scores.items()
             if score >= threshold
         }
+        # Context-personalized ranking: bias toward the caller's focus files and
+        # the files that historically co-change with them (git coupling).
+        if focus_paths:
+            self._apply_focus_personalization(
+                project_id, rankable_rows, seed_personalization, focus_paths
+            )
         if seed_personalization:
             ppr_scores = dependency_ordered_pagerank(
                 symbol_rows,
@@ -804,6 +996,12 @@ class QueryEngine:
                     )
                 )
 
+        # Two-stage rerank: re-score the fused candidates against the query with a
+        # feature reranker and blend with the first-stage score. Promotes exact
+        # name/signature matches the noisy first stage may have buried.
+        if self.config.enable_reranker and len(ranked) > 1 and query.strip():
+            ranked = self._rerank(query, ranked)
+
         grouped: dict[str, FileGroup] = {}
         for symbol in ranked:
             group = grouped.setdefault(
@@ -833,14 +1031,16 @@ class QueryEngine:
         limit: int = 10,
         *,
         scope: SearchScope = "all",
+        focus_paths: tuple[str, ...] = (),
     ) -> list[FileGroup]:
         signature = self.storage.get_project_signature(project_id) or ""
+        focus_key = ",".join(sorted(focus_paths))
         query_hash = sha256(
-            f"{QUERY_CACHE_VERSION}:{signature}:{self.provider.model_id}:{scope}:{query}:{limit}".encode("utf-8")
+            f"{QUERY_CACHE_VERSION}:{signature}:{self.provider.model_id}:{scope}:{query}:{limit}:{focus_key}".encode("utf-8")
         ).hexdigest()
         cached = self.storage.get_query_cache(project_id, query_hash)
         if cached is not None:
             return self._deserialize_groups(cached)
-        results = self._search_uncached(project_id, query, limit, scope=scope)
+        results = self._search_uncached(project_id, query, limit, scope=scope, focus_paths=focus_paths)
         self.storage.store_query_cache(project_id, query_hash, self._serialize_groups(results))
         return results

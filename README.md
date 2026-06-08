@@ -42,7 +42,7 @@ No Hugging Face download path is used anymore.
 - the first choice is `ULTIMATE_INDEXER_MODEL_PATH` when set
 - otherwise the indexer looks in `models/` and `graph-indexer/models/`
 - the default committed filename is `coderankembed-q8_0.gguf`
-- `auto` falls back to the deterministic `hash` backend only when no local GGUF model is available
+- `auto` falls back to the deterministic `hash` backend when no local GGUF model is available **or** the `llama-cpp-python` runtime is not installed, so indexing and querying work with zero setup
 
 Ranking and query scoring exclude low-signal generated artifacts such as `.next` outputs, protobuf-generated `proto/*` code, `*.pb.go`, and `*_pb2.*` files. Those files are still stored for inspection, but they no longer dominate `top-symbols` or semantic query results.
 
@@ -74,7 +74,7 @@ The built-in SCIP runner supports the same external toolchain family that CodeGr
 ## What gets indexed
 
 - local source files through a SCIP ingestion path
-- built-in zero-config Python SCIP emission when no external `.scip` index is provided
+- built-in zero-config Python SCIP emission when no external `.scip` index is provided — this is also used automatically when `scip-python` is missing or fails at runtime, so Python projects get function/class/method symbols with no Node toolchain
 - automatic external SCIP ingestion for detected languages when `scip-<lang>` tools are available
 - broad SocratiCode-style file discovery for JavaScript, TypeScript, TSX, Python, Java, Kotlin, Scala, C, C++, C#, Go, Rust, Ruby, PHP, Swift, Bash, HTML/CSS, Vue, Svelte, config files, docs, SQL, Dart, Lua, R, Elixir, Haskell, Perl, and special files like `Dockerfile` and `Makefile`
 - line and minified-content fallback chunking for non-SCIP files so unsupported languages stay searchable
@@ -113,6 +113,56 @@ Query ranking and `top-symbols` now follow the graph-indexer pattern more closel
 - `top-symbols` uses dependency-ordered PageRank plus symbol-kind boosts
 - `query` uses lexical and semantic seeds, then expands with query-relative dependency ordering
 - config/docs artifacts keep qualified keys, parent headings, and attribution in their indexed text
+
+## Search quality upgrades
+
+Retrieval combines several signals beyond hybrid BM25 + embeddings. All are on by
+default and degrade gracefully (no models or git required):
+
+- **Built-in zero-config Python SCIP.** Python projects get real Function/Method/Class
+  symbols and call edges even when the external `scip-python` (Node) tool is missing or
+  broken — the in-tree emitter is used as a fallback.
+- **Vocabulary expansion** (doc2query / SPLADE-lite). Identifiers are split and common
+  abbreviations bridged (e.g. a query for `authentication` matches `authnHandler`, `svc`
+  matches `GreetingService`). Indexed into the lexical FTS only — never displayed.
+  Toggle: `ULTIMATE_INDEXER_ENABLE_EXPANSION`.
+- **Contextual embeddings.** Each chunk is embedded with a small structural context
+  header (file, enclosing class/module, purpose) prepended — kept out of the BM25 text.
+  Toggle: `ULTIMATE_INDEXER_ENABLE_CONTEXTUAL`.
+- **HyDE** for natural-language queries. A hypothetical code snippet is generated from the
+  query and blended into the dense query vector so NL questions land closer to real code.
+  Toggle/tune: `ULTIMATE_INDEXER_ENABLE_HYDE`, `ULTIMATE_INDEXER_HYDE_BLEND` (default 0.5).
+- **Two-stage reranking.** The fused candidate set is re-scored against the query (exact
+  name/signature matches, term coverage) and blended with the first-stage score.
+  Toggle/tune: `ULTIMATE_INDEXER_ENABLE_RERANKER`, `ULTIMATE_INDEXER_RERANK_BLEND`,
+  `ULTIMATE_INDEXER_RERANK_TOP_K`.
+- **Git history signals.** Recency and churn lift a file's symbols' global rank, and
+  files that co-change in history couple together. Toggle/tune:
+  `ULTIMATE_INDEXER_ENABLE_GIT_SIGNALS`, `ULTIMATE_INDEXER_GIT_SIGNAL_STRENGTH`,
+  `ULTIMATE_INDEXER_GIT_HALF_LIFE_DAYS`, `ULTIMATE_INDEXER_GIT_HISTORY_LIMIT`.
+- **Context-personalized ranking.** Pass `--focus <file>` (repeatable) to `query`, or the
+  `focus` argument to the MCP `search_*` tools, to bias results toward the files you are
+  working in and the files that historically co-change with them.
+  Tune: `ULTIMATE_INDEXER_COCHANGE_WEIGHT`.
+
+HyDE and the reranker default to fast deterministic implementations, but can be
+upgraded to **model-backed variants** by pointing them at any OpenAI /
+`llama.cpp`-server-compatible HTTP endpoint (they fall back automatically on any
+error, so this is purely additive):
+
+- LLM-generated HyDE via chat completions —
+  `ULTIMATE_INDEXER_HYDE_API_ENDPOINT`, `ULTIMATE_INDEXER_HYDE_API_MODEL`,
+  optional `ULTIMATE_INDEXER_HYDE_API_KEY` / `ULTIMATE_INDEXER_HYDE_MAX_TOKENS`.
+- Cross-encoder reranker via a `/v1/rerank` endpoint (llama.cpp server, TEI,
+  infinity, Jina, Cohere) — `ULTIMATE_INDEXER_RERANK_API_ENDPOINT`,
+  `ULTIMATE_INDEXER_RERANK_API_MODEL`, optional `ULTIMATE_INDEXER_RERANK_API_KEY`.
+
+```bash
+poetry run ultimate-indexer query /path/to/project "how is auth handled?" --focus src/auth/login.py
+```
+
+Run `python scripts/smoke_test.py` for an end-to-end check of the whole pipeline
+(uses the deterministic `hash` backend; no model download).
 
 ## Notes on coverage
 

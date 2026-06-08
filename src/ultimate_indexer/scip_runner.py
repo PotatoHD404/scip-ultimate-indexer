@@ -8,6 +8,7 @@ from hashlib import sha256
 from pathlib import Path
 
 from .constants import SCIP_EXTENSION_MAP, SCIP_RUN_ORDER
+from .python_scip import emit_python_scip
 
 
 def _normalize_scip_language(language: str) -> str:
@@ -199,6 +200,30 @@ def _output_file_for_root(cache_dir: Path, language: str, invocation_root: Path,
     return cache_dir / f"{language}-{suffix}.scip"
 
 
+def _emit_builtin_python_scip(
+    project_root: Path, files: list[Path], cache_dir: Path
+) -> ScipRunResult | None:
+    """Produce a SCIP index for Python using the in-tree emitter (no external tool).
+
+    Returns ``None`` when there is nothing to emit or emission fails, so callers
+    can degrade to generic non-SCIP coverage.
+    """
+    python_files = _files_for_language(files, "python")
+    if not python_files:
+        return None
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        output_file = cache_dir / "python-builtin.scip"
+        emit_python_scip(project_root.resolve(), python_files, output_file)
+    except Exception:
+        return None
+    if not output_file.exists():
+        return None
+    return ScipRunResult(
+        language="python", index_path=output_file, source_root=project_root.resolve()
+    )
+
+
 def run_scip_indexers(
     project_root: Path,
     files: list[Path],
@@ -216,6 +241,10 @@ def run_scip_indexers(
             continue
         binary = shutil.which(requirement.binary_name)
         if binary is None:
+            # Python has an in-tree emitter, so a missing external tool is not
+            # fatal — it is handled in the run loop below.
+            if language == "python":
+                continue
             missing.append(requirement)
             continue
         available_binaries[language] = (requirement, binary)
@@ -225,11 +254,16 @@ def run_scip_indexers(
     for language in detected_languages:
         available = available_binaries.get(language)
         if available is None:
+            if language == "python":
+                builtin = _emit_builtin_python_scip(project_root, files, cache_dir)
+                if builtin is not None:
+                    results.append(builtin)
             continue
         requirement, binary = available
         invocation_roots = _group_invocation_roots(project_root, language, files)
         if not invocation_roots:
             continue
+        language_succeeded = False
         for invocation_root in invocation_roots:
             output_file = _output_file_for_root(cache_dir, language, invocation_root, project_root)
             command = _language_command(language, binary, output_file)
@@ -269,4 +303,12 @@ def run_scip_indexers(
                 )
                 continue
             results.append(ScipRunResult(language=language, index_path=output_file, source_root=invocation_root))
+            language_succeeded = True
+        # External scip-python was present but produced no usable index (e.g. a
+        # broken runtime). Fall back to the in-tree emitter so Python projects
+        # still get function/class symbols rather than coarse fallback coverage.
+        if language == "python" and not language_succeeded:
+            builtin = _emit_builtin_python_scip(project_root, files, cache_dir)
+            if builtin is not None:
+                results.append(builtin)
     return ScipRunReport(results=results, missing=missing, failed=failed)

@@ -311,10 +311,19 @@ def emit_python_scip(project_root: Path, files: list[Path], output_path: Path) -
     module_index: dict[str, dict[str, str]] = defaultdict(dict)
     global_symbols: dict[str, DefinitionDescriptor] = {}
 
+    # Parse each file once, skipping anything we cannot read or parse (e.g.
+    # notebooks, files with syntax errors, paths outside the project root).
+    # Those fall through to generic non-SCIP coverage instead of aborting the
+    # whole built-in emission.
+    parsed_sources: list[tuple[str, str, ast.AST]] = []
     for path in files:
-        relative_path = str(path.relative_to(project_root))
-        source = path.read_text(encoding="utf-8")
-        tree = ast.parse(source, filename=relative_path)
+        try:
+            relative_path = str(path.relative_to(project_root))
+            source = path.read_text(encoding="utf-8")
+            tree = ast.parse(source, filename=relative_path)
+        except (OSError, ValueError, SyntaxError, UnicodeDecodeError):
+            continue
+        parsed_sources.append((relative_path, source, tree))
         collector = DefinitionCollector(relative_path)
         collector.visit(tree)
         definitions_by_file[relative_path] = collector.definitions
@@ -329,10 +338,7 @@ def emit_python_scip(project_root: Path, files: list[Path], output_path: Path) -
     index.metadata.tool_info.name = "ultimate-indexer"
     index.metadata.tool_info.version = "0.1.0"
 
-    for path in files:
-        relative_path = str(path.relative_to(project_root))
-        source = path.read_text(encoding="utf-8")
-        tree = ast.parse(source, filename=relative_path)
+    for relative_path, source, tree in parsed_sources:
         document = index.documents.add()
         document.language = "python"
         document.relative_path = relative_path

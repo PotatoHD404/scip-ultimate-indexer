@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import re
@@ -35,6 +36,9 @@ from .socraticode import ingest_socraticode_artifacts
 from .storage import Storage
 from .visuals import write_query_visualization
 from .docs.ingest import _discover_document_files, ingest_documentation
+from .expansions import expansion_text
+from .contextual import build_context_header, contextual_embedding_text, first_doc_line
+from . import git_signals as git_signals_module
 
 
 INDEX_STAGES = (
@@ -48,7 +52,7 @@ INDEX_STAGES = (
     "store",
     "pagerank",
 )
-INDEX_FORMAT_VERSION = 6
+INDEX_FORMAT_VERSION = 7
 
 
 def _discover_code_files(project_root: Path, extra_extensions: set[str]) -> list[Path]:
@@ -94,26 +98,35 @@ def _project_signature(
     extra_extensions: set[str],
     max_chunk_lines: int,
     chunk_overlap: int,
-) -> str:
-    payload: list[str] = []
+) -> tuple[str, str]:
+    """Return (full_signature, config_signature).
+
+    The full signature mixes per-file mtime/size with the config; it decides
+    whether anything changed at all. The config signature covers only the
+    non-file inputs (embedding backend/model, index format version, chunk params,
+    ignore settings) so a config/format change forces a full rebuild even when no
+    file content changed (otherwise stale-format or stale-model rows survive).
+    """
+    file_payload: list[str] = []
     for path in code_files:
         relative = path.relative_to(project_root)
-        payload.append(f"{relative}:{path.stat().st_mtime_ns}:{path.stat().st_size}")
+        file_payload.append(f"{relative}:{path.stat().st_mtime_ns}:{path.stat().st_size}")
     for path in doc_files:
         relative = path.relative_to(project_root)
-        payload.append(f"doc::{relative}:{path.stat().st_mtime_ns}:{path.stat().st_size}")
-    payload.append(f"embedding-backend:{embedding_backend}")
-    payload.append(f"index-format-version:{INDEX_FORMAT_VERSION}")
-    payload.append(f"model-path:{model_path or ''}")
-    payload.append(f"model-file:{model_filename}")
-    payload.append(f"embedding-api-endpoint:{embedding_api_endpoint or ''}")
-    payload.append(f"embedding-api-model:{embedding_api_model or ''}")
-    payload.append(f"extra-extensions:{','.join(sorted(extra_extensions))}")
-    payload.append(f"respect-gitignore:{os.getenv('RESPECT_GITIGNORE', 'true')}")
-    payload.append(f"ignore-dirs:{os.getenv('IGNORE_DIRS', '')}")
-    payload.append(f"scip-languages:{os.getenv('SCIP_LANGUAGES', '')}")
-    payload.append(f"max-chunk-lines:{max_chunk_lines}")
-    payload.append(f"chunk-overlap:{chunk_overlap}")
+        file_payload.append(f"doc::{relative}:{path.stat().st_mtime_ns}:{path.stat().st_size}")
+    config_payload: list[str] = []
+    config_payload.append(f"embedding-backend:{embedding_backend}")
+    config_payload.append(f"index-format-version:{INDEX_FORMAT_VERSION}")
+    config_payload.append(f"model-path:{model_path or ''}")
+    config_payload.append(f"model-file:{model_filename}")
+    config_payload.append(f"embedding-api-endpoint:{embedding_api_endpoint or ''}")
+    config_payload.append(f"embedding-api-model:{embedding_api_model or ''}")
+    config_payload.append(f"extra-extensions:{','.join(sorted(extra_extensions))}")
+    config_payload.append(f"respect-gitignore:{os.getenv('RESPECT_GITIGNORE', 'true')}")
+    config_payload.append(f"ignore-dirs:{os.getenv('IGNORE_DIRS', '')}")
+    config_payload.append(f"scip-languages:{os.getenv('SCIP_LANGUAGES', '')}")
+    config_payload.append(f"max-chunk-lines:{max_chunk_lines}")
+    config_payload.append(f"chunk-overlap:{chunk_overlap}")
     for special_name in (
         ".socraticodecontextartifacts.json",
         ".gitignore",
@@ -122,8 +135,10 @@ def _project_signature(
     ):
         candidate = project_root / special_name
         if candidate.exists():
-            payload.append(f"{special_name}:{candidate.stat().st_mtime_ns}:{candidate.stat().st_size}")
-    return sha256("\n".join(payload).encode("utf-8")).hexdigest()
+            config_payload.append(f"{special_name}:{candidate.stat().st_mtime_ns}:{candidate.stat().st_size}")
+    config_signature = sha256("\n".join(config_payload).encode("utf-8")).hexdigest()
+    full_signature = sha256("\n".join(file_payload + config_payload).encode("utf-8")).hexdigest()
+    return full_signature, config_signature
 
 
 def _overview_chunk(project_id: str, file_symbol: SymbolRecord, symbols: list[SymbolRecord]) -> ChunkRecord:
@@ -158,6 +173,8 @@ def _render_scip_warning(failure: ScipRunFailure, project_root: Path) -> str:
     except ValueError:
         rel_root = failure.working_directory
     detail = " ".join(failure.detail.split())
+    if len(detail) > 240:
+        detail = detail[:240].rstrip() + " […]"
     return f"{failure.language} at {rel_root}: {detail}"
 
 
@@ -320,6 +337,8 @@ class UltimateIndexer:
         self._query_engine: QueryEngine | None = None
         # Timestamp of the last file-staleness check; 0.0 = never checked.
         self._last_stale_check: float = 0.0
+        # Git-history signals from the most recent index (recency/churn/co-change).
+        self._git_signals: git_signals_module.GitSignals | None = None
 
     def close(self) -> None:
         self.storage.close()
@@ -344,6 +363,22 @@ class UltimateIndexer:
                 retry_base_delay_ms=self.settings.embedding_api_retry_base_delay_ms,
             )
             return self._provider
+        # llama-cpp path. The native provider imports ``llama_cpp`` lazily at
+        # embed time, so a present-but-unusable model file (e.g. a cached .gguf
+        # with the runtime uninstalled) would otherwise crash mid-index. Verify
+        # importability up front: degrade "auto" to hash, but fail loudly when
+        # the backend was explicitly requested.
+        explicit_llama = backend in {"llama-cpp", "local"}
+        if importlib.util.find_spec("llama_cpp") is None:
+            if explicit_llama:
+                raise RuntimeError(
+                    f"Embedding backend {backend!r} requires the 'llama-cpp-python' "
+                    "package, which is not installed. Install it, or select another "
+                    "backend (ULTIMATE_INDEXER_EMBEDDING_BACKEND=hash, or configure an "
+                    "embedding API)."
+                )
+            self._provider = HashEmbeddingProvider()
+            return self._provider
         try:
             self._provider = resolve_llama_cpp_provider(
                 project_root=self.settings.project_root,
@@ -353,7 +388,7 @@ class UltimateIndexer:
             )
             return self._provider
         except Exception:
-            if backend in {"llama-cpp", "local"}:
+            if explicit_llama:
                 raise
             self._provider = HashEmbeddingProvider()
             return self._provider
@@ -415,7 +450,11 @@ class UltimateIndexer:
                 chunk.embedding_model_id = provider.model_id
                 cached_count += 1
                 continue
-            embedding_text = _provider_prepare_document_text(provider, chunk.content, chunk.relative_path)
+            embedding_text = _provider_prepare_document_text(
+                provider,
+                contextual_embedding_text(chunk.content, chunk.context_header),
+                chunk.relative_path,
+            )
             cached = self.storage.get_or_create_embedding(provider.model_id, embedding_text)
             if cached is not None:
                 chunk.embedding = cached.astype("float32").tobytes()
@@ -482,8 +521,25 @@ class UltimateIndexer:
             self.storage.get_edges(self.project_id),
             alpha=0.85,
         )
+        signals = getattr(self, "_git_signals", None)
+        strength = self.settings.git_signal_strength if self.settings.enable_git_signals else 0.0
+
+        def _git_multiplier(symbol_id: str) -> float:
+            # Recently-changed / frequently-churned code is more likely to matter;
+            # lift its rank by up to `strength` (1.0 = no change).
+            if signals is None or strength <= 0:
+                return 1.0
+            relpath = str(symbol_rows[symbol_id]["relative_path"])
+            boost = git_signals_module.recency_churn_boost(
+                signals,
+                relpath,
+                recency_weight=self.settings.git_recency_weight,
+                churn_weight=self.settings.git_churn_weight,
+            )
+            return 1.0 + strength * boost
+
         boosted = {
-            symbol_id: apply_kind_boost(symbol_rows[symbol_id], score)
+            symbol_id: apply_kind_boost(symbol_rows[symbol_id], score) * _git_multiplier(symbol_id)
             for symbol_id, score in ranks.items()
             if symbol_id in symbol_rows
         }
@@ -546,7 +602,7 @@ class UltimateIndexer:
             unit="files",
             detail="Discovered indexable files",
         )
-        signature = _project_signature(
+        signature, config_signature = _project_signature(
             code_files,
             doc_files_for_signature,
             self.settings.project_root,
@@ -749,6 +805,21 @@ class UltimateIndexer:
                     symbol_lookup=symbol_lookup,
                     children_by_symbol_id=children_by_symbol_id,
                 )
+                context_header = ""
+                if self.settings.enable_contextual_embeddings:
+                    enclosing = symbol_lookup.get(symbol.enclosing_symbol_id or "")
+                    context_header = build_context_header(
+                        relative_path=symbol.relative_path,
+                        kind=symbol.kind,
+                        enclosing_name=enclosing.display_name if enclosing is not None else "",
+                        purpose=first_doc_line(symbol.docstring),
+                    )
+                # Fold the context header into content_hash so a contextual-setting
+                # change re-embeds (the embedding text now differs even though the
+                # raw code content does not).
+                content_hash = sha256(
+                    (chunk_content + "\x00" + context_header).encode("utf-8")
+                ).hexdigest()
                 chunks.append(
                     ChunkRecord(
                         project_id=self.project_id,
@@ -763,7 +834,8 @@ class UltimateIndexer:
                         start_line=symbol.start_line,
                         end_line=symbol.end_line,
                         content=chunk_content,
-                        content_hash=sha256(chunk_content.encode("utf-8")).hexdigest(),
+                        content_hash=content_hash,
+                        context_header=context_header,
                     )
                 )
 
@@ -863,27 +935,72 @@ class UltimateIndexer:
         
         if all_function_docs:
             self._emit_progress(progress_callback, stage="embed", detail="Embedding function documents")
-            doc_texts = [doc.metadata_content if isinstance(doc, FunctionMetadataRecord) else doc.content
-                        for _, doc in all_function_docs]
             provider = self._provider_instance()
-            
-            # Generate embeddings in batches
-            vectors = generate_embeddings(provider, doc_texts)
-            
-            for i, (doc_type, doc) in enumerate(all_function_docs):
-                vec = vectors[i]
-                doc.embedding = vec.astype("float32").tobytes()
-                doc.embedding_dim = int(vec.shape[0])
-                doc.embedding_model_id = provider.model_id
-            
+
+            # Reuse cached vectors (keyed on model + embedded text) so re-indexing
+            # only embeds new/changed function docs instead of every function in
+            # the repo on every run. The embedded text is unchanged (raw
+            # metadata/body content) so retrieval behavior is identical.
+            pending_indices: list[int] = []
+            pending_texts: list[str] = []
+            reused_count = 0
+            for i, (_doc_type, doc) in enumerate(all_function_docs):
+                source_text = doc.metadata_content if isinstance(doc, FunctionMetadataRecord) else doc.content
+                if self.settings.enable_contextual_embeddings:
+                    if isinstance(doc, FunctionMetadataRecord):
+                        header = build_context_header(
+                            relative_path=doc.relative_path,
+                            kind=doc.kind,
+                            enclosing_name=doc.fully_qualified_name.rsplit(".", 1)[0],
+                            purpose=first_doc_line(doc.docstring),
+                        )
+                    else:
+                        header = build_context_header(
+                            relative_path=doc.relative_path,
+                            kind=doc.kind,
+                            enclosing_name=doc.display_name,
+                        )
+                    source_text = contextual_embedding_text(source_text, header)
+                cached = self.storage.get_or_create_embedding(provider.model_id, source_text)
+                if cached is not None:
+                    doc.embedding = cached.astype("float32").tobytes()
+                    doc.embedding_dim = int(cached.shape[0])
+                    doc.embedding_model_id = provider.model_id
+                    reused_count += 1
+                    continue
+                pending_indices.append(i)
+                pending_texts.append(source_text)
+
+            if pending_texts:
+                vectors = generate_embeddings(provider, pending_texts)
+                for list_index, vector in enumerate(vectors):
+                    _doc_type, doc = all_function_docs[pending_indices[list_index]]
+                    self.storage.store_embedding(provider.model_id, pending_texts[list_index], vector)
+                    doc.embedding = vector.astype("float32").tobytes()
+                    doc.embedding_dim = int(vector.shape[0])
+                    doc.embedding_model_id = provider.model_id
+
             self._emit_progress(
                 progress_callback,
                 stage="embed",
                 completed=len(all_function_docs),
                 total=len(all_function_docs),
                 unit="function_docs",
-                detail="Embedded function documents",
+                detail=f"Embedded function documents (reused {reused_count} cached)",
             )
+
+        # Vocabulary expansion: bridge code<->query terms for the lexical index
+        # (e.g. a query for "authentication" matching a symbol named authnHandler).
+        # Indexed into FTS only; never displayed.
+        if self.settings.enable_query_expansion:
+            for chunk in chunks:
+                chunk.fts_expansion = expansion_text(chunk.symbol_name, path=chunk.relative_path)
+            for meta_record in function_metadata_records:
+                meta_record.fts_expansion = expansion_text(
+                    meta_record.display_name,
+                    signature=meta_record.signature,
+                    path=meta_record.relative_path,
+                )
 
         self._embed_chunks(chunks, symbol_lookup, progress_callback=progress_callback)
         self._emit_progress(progress_callback, stage="store", detail="Writing index to SQLite")
@@ -895,6 +1012,15 @@ class UltimateIndexer:
             if existing_file_hashes.get(relative_path) != content_hash
         }
         removed_paths = set(existing_file_hashes) - set(indexed_file_hashes)
+        # A config/format change (embedding backend/model, INDEX_FORMAT_VERSION,
+        # chunk params, ignore settings) must trigger a FULL rebuild even when no
+        # file content changed; otherwise unchanged files keep stale-format or
+        # stale-model rows (which the model-id-filtered dense loaders then drop).
+        if (
+            existing_file_hashes
+            and self.storage.get_project_config_signature(self.project_id) != config_signature
+        ):
+            force = True
         if not force and existing_file_hashes:
             self._emit_progress(
                 progress_callback,
@@ -929,7 +1055,7 @@ class UltimateIndexer:
                 removed_paths=removed_paths,
             )
             reused_files = max(len(indexed_file_hashes) - len(changed_paths), 0)
-        self.storage.upsert_project(self.project_id, self.project_id, signature)
+        self.storage.upsert_project(self.project_id, self.project_id, signature, config_signature)
         self._emit_progress(
             progress_callback,
             stage="store",
@@ -938,6 +1064,26 @@ class UltimateIndexer:
             unit="projects",
             detail="Stored indexed data",
         )
+        # Git-history signals: recency/churn lift importance (folded into global
+        # ranks), and co-change couples files for context-personalized ranking.
+        # collect_git_signals never raises — it degrades to empty off a git repo.
+        self._git_signals = git_signals_module.GitSignals.empty()
+        if self.settings.enable_git_signals:
+            self._git_signals = git_signals_module.collect_git_signals(
+                self.settings.project_root,
+                history_limit=self.settings.git_history_limit,
+                half_life_days=self.settings.git_half_life_days,
+            )
+            indexed_paths = {record.relative_path for record in files}
+            cochange = {
+                pair: weight
+                for pair, weight in self._git_signals.cochange.items()
+                if pair[0] in indexed_paths and pair[1] in indexed_paths
+            }
+            self.storage.replace_cochange(self.project_id, cochange)
+        else:
+            self.storage.replace_cochange(self.project_id, {})
+
         self._emit_progress(progress_callback, stage="pagerank", detail="Computing global ranks")
         self._global_ranks()
         self._emit_progress(
@@ -960,10 +1106,19 @@ class UltimateIndexer:
             warnings=scip_warnings,
         )
 
-    def query(self, text: str, limit: int = 10, *, scope: SearchScope = "all"):
+    def query(
+        self,
+        text: str,
+        limit: int = 10,
+        *,
+        scope: SearchScope = "all",
+        focus_paths: tuple[str, ...] = (),
+    ):
         if self._query_engine is None:
             self._query_engine = QueryEngine(self.storage, self._provider_instance())
-        return self._query_engine.search(self.project_id, text, limit=limit, scope=scope)
+        return self._query_engine.search(
+            self.project_id, text, limit=limit, scope=scope, focus_paths=focus_paths
+        )
 
     def top_symbols(self, limit: int = 10):
         return self.storage.get_top_symbols(self.project_id, limit)

@@ -7,6 +7,37 @@ from pathlib import Path
 from .constants import parse_extra_extensions
 
 
+def _env_int(name: str, default: int) -> int:
+    """Parse an int env var, falling back to *default* on missing/garbage values.
+
+    A malformed numeric env var must not crash every CLI invocation.
+    """
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw.strip())
+    except ValueError:
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 DEFAULT_EDGE_WEIGHTS = {
     "contains": 0.55,
     "calls": 1.0,
@@ -69,19 +100,19 @@ class Settings:
         default_factory=lambda: os.getenv("ULTIMATE_INDEXER_EMBEDDING_API_MODEL")
     )
     embedding_api_max_tokens: int | None = field(
-        default_factory=lambda: int(os.getenv("ULTIMATE_INDEXER_EMBEDDING_API_MAX_TOKENS", "0")) or None
+        default_factory=lambda: _env_int("ULTIMATE_INDEXER_EMBEDDING_API_MAX_TOKENS", 0) or None
     )
     embedding_api_batch_size: int = field(
-        default_factory=lambda: int(os.getenv("ULTIMATE_INDEXER_EMBEDDING_API_BATCH_SIZE", "32"))
+        default_factory=lambda: _env_int("ULTIMATE_INDEXER_EMBEDDING_API_BATCH_SIZE", 32)
     )
     embedding_api_timeout_seconds: float = field(
-        default_factory=lambda: float(os.getenv("ULTIMATE_INDEXER_EMBEDDING_API_TIMEOUT_SECONDS", "30.0"))
+        default_factory=lambda: _env_float("ULTIMATE_INDEXER_EMBEDDING_API_TIMEOUT_SECONDS", 30.0)
     )
     embedding_api_max_retries: int = field(
-        default_factory=lambda: int(os.getenv("ULTIMATE_INDEXER_EMBEDDING_API_MAX_RETRIES", "3"))
+        default_factory=lambda: _env_int("ULTIMATE_INDEXER_EMBEDDING_API_MAX_RETRIES", 3)
     )
     embedding_api_retry_base_delay_ms: int = field(
-        default_factory=lambda: int(os.getenv("ULTIMATE_INDEXER_EMBEDDING_API_RETRY_BASE_DELAY_MS", "500"))
+        default_factory=lambda: _env_int("ULTIMATE_INDEXER_EMBEDDING_API_RETRY_BASE_DELAY_MS", 500)
     )
     edge_weights: dict[str, float] = field(default_factory=lambda: DEFAULT_EDGE_WEIGHTS.copy())
     max_chunk_lines: int = 120
@@ -89,6 +120,39 @@ class Settings:
     query_cache_ttl_seconds: int = 60 * 60
     extra_extensions: set[str] = field(
         default_factory=lambda: parse_extra_extensions(os.getenv("EXTRA_EXTENSIONS"))
+    )
+    # --- Retrieval / ranking upgrades (index-time) ---
+    # Code<->query vocabulary expansion folded into the lexical (BM25) index.
+    enable_query_expansion: bool = field(
+        default_factory=lambda: _env_bool("ULTIMATE_INDEXER_ENABLE_EXPANSION", True)
+    )
+    # Structural context prepended to dense embedding text (kept out of BM25).
+    enable_contextual_embeddings: bool = field(
+        default_factory=lambda: _env_bool("ULTIMATE_INDEXER_ENABLE_CONTEXTUAL", True)
+    )
+    # Git-history importance signals (recency/churn) and co-change coupling.
+    enable_git_signals: bool = field(
+        default_factory=lambda: _env_bool("ULTIMATE_INDEXER_ENABLE_GIT_SIGNALS", True)
+    )
+    git_history_limit: int = field(
+        default_factory=lambda: _env_int("ULTIMATE_INDEXER_GIT_HISTORY_LIMIT", 2000)
+    )
+    git_half_life_days: float = field(
+        default_factory=lambda: _env_float("ULTIMATE_INDEXER_GIT_HALF_LIFE_DAYS", 90.0)
+    )
+    # How strongly recency/churn lift a file's symbols' global rank (0 = off).
+    git_signal_strength: float = field(
+        default_factory=lambda: _env_float("ULTIMATE_INDEXER_GIT_SIGNAL_STRENGTH", 0.5)
+    )
+    git_recency_weight: float = field(
+        default_factory=lambda: _env_float("ULTIMATE_INDEXER_GIT_RECENCY_WEIGHT", 0.6)
+    )
+    git_churn_weight: float = field(
+        default_factory=lambda: _env_float("ULTIMATE_INDEXER_GIT_CHURN_WEIGHT", 0.4)
+    )
+    # Weight of git co-change neighbours when a query supplies focus files.
+    cochange_personalization_weight: float = field(
+        default_factory=lambda: _env_float("ULTIMATE_INDEXER_COCHANGE_WEIGHT", 0.5)
     )
 
     def __post_init__(self) -> None:
