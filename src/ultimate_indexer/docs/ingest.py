@@ -141,9 +141,14 @@ def _chunk_to_record(
     project_id: str,
     chunk: DocumentChunk,
     file_symbol_id: str,
-    doc_symbol_id: str,
+    chunk_symbol_id: str,
 ) -> ChunkRecord:
-    """Convert a DocumentChunk to a ChunkRecord."""
+    """Convert a DocumentChunk to a ChunkRecord.
+
+    ``chunk_symbol_id`` is the symbol the chunk binds to in search results — a
+    ``doc-section::`` symbol when the chunk belongs to a section, else the
+    ``doc::`` document root.
+    """
     # Build rich content with breadcrumb context
     content_parts: list[str] = []
     if chunk.breadcrumb:
@@ -168,7 +173,7 @@ def _chunk_to_record(
             f"{chunk.file_path}:{chunk.chunk_type}:{chunk.anchor or chunk.breadcrumb or f'line:{chunk.start_line}-{chunk.end_line}'}:{chunk.metadata.get('sub_chunk', 0) if chunk.metadata else 0}".encode()
         ).hexdigest()[:32],
         relative_path=chunk.file_path,
-        symbol_id=doc_symbol_id,
+        symbol_id=chunk_symbol_id,
         symbol_name=Path(chunk.file_path).stem,
         artifact_name=None,
         chunk_kind=CHUNK_KINDS.get(chunk.chunk_type, "doc-section"),
@@ -433,8 +438,12 @@ def ingest_documentation(
         if progress_callback:
             progress_callback(index, len(doc_files), rel_path)
 
-    # Second pass: register chunks and resolve links
+    # Second pass: register chunks and resolve links. Chunks bind to their
+    # SECTION symbol when one exists so section-level results can surface in
+    # search output; the doc-root symbol is only the fallback.
     logger.info("Resolving documentation links...")
+    created_symbol_ids = {symbol.symbol_id for symbol in symbols}
+    chunk_symbol_map: dict[str, str] = {}
     for rel_path, doc_chunks, links, anchors in file_data:
         # Register with link resolver
         link_resolver.register_file(rel_path, doc_chunks, anchors)
@@ -452,12 +461,45 @@ def ingest_documentation(
             # Create chunk record
             file_symbol_id = f"file::{rel_path}"
             doc_symbol_id = f"doc::{rel_path}"
-            chunk_record = _chunk_to_record(
-                project_id, chunk, file_symbol_id, doc_symbol_id
+            section_anchor = chunk.anchor or (
+                chunk.headers[-1].anchor if chunk.headers else None
             )
+            chunk_symbol_id = doc_symbol_id
+            if section_anchor:
+                candidate = f"doc-section::{rel_path}:{section_anchor}"
+                if candidate in created_symbol_ids:
+                    chunk_symbol_id = candidate
+            chunk_record = _chunk_to_record(
+                project_id, chunk, file_symbol_id, chunk_symbol_id
+            )
+            chunk_symbol_map[chunk_record.chunk_id] = chunk_symbol_id
             chunks.append(chunk_record)
 
-    # Third pass: resolve links and build graph edges
+    # Third pass: resolve links and build graph edges. Link and hierarchy
+    # structure is persisted as symbol-level EdgeRecords (translated through the
+    # chunk->symbol map) so it feeds PageRank; the in-memory doc_graph mirrors it
+    # for chunk-level inspection.
+    seen_doc_edges: set[tuple[str, str, str]] = set()
+
+    def _persist_doc_edge(edge: dict) -> None:
+        source_symbol = chunk_symbol_map.get(edge["source_chunk_id"])
+        target_symbol = chunk_symbol_map.get(edge["target_chunk_id"])
+        if not source_symbol or not target_symbol or source_symbol == target_symbol:
+            return
+        key = (source_symbol, target_symbol, str(edge["edge_type"]))
+        if key in seen_doc_edges:
+            return
+        seen_doc_edges.add(key)
+        edges.append(
+            EdgeRecord(
+                project_id=project_id,
+                source_symbol_id=source_symbol,
+                target_symbol_id=target_symbol,
+                edge_type=str(edge["edge_type"]),
+                weight=float(edge["weight"]),
+            )
+        )
+
     for rel_path, doc_chunks, links, anchors in file_data:
         # Resolve explicit links
         resolved_edges = link_resolver.resolve_links(
@@ -470,10 +512,7 @@ def ingest_documentation(
                 edge["edge_type"],
                 edge["weight"],
             )
-
-            # Note: Cross-file symbol edges are handled at the chunk level
-            # through the document graph. We don't create additional symbol edges
-            # here to avoid duplication.
+            _persist_doc_edge(edge)
 
         # Build hierarchy edges
         hierarchy_edges = link_resolver.build_hierarchy_edges(
@@ -486,6 +525,7 @@ def ingest_documentation(
                 edge["edge_type"],
                 edge["weight"],
             )
+            _persist_doc_edge(edge)
 
     logger.info(
         f"Ingested {len(files)} documentation files, "

@@ -71,6 +71,12 @@ The built-in SCIP runner supports the same external toolchain family that CodeGr
 
 `SCIP_LANGUAGES` can be used to restrict auto-detection, and accepts CodeGraphContext-style values such as `python,javascript,go,rust,java,c`.
 
+Set `ULTIMATE_INDEXER_DISABLE_EXTERNAL_SCIP=1` to skip external SCIP toolchains
+entirely (offline CI, locked-down hosts, or when scip-python's full pyright pass
+is too slow) — Python still gets structured symbols from the built-in emitter,
+and other languages use generic fallback coverage. `ULTIMATE_INDEXER_SCIP_TIMEOUT`
+(seconds, default 600) bounds each external tool invocation.
+
 ## What gets indexed
 
 - local source files through a SCIP ingestion path

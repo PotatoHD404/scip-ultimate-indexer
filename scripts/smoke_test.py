@@ -100,7 +100,13 @@ def run_cli(args: list[str], env: dict[str, str]) -> subprocess.CompletedProcess
 
 def main() -> int:
     backend = os.environ.get("SMOKE_BACKEND", "hash")
-    base_env = {**os.environ, "PYTHONPATH": str(REPO_ROOT / "src")}
+    base_env = {
+        **os.environ,
+        "PYTHONPATH": str(REPO_ROOT / "src"),
+        # Deterministic + fast: external SCIP tools (scip-python = full pyright
+        # run) vary by host; the built-in emitter is what these checks assert.
+        "ULTIMATE_INDEXER_DISABLE_EXTERNAL_SCIP": "1",
+    }
     # The deterministic env used for functional assertions.
     env = {**base_env, "ULTIMATE_INDEXER_EMBEDDING_BACKEND": backend}
 

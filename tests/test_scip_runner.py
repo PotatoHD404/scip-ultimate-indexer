@@ -38,6 +38,8 @@ def test_detect_scip_languages_accepts_codegraphcontext_aliases(monkeypatch) -> 
 
 def test_run_scip_indexers_reports_missing_tools(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.delenv("SCIP_LANGUAGES", raising=False)
+    # This test verifies EXTERNAL tool semantics — undo the suite-wide hermetic switch.
+    monkeypatch.delenv("ULTIMATE_INDEXER_DISABLE_EXTERNAL_SCIP", raising=False)
     monkeypatch.setattr("ultimate_indexer.scip_runner.shutil.which", lambda _: None)
     files = [tmp_path / "main.ts"]
 
@@ -70,6 +72,8 @@ def test_run_scip_indexers_uses_nearest_project_roots(tmp_path: Path, monkeypatc
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.delenv("SCIP_LANGUAGES", raising=False)
+    # This test verifies EXTERNAL tool semantics — undo the suite-wide hermetic switch.
+    monkeypatch.delenv("ULTIMATE_INDEXER_DISABLE_EXTERNAL_SCIP", raising=False)
     monkeypatch.setattr("ultimate_indexer.scip_runner.shutil.which", lambda _: "/usr/bin/scip-typescript")
     monkeypatch.setattr("ultimate_indexer.scip_runner.subprocess.run", fake_run)
 

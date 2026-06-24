@@ -36,6 +36,8 @@ def test_unsupported_language_fallback_is_searchable(tmp_path: Path, monkeypatch
 
 def test_supported_language_without_scip_tool_exits(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("ULTIMATE_INDEXER_EMBEDDING_BACKEND", "hash")
+    # This test verifies the missing-EXTERNAL-tool error — undo the hermetic switch.
+    monkeypatch.delenv("ULTIMATE_INDEXER_DISABLE_EXTERNAL_SCIP", raising=False)
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
     project = tmp_path / "project"
     project.mkdir()

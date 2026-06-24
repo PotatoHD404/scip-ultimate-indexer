@@ -10,29 +10,43 @@ from .storage import Storage
 # Token counting — tiktoken (Qwen2-compatible cl100k_base) with char fallback
 # ---------------------------------------------------------------------------
 # Qwen2 uses a BPE tokenizer very close to GPT-4's cl100k_base.
-# tiktoken is a lightweight C extension with no model weights — just BPE
-# tables — so it loads in milliseconds and adds no inference overhead.
-try:
-    import tiktoken as _tiktoken
-    _enc = _tiktoken.get_encoding("cl100k_base")
+#
+# The encoding is built LAZILY on first use: tiktoken downloads the BPE table
+# over the network when its cache is cold, so constructing it at import time
+# can block process startup (the MCP server must answer the stdio handshake
+# immediately). A failed load — offline, blocked CDN, full disk — permanently
+# degrades to the character-ratio estimate instead of raising.
+_CHARS_PER_TOKEN = 3.5  # empirical ratio for mixed code/prose
+_enc = None
+_enc_failed = False
 
-    def count_tokens(text: str) -> int:
-        """Return the token count for *text* using tiktoken cl100k_base.
 
-        cl100k_base is the GPT-4 / Qwen2-compatible BPE encoding.  Counts are
-        within ±5 % of the true Qwen2 count for typical code content.
-        """
+def _char_estimate(text: str) -> int:
+    return max(1, round(len(text) / _CHARS_PER_TOKEN))
+
+
+def count_tokens(text: str) -> int:
+    """Return the token count for *text* using tiktoken cl100k_base.
+
+    cl100k_base is the GPT-4 / Qwen2-compatible BPE encoding. Counts are
+    within ±5 % of the true Qwen2 count for typical code content. Falls back
+    to a character-ratio estimate when tiktoken (or its BPE download) is
+    unavailable.
+    """
+    global _enc, _enc_failed
+    if _enc is None and not _enc_failed:
+        try:
+            import tiktoken as _tiktoken
+
+            _enc = _tiktoken.get_encoding("cl100k_base")
+        except Exception:
+            _enc_failed = True
+    if _enc is None:
+        return _char_estimate(text)
+    try:
         return len(_enc.encode(text, disallowed_special=()))
-
-except ImportError:
-    _CHARS_PER_TOKEN = 3.5  # empirical ratio for mixed code/prose
-
-    def count_tokens(text: str) -> int:  # type: ignore[misc]
-        """Estimate token count via character ratio (tiktoken not installed).
-
-        Install ``tiktoken`` for accurate counts: ``pip install tiktoken``.
-        """
-        return max(1, round(len(text) / _CHARS_PER_TOKEN))
+    except Exception:
+        return _char_estimate(text)
 
 
 CLASS_LIKE_KINDS = {"Class", "Struct", "Interface", "Trait", "Enum"}

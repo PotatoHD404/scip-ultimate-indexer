@@ -318,7 +318,10 @@ def emit_python_scip(project_root: Path, files: list[Path], output_path: Path) -
     parsed_sources: list[tuple[str, str, ast.AST]] = []
     for path in files:
         try:
-            relative_path = str(path.relative_to(project_root))
+            # Resolve before computing the relative path so symlinked roots
+            # (e.g. /tmp -> /private/tmp on macOS) cannot silently exclude
+            # every file from the emitted index.
+            relative_path = str(path.resolve().relative_to(project_root))
             source = path.read_text(encoding="utf-8")
             tree = ast.parse(source, filename=relative_path)
         except (OSError, ValueError, SyntaxError, UnicodeDecodeError):

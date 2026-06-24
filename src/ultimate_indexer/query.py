@@ -162,7 +162,7 @@ def dependency_ordered_pagerank(
     edge_rows: list[object],
     *,
     personalization: dict[str, float] | None = None,
-    alpha: float = 0.15,
+    alpha: float = 0.85,
 ) -> dict[str, float]:
     rankable_rows = _rankable_query_rows(symbol_rows)
     rankable_ids = set(rankable_rows)
@@ -951,11 +951,15 @@ class QueryEngine:
                 project_id, rankable_rows, seed_personalization, focus_paths
             )
         if seed_personalization:
+            # Standard personalized-PageRank damping: 85 % of mass follows the
+            # dependency graph, 15 % restarts at the query-seed personalization.
+            # Matches the global-rank convention in indexer._global_ranks; query
+            # bias comes from the restart vector, not a tiny damping factor.
             ppr_scores = dependency_ordered_pagerank(
                 symbol_rows,
                 self.storage.get_edges(project_id),
                 personalization=seed_personalization,
-                alpha=0.15,
+                alpha=0.85,
             )
             normalized_ppr_scores = _normalize_scores(ppr_scores)
             for symbol_id in candidates:

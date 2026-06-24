@@ -19,3 +19,5 @@ tests/fixtures/sample_project/.scip_indexes-registry-debug/
 /.confluence_cookies.json
 /config.json
 /confluence_export/
+
+dist/

@@ -106,7 +106,10 @@ def _with_retry(
                 break
             message = str(exc)
             is_rate_limit = any(marker in message for marker in ("429", "RESOURCE_EXHAUSTED", "quota"))
-            delay_ms = max(base_delay_ms * (2 ** (attempt - 1)), 15_000) if is_rate_limit else base_delay_ms * (2 ** (attempt - 1))
+            # Rate limits start at a 15 s floor and keep growing exponentially;
+            # other errors use plain exponential backoff from the base delay.
+            backoff_ms = base_delay_ms * (2 ** (attempt - 1))
+            delay_ms = max(15_000 * (2 ** (attempt - 1)), backoff_ms) if is_rate_limit else backoff_ms
             sleep_fn(delay_ms / 1000.0)
     assert last_error is not None
     raise last_error

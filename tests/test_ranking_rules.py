@@ -1,6 +1,23 @@
 from __future__ import annotations
 
-from ultimate_indexer.ranking_rules import clean_symbol_display_name, is_generated_path, is_rankable_symbol
+from ultimate_indexer.ranking_rules import (
+    clean_symbol_display_name,
+    is_generated_path,
+    is_rankable_symbol,
+    is_test_path,
+)
+
+
+def test_is_test_path_detects_test_code() -> None:
+    assert is_test_path("tests/test_query.py")
+    assert is_test_path("pkg/__tests__/router.test.ts")
+    assert is_test_path("internal/auth/auth_test.go")
+    assert is_test_path("spec/models/user.spec.ts")
+    assert is_test_path("tests/conftest.py")
+    assert is_test_path("app/testdata/sample.py")
+    assert not is_test_path("src/ultimate_indexer/query.py")
+    assert not is_test_path("services/contest/runner.py")  # 'test' inside a word
+    assert not is_test_path("src/latest_results.py")
 
 
 def test_is_generated_path_detects_generated_outputs() -> None:

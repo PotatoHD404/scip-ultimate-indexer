@@ -9,9 +9,13 @@ include = [
     { path = "src/ultimate_indexer/templates/*.html", format = ["sdist", "wheel"] }
 ]
 
+# The internal mirror is opt-in only ("explicit"): nothing references it by
+# default, so `poetry install` resolves from public PyPI and works outside the
+# corporate network. Pin a dependency to it explicitly if ever needed.
 [[tool.poetry.source]]
 name = "artifactory"
 url = "https://artifactory.tcsbank.ru/artifactory/api/pypi/python-all/simple"
+priority = "explicit"
 
 [tool.poetry.dependencies]
 python = ">=3.12,<3.15"
@@ -22,10 +26,17 @@ numpy = "^2.4.3"
 protobuf = "^6.33.0"
 pathspec = "^0.12.1"
 mcp = "^1.26.0"
-llama-cpp-python = "^0.3.16"
+# Optional: local GGUF embeddings (heavy native build). The indexer degrades to
+# the hash backend or an embedding API when this is not installed.
+llama-cpp-python = { version = "^0.3.16", optional = true }
 jinja2 = "^3.1.6"
 pyyaml = "^6.0.3"
-tiktoken = "^0.9"
+# >=0.12 is required for Python 3.14 binary wheels (older releases force a
+# Rust source build on 3.14); older pythons may still resolve 0.9-0.11.
+tiktoken = ">=0.9,<1.0"
+
+[tool.poetry.extras]
+local-embeddings = ["llama-cpp-python"]
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.4.2"

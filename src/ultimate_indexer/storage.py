@@ -48,7 +48,10 @@ def _normalized_bm25_score(raw_rank: float, max_magnitude: float, idx: int) -> f
 class Storage:
     def __init__(self, database_path: Path) -> None:
         self.database_path = database_path
-        self.connection = sqlite3.connect(str(database_path))
+        # check_same_thread=False: MCP frameworks run sync tools in a worker
+        # threadpool, so consecutive calls can land on different threads. Python's
+        # sqlite3 serializes access internally and we use WAL, so this is safe.
+        self.connection = sqlite3.connect(str(database_path), check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA foreign_keys=ON")
@@ -337,7 +340,16 @@ class Storage:
 
         if incremental_mode:
             files = [item for item in files if item.relative_path in changed_paths]
-            symbols = [item for item in symbols if item.relative_path in changed_paths]
+            # External library stubs (_external/...) have no on-disk file, so they
+            # can never appear in changed_paths — keep them so an edge from a
+            # changed file to a NEW external symbol is never dangling. They are
+            # written with INSERT OR REPLACE, so pre-existing stubs are refreshed.
+            symbols = [
+                item
+                for item in symbols
+                if item.relative_path in changed_paths
+                or item.relative_path.startswith("_external/")
+            ]
             chunks = [item for item in chunks if item.relative_path in changed_paths]
             function_metadata = [
                 item for item in function_metadata if item.relative_path in changed_paths
@@ -483,7 +495,7 @@ class Storage:
             for symbol in symbols:
                 self.connection.execute(
                     """
-                    INSERT INTO symbols(
+                    INSERT OR REPLACE INTO symbols(
                         project_id, symbol_id, scip_symbol, display_name, kind, relative_path,
                         start_line, end_line, signature, docstring, snippet, enclosing_symbol_id,
                         source_kind
@@ -568,6 +580,18 @@ class Storage:
                     ),
                 )
 
+            # Some emitters (notably the Python frontend) yield the same
+            # (project_id, symbol_id) more than once — overloads, @property
+            # getter/setter pairs, or redefinitions — which trips the UNIQUE
+            # constraint and aborts the ENTIRE index transaction, leaving Python
+            # repos with an empty index. Dedupe first (last occurrence wins) so
+            # the function_metadata and its FTS row stay 1:1 and indexing succeeds.
+            if function_metadata:
+                _dedup: dict[tuple, object] = {}
+                for _m in function_metadata:
+                    _dedup[(_m.project_id, _m.symbol_id)] = _m
+                function_metadata = list(_dedup.values())
+
             for meta in function_metadata:
                 self.connection.execute(
                     """
@@ -629,6 +653,14 @@ class Storage:
                         meta.metadata_content + (f"\n{meta.fts_expansion}" if meta.fts_expansion else ""),
                     ),
                 )
+
+            # Same dedupe rationale as function_metadata: duplicate symbols can
+            # yield duplicate body chunks sharing (project_id, chunk_id).
+            if function_body_chunks:
+                _bdedup: dict[tuple, object] = {}
+                for _b in function_body_chunks:
+                    _bdedup[(_b.project_id, _b.chunk_id)] = _b
+                function_body_chunks = list(_bdedup.values())
 
             for body_chunk in function_body_chunks:
                 self.connection.execute(

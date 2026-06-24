@@ -158,9 +158,12 @@ def build_mcp(
             if embedding_n_ctx > 0:
                 import os
 
-                os.environ["ULTIMATE_INDEXER_LLAMA_N_CTX"] = str(embedding_n_ctx)
-                os.environ["ULTIMATE_INDEXER_LLAMA_N_BATCH"] = str(embedding_n_ctx)
-                os.environ["ULTIMATE_INDEXER_LLAMA_N_UBATCH"] = str(embedding_n_ctx)
+                # setdefault: honour any explicit operator-set values; the server
+                # flag only fills in defaults rather than mutating global state
+                # differently per indexer.
+                os.environ.setdefault("ULTIMATE_INDEXER_LLAMA_N_CTX", str(embedding_n_ctx))
+                os.environ.setdefault("ULTIMATE_INDEXER_LLAMA_N_BATCH", str(embedding_n_ctx))
+                os.environ.setdefault("ULTIMATE_INDEXER_LLAMA_N_UBATCH", str(embedding_n_ctx))
             indexers[cache_key] = indexer
         # Auto-refresh: re-index incrementally if any files changed since the
         # last index run.  Skipped for index_project (auto_refresh=False) to

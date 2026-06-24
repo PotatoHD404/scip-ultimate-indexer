@@ -29,7 +29,12 @@ from .models import (
     FunctionMetadataRecord, IndexProgress, IndexSummary, SymbolRecord, TreeScoreNode,
 )
 from .query import QueryEngine, SearchScope, apply_kind_boost, dependency_ordered_pagerank
-from .ranking_rules import is_external_symbol, is_queryable_symbol, is_rankable_symbol
+from .ranking_rules import (
+    is_external_symbol,
+    is_queryable_symbol,
+    is_rankable_symbol,
+    is_test_path,
+)
 from .scip_parser import ParsedScip, parse_scip_index
 from .scip_runner import ScipRunFailure, StructuredIndexingRequiredError, run_scip_indexers
 from .socraticode import ingest_socraticode_artifacts
@@ -538,8 +543,21 @@ class UltimateIndexer:
             )
             return 1.0 + strength * boost
 
+        def _test_multiplier(symbol_id: str) -> float:
+            # Damp (not exclude) test code: test suites otherwise dominate
+            # top-symbols because their many member methods donate rank to the
+            # containing class. A 0.25 damp is too weak — a single large test
+            # class (e.g. requests' TestRequests, ~100 methods) still outranks
+            # the product core. 0.05 means a test symbol must be ~20x more
+            # connected than product code to surface; tests remain fully
+            # searchable via queries (is_queryable_symbol is unaffected).
+            relpath = str(symbol_rows[symbol_id]["relative_path"])
+            return 0.05 if is_test_path(relpath) else 1.0
+
         boosted = {
-            symbol_id: apply_kind_boost(symbol_rows[symbol_id], score) * _git_multiplier(symbol_id)
+            symbol_id: apply_kind_boost(symbol_rows[symbol_id], score)
+            * _git_multiplier(symbol_id)
+            * _test_multiplier(symbol_id)
             for symbol_id, score in ranks.items()
             if symbol_id in symbol_rows
         }

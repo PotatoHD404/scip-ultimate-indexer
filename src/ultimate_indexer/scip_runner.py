@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -26,10 +27,23 @@ def _normalize_scip_language(language: str) -> str:
     return normalized
 
 
-def _language_command(language: str, binary: str, output_file: Path) -> list[str] | None:
+def _language_command(
+    language: str, binary: str, output_file: Path, invocation_root: Path | None = None
+) -> list[str] | None:
     out = str(output_file)
     if language == "python":
-        return [binary, "index", ".", "--output", out]
+        # scip-python crashes ("Cannot read properties of undefined" in
+        # makePackage) when it cannot infer a package name/version — e.g. on a
+        # project without git metadata. Always pass both explicitly.
+        project_name = re.sub(
+            r"[^A-Za-z0-9._-]+", "-", invocation_root.name if invocation_root else "project"
+        ).strip("-") or "project"
+        return [
+            binary, "index", ".",
+            "--project-name", project_name,
+            "--project-version", "0.0.0",
+            "--output", out,
+        ]
     if language == "typescript":
         return [binary, "index", "--output", out]
     if language == "go":
@@ -234,10 +248,21 @@ def run_scip_indexers(
     missing: list[ScipRequirement] = []
     failed: list[ScipRunFailure] = []
     detected_languages = detect_scip_languages(files)
+    # Operator/test switch: skip external SCIP tools entirely (offline CI,
+    # locked-down hosts, deterministic test runs). The built-in Python emitter
+    # still provides zero-config coverage.
+    disable_external = os.getenv(
+        "ULTIMATE_INDEXER_DISABLE_EXTERNAL_SCIP", ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
     available_binaries: dict[str, tuple[ScipRequirement, str]] = {}
     for language in detected_languages:
         requirement = _language_tooling(language, files)
         if requirement is None:
+            continue
+        if disable_external:
+            # Explicitly disabled: no language is treated as a hard requirement;
+            # Python uses the in-tree emitter, everything else uses generic
+            # fallback coverage.
             continue
         binary = shutil.which(requirement.binary_name)
         if binary is None:
@@ -266,9 +291,12 @@ def run_scip_indexers(
         language_succeeded = False
         for invocation_root in invocation_roots:
             output_file = _output_file_for_root(cache_dir, language, invocation_root, project_root)
-            command = _language_command(language, binary, output_file)
+            command = _language_command(language, binary, output_file, invocation_root)
             if command is None:
                 continue
+            # Remove any index left by a previous run so a tool that exits 0
+            # without writing output cannot silently pass off stale data.
+            output_file.unlink(missing_ok=True)
             try:
                 completed = subprocess.run(
                     command,

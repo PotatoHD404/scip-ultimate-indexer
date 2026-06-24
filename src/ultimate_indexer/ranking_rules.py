@@ -76,6 +76,31 @@ def is_generated_path(relative_path: str) -> bool:
     return False
 
 
+_TEST_DIR_NAMES = {"tests", "test", "__tests__", "spec", "specs", "testdata"}
+
+
+def is_test_path(relative_path: str) -> bool:
+    """Return True for paths that belong to test code.
+
+    Test classes hold many member methods, which donate rank to their container
+    in the compositional graph — without damping, ``top-symbols`` on a real
+    repository is dominated by test suites instead of product code. Tests stay
+    fully searchable; only their *importance* weight is reduced.
+    """
+    normalized = relative_path.replace("\\", "/")
+    path = PurePosixPath(normalized)
+    if any(part.lower() in _TEST_DIR_NAMES for part in path.parts[:-1]):
+        return True
+    stem = path.stem.lower()
+    return (
+        stem.startswith("test_")
+        or stem.endswith("_test")
+        or stem.endswith(".test")
+        or stem.endswith(".spec")
+        or stem == "conftest"
+    )
+
+
 def is_rankable_symbol(relative_path: str, kind: str) -> bool:
     # External library stubs always participate in PageRank so that project
     # symbols which implement/call widely-used library types rank higher.
