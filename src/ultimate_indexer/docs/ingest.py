@@ -19,10 +19,12 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Callable
 
+from ..constants import DEFAULT_IGNORED_DIR_NAMES
 from ..embeddings import hash_text
 from ..models import ChunkRecord, EdgeRecord, FileRecord, SymbolRecord
 from .chunker import DocumentChunk, DocumentChunker
@@ -54,85 +56,97 @@ def _path_identity_key(path: Path) -> tuple[int, int] | str:
     return (stat.st_dev, stat.st_ino)
 
 
+# Files that should be handled by fallback, not documentation ingestion.
+_SKIP_DOC_FILES = {
+    ".gitignore",
+    ".dockerignore",
+    ".socraticodeignore",
+    ".cgcignore",
+    ".env",
+    ".env.example",
+    ".env.local",
+    ".env.production",
+    "package.json",
+    "package-lock.json",
+    "tsconfig.json",
+    ".eslintrc.json",
+    "composer.json",
+    "composer.lock",
+}
+
+# Top-level OpenAPI/Swagger discriminator (JSON `"openapi"` or YAML `openapi:`).
+_OPENAPI_MARKER = re.compile(r'(?m)^\s*["\']?(openapi|swagger)["\']?\s*:')
+
+
+def _looks_like_openapi(path: Path) -> bool:
+    """Content sniff so only real OpenAPI/Swagger specs — not arbitrary YAML/JSON
+    config (CI files, package manifests, …) — are treated as documentation.
+    Reads only the head; the full validation still happens in OpenAPIParser."""
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            head = handle.read(8192)
+    except OSError:
+        return False
+    return bool(_OPENAPI_MARKER.search(head))
+
+
 def _discover_document_files(
     project_root: Path,
     doc_dirs: list[str] | None = None,
 ) -> list[Path]:
-    """Discover documentation files in the project.
+    """Discover documentation files anywhere in the project, honoring ignore dirs.
 
-    Args:
-        project_root: Root directory of the project
-        doc_dirs: Optional list of documentation directories to search.
-                  If None, searches common doc directories and root.
+    Markdown (``.md``/``.markdown``) is unambiguous documentation, so every such
+    file outside ignored directories is included regardless of location.
+    ``.yaml``/``.yml``/``.json`` files are included only when they content-sniff
+    as an OpenAPI/Swagger spec, so config files stay on the code/fallback path.
 
-    Returns:
-        List of paths to documentation files
+    A non-empty ``doc_dirs`` restricts the walk to those subdirectories
+    (preserved for callers that scope ingestion explicitly); the default (None)
+    searches the whole tree so specs/READMEs are found wherever they live.
     """
     files: list[Path] = []
-
-    # Files that should be handled by fallback, not documentation ingestion
-    SKIP_FILES = {
-        ".gitignore",
-        ".dockerignore",
-        ".socraticodeignore",
-        ".cgcignore",
-        ".env",
-        ".env.example",
-        ".env.local",
-        ".env.production",
-    }
-
-    # Default documentation directories to search
-    if doc_dirs is None:
-        doc_dirs = [
-            "docs",
-            "documentation",
-            "doc",
-            "Docs",
-            "Documentation",
-            "api-docs",
-            "api_docs",
-            "openapi",
-            "specs",
-        ]
-
-    # Collect all candidate directories
-    candidate_dirs: list[Path] = []
-    for dir_name in doc_dirs:
-        candidate = project_root / dir_name
-        if candidate.exists() and candidate.is_dir():
-            candidate_dirs.append(candidate)
-
-    # Remove duplicates while preserving order
-    seen: set[tuple[int, int] | str] = set()
-    unique_dirs: list[Path] = []
-    for d in candidate_dirs:
-        identity = _path_identity_key(d)
-        if identity not in seen:
-            seen.add(identity)
-            unique_dirs.append(d)
-
-    # Walk directories and find document files
     seen_files: set[tuple[int, int] | str] = set()
-    for base_dir in unique_dirs:
-        for ext in DOCUMENT_EXTENSIONS:
-            for path in base_dir.rglob(f"*{ext}"):
-                if not path.is_file():
-                    continue
-                # Skip hidden files (except markdown docs)
-                if path.name.startswith(".") and not path.name.endswith(".md"):
-                    continue
-                # Skip special config files
-                if path.name in SKIP_FILES:
-                    continue
-                # Skip common non-doc files
-                if path.name in ("package.json", "tsconfig.json", ".eslintrc.json"):
-                    continue
-                identity = _path_identity_key(path)
-                if identity in seen_files:
-                    continue
-                seen_files.add(identity)
-                files.append(path)
+
+    def _add(path: Path) -> None:
+        if not path.is_file():
+            return
+        name = path.name
+        if name in _SKIP_DOC_FILES:
+            return
+        ext = path.suffix.lower()
+        if ext in (".md", ".markdown"):
+            pass  # markdown is always documentation
+        elif ext in (".yaml", ".yml", ".json"):
+            if not _looks_like_openapi(path):
+                return
+        else:
+            return
+        # Skip hidden files except markdown docs (e.g. keep a .changes.md note).
+        if name.startswith(".") and ext not in (".md", ".markdown"):
+            return
+        identity = _path_identity_key(path)
+        if identity in seen_files:
+            return
+        seen_files.add(identity)
+        files.append(path)
+
+    if doc_dirs:
+        roots = [project_root / d for d in doc_dirs if (project_root / d).is_dir()]
+    else:
+        roots = [project_root]
+
+    for base in roots:
+        for dirpath, dirnames, filenames in os.walk(base):
+            # Prune ignored + hidden directories in place so we never descend
+            # into node_modules, .git, build output, the index state dir, etc.
+            dirnames[:] = [
+                d
+                for d in dirnames
+                if d not in DEFAULT_IGNORED_DIR_NAMES and not d.startswith(".")
+            ]
+            for fn in filenames:
+                _add(Path(dirpath) / fn)
 
     return sorted(files)
 
@@ -241,7 +255,13 @@ def _create_doc_symbols(
             symbol_id=section_symbol_id,
             scip_symbol=section_symbol_id,
             display_name=header.text if header else (anchor or f"Section {idx}"),
-            kind="Section",
+            # OpenAPI operations and schemas are the meaningful, rankable units of
+            # an API spec (like a struct/endpoint in code), so they get first-class
+            # kinds; prose sections stay non-rankable "Section".
+            kind={
+                "openapi_endpoint": "ApiEndpoint",
+                "openapi_schema": "ApiSchema",
+            }.get(section.get("chunk_type", ""), "Section"),
             relative_path=file_path,
             start_line=(header.line_number + 1)
             if header

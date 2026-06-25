@@ -92,6 +92,9 @@ KIND_BOOSTS = {
     "variable": 0.75,
     "function": 1.0,
     "method": 1.0,
+    # OpenAPI: schemas are data contracts (like a struct), operations are actions.
+    "apischema": 1.4,
+    "apiendpoint": 1.1,
 }
 QUERY_CACHE_VERSION = 3
 DOCUMENTATION_SOURCE_KIND = "documentation"

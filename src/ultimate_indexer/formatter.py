@@ -51,7 +51,8 @@ def count_tokens(text: str) -> int:
 
 CLASS_LIKE_KINDS = {"Class", "Struct", "Interface", "Trait", "Enum"}
 TYPE_LIKE_KINDS = CLASS_LIKE_KINDS | {"TypeAlias"}
-DOC_KINDS = {"Document", "Section"}
+DOC_SECTION_KINDS = {"Section", "ApiEndpoint", "ApiSchema"}
+DOC_KINDS = {"Document"} | DOC_SECTION_KINDS
 
 
 def _comment_prefix(relative_path: str) -> str:
@@ -826,7 +827,7 @@ def format_documentation_section(
             and str(row["kind"]) in DOC_KINDS
         ]
         docs = [s for s in file_symbols if str(s["kind"]) == "Document"]
-        sections = [s for s in file_symbols if str(s["kind"]) == "Section"]
+        sections = [s for s in file_symbols if str(s["kind"]) in DOC_SECTION_KINDS]
         for doc in docs:
             docstring = str(doc["docstring"])
             if docstring:
