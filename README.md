@@ -71,6 +71,32 @@ The built-in SCIP runner supports the same external toolchain family that CodeGr
 
 `SCIP_LANGUAGES` can be used to restrict auto-detection, and accepts CodeGraphContext-style values such as `python,javascript,go,rust,java,c`.
 
+### Enabling Java and C/C++
+
+Both produce real class/method symbols (not just fallback chunks) once their
+external tool is on `PATH`:
+
+```bash
+# C/C++ — prebuilt binary (no other setup for CMake projects)
+curl -fL -o ~/.local/bin/scip-clang \
+  https://github.com/sourcegraph/scip-clang/releases/download/v0.4.0/scip-clang-arm64-darwin
+chmod +x ~/.local/bin/scip-clang
+
+# Java — via coursier
+coursier bootstrap --standalone -o ~/.local/bin/scip-java \
+  com.sourcegraph:scip-java_2.13:0.11.2 --main com.sourcegraph.scip_java.ScipJava
+```
+
+- **C/C++** needs a `compile_commands.json`. For a **CMake** project the runner
+  generates one automatically (into its cache, via
+  `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`); for other build systems, drop a
+  `compile_commands.json` at the project root (e.g. with `bear -- <build>`).
+- **Java** is *compiled* by scip-java (Maven/Gradle), so the project must build.
+  The runner passes `--build-tool=maven` when both Maven and Gradle metadata are
+  present. scip-java's bundled `javac` is version-sensitive: projects using a
+  modern `<release>` build cleanly, while older Java-8 `<source>/<target>`
+  projects may need an older `JAVA_HOME` (e.g. JDK 11) for the build to succeed.
+
 Set `ULTIMATE_INDEXER_DISABLE_EXTERNAL_SCIP=1` to skip external SCIP toolchains
 entirely (offline CI, locked-down hosts, or when scip-python's full pyright pass
 is too slow) — Python still gets structured symbols from the built-in emitter,

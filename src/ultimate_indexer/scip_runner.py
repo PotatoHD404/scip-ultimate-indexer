@@ -51,10 +51,47 @@ def _language_command(
     if language == "rust":
         return [binary, "scip", ".", "--output", out]
     if language == "java":
-        return [binary, "index", "--output", out]
+        cmd = [binary, "index", "--output", out]
+        # scip-java aborts ("Multiple build tools detected") when a repo carries
+        # both Maven and Gradle metadata; pick one explicitly (prefer Maven).
+        if invocation_root is not None and (invocation_root / "pom.xml").exists():
+            gradle = ("build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts")
+            if any((invocation_root / g).exists() for g in gradle):
+                cmd.append("--build-tool=maven")
+        return cmd
     if language == "cpp":
         return [binary, f"--index-output-path={out}"]
     return None
+
+
+def _ensure_compile_db(
+    invocation_root: Path, cache_dir: Path, timeout_seconds: int | None
+) -> Path | None:
+    """scip-clang requires a compile_commands.json. Prefer the project's own; for
+    a CMake project without one, generate it into the cache (best-effort) with
+    `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON` so the user's tree is never written to.
+    Returns the database path to use, or None if none could be obtained."""
+    existing = invocation_root / "compile_commands.json"
+    if existing.exists():
+        return existing
+    if not (invocation_root / "CMakeLists.txt").exists():
+        return None
+    cmake = shutil.which("cmake")
+    if cmake is None:
+        return None
+    build_dir = cache_dir / "cmake-compdb"
+    try:
+        subprocess.run(
+            [cmake, "-S", str(invocation_root), "-B", str(build_dir),
+             "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"],
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except Exception:
+        return None
+    generated = build_dir / "compile_commands.json"
+    return generated if generated.exists() else None
 
 
 def detect_scip_languages(files: list[Path]) -> list[str]:
@@ -294,6 +331,27 @@ def run_scip_indexers(
             command = _language_command(language, binary, output_file, invocation_root)
             if command is None:
                 continue
+            if language == "cpp":
+                compdb = _ensure_compile_db(invocation_root, cache_dir, timeout_seconds)
+                if compdb is None:
+                    failed.append(
+                        ScipRunFailure(
+                            language=language,
+                            binary_name=requirement.binary_name,
+                            install_hint=(
+                                "scip-clang needs a compile_commands.json. A CMake project "
+                                "is configured automatically; otherwise generate one (e.g. "
+                                "`bear -- <build>` or a CMake build with "
+                                "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON)."
+                            ),
+                            working_directory=str(invocation_root),
+                            command=tuple(command),
+                            detail="No compile_commands.json found and none could be generated.",
+                        )
+                    )
+                    continue
+                if compdb != invocation_root / "compile_commands.json":
+                    command = [*command, f"--compdb-path={compdb}"]
             # Remove any index left by a previous run so a tool that exits 0
             # without writing output cannot silently pass off stale data.
             output_file.unlink(missing_ok=True)
