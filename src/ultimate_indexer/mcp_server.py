@@ -2,10 +2,24 @@ from __future__ import annotations
 
 import atexit
 import json
+import logging
+import sys
 from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+
+# CRITICAL: Configure logging to stderr BEFORE any other imports or code execution
+# This prevents any logging from contaminating stdout (which must contain ONLY JSON-RPC)
+_logging_configured = False
+if not _logging_configured:
+    logging.basicConfig(
+        level=logging.WARNING,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        stream=sys.stderr,
+        force=True,
+    )
+    _logging_configured = True
 
 from .formatter import (
     format_context_window,
