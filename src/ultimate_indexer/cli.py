@@ -308,3 +308,7 @@ def tui(
         embedding_api_endpoint=embedding_api_endpoint,
         embedding_api_model=embedding_api_model,
     )
+
+
+if __name__ == "__main__":
+    app()
