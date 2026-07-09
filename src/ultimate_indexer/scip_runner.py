@@ -74,6 +74,12 @@ def _ensure_compile_db(
     existing = invocation_root / "compile_commands.json"
     if existing.exists():
         return existing
+    # Also check common build directories — many CMake projects generate
+    # compile_commands.json into build/ rather than the project root
+    for build_dir in ("build", "_build", "cmake-build-debug", "cmake-build-relwithdebinfo"):
+        candidate = invocation_root / build_dir / "compile_commands.json"
+        if candidate.exists():
+            return candidate
     if not (invocation_root / "CMakeLists.txt").exists():
         return None
     cmake = shutil.which("cmake")
