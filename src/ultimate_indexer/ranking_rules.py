@@ -47,6 +47,7 @@ PROTO_GENERATED_SUFFIXES = {
     ".ts",
     ".tsx",
 }
+MOCK_DIR_NAMES = {"mocks", "mock", "__mocks__", "fixtures", "fake", "stubs"}
 _DOCSTRING_NAME_PATTERNS = (
     re.compile(r"^\((?:property|parameter)\)\s+([A-Za-z_][\w$]*)"),
     re.compile(r"^(?:var|let|const|type|enum|interface|class|struct)\s+([A-Za-z_][\w$]*)"),
@@ -72,6 +73,14 @@ def is_generated_path(relative_path: str) -> bool:
     if filename.endswith(GENERATED_SUFFIXES):
         return True
     if "proto" in parts and suffix in PROTO_GENERATED_SUFFIXES:
+        return True
+    # Exclude mock/stub/fake files from ranking (they inflate the graph without
+    # representing real project logic). The generated testify mock files
+    # (*_Expecter types) otherwise dominate top-symbols in Go repos.
+    if any(mock_dir in parts for mock_dir in MOCK_DIR_NAMES):
+        return True
+    # Also detect testify _Expecter files in usecase mocks dirs
+    if filename.endswith("_expecter.go") or filename.endswith("_mock.go"):
         return True
     return False
 
