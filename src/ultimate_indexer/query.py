@@ -191,7 +191,16 @@ def dependency_ordered_pagerank(
         # Walk the enclosing chain — guard against cycles.
         current = sid
         chain: list[str] = []
+        seen: set[str] = set()
         while current not in rankable_ids:
+            if current in seen:
+                # Circular enclosing_symbol_id chain (e.g. SCIP-go bug with
+                # mock files). Abort and mark all as unresolvable.
+                for chained in chain:
+                    _ancestor_cache[chained] = None
+                _ancestor_cache[sid] = None
+                return None
+            seen.add(current)
             if current in _ancestor_cache:
                 resolved = _ancestor_cache[current]
                 # Back-fill the entire chain so future lookups are O(1).
