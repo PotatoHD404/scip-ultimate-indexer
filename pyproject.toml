@@ -25,7 +25,7 @@ networkx = "^3.6"
 numpy = "^2.4.3"
 protobuf = "^6.33.0"
 pathspec = "^0.12.1"
-mcp = "^1.27.0"
+mcp = "^1.28.0"
 # Optional: local GGUF embeddings (heavy native build). The indexer degrades to
 # the hash backend or an embedding API when this is not installed.
 llama-cpp-python = { version = "^0.3.16", optional = true }
