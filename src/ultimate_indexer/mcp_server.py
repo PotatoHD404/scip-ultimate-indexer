@@ -4,6 +4,21 @@ import atexit
 import json
 import logging
 import sys
+
+# ── OpenCode MCP client compat ──────────────────────────────────────
+# OpenCode 1.17.5 sometimes serialises zero-param JSON-RPC arguments
+# as '{}""' (JSON object followed by two garbage quote marks).  Patch
+# json.loads at our STDIO transport boundary so these calls survive.
+_json_loads_orig = json.loads
+
+def _json_loads_patched(s, **kwargs):
+    if isinstance(s, str):
+        s = s.rstrip('"\' \t\n\r')
+    return _json_loads_orig(s, **kwargs)
+
+
+json.loads = _json_loads_patched
+# ─────────────────────────────────────────────────────────────────────
 from pathlib import Path
 from typing import Any
 
@@ -87,7 +102,7 @@ def _register_project(cache_dir: Path, project_path: Path) -> None:
     _save_registry(cache_dir, merged)
 
 
-def _resolve_project_path(cache_dir: Path, project: str | None) -> Path:
+def _resolve_project_path(cache_dir: Path, project: str) -> Path:
     if project:
         candidate = Path(project).expanduser()
         if candidate.exists():
@@ -144,7 +159,7 @@ def build_mcp(
         return "auto"
 
     def get_indexer(
-        project: str | None,
+        project: str,
         embedding_backend: str,
         *,
         auto_refresh: bool = True,
@@ -179,11 +194,12 @@ def build_mcp(
                 os.environ.setdefault("ULTIMATE_INDEXER_LLAMA_N_BATCH", str(embedding_n_ctx))
                 os.environ.setdefault("ULTIMATE_INDEXER_LLAMA_N_UBATCH", str(embedding_n_ctx))
             indexers[cache_key] = indexer
-        # Auto-refresh: re-index incrementally if any files changed since the
-        # last index run.  Skipped for index_project (auto_refresh=False) to
-        # avoid a redundant pre-scan before the explicit index call.
-        if auto_refresh:
-            indexer.refresh_if_stale()
+        # Auto-refresh disabled: was causing 2-5s latency on every search call.
+        # CLI doesn't use refresh_if_stale either (fresh indexer per invocation).
+        # If you modify source files while the MCP server is running, re-index
+        # explicitly via index_project() instead.
+        # if auto_refresh:
+        #     indexer.refresh_if_stale()
         return indexer
 
     def close_indexers() -> None:
@@ -199,14 +215,16 @@ def build_mcp(
     def _render_search(
         *,
         query: str,
-        project: str | None,
+        project: str,
         count: int,
-        kind: str | None,
+        kind: str,
         hybrid: bool,
         embedding_backend: str,
         scope: str,
-        focus: list[str] | None = None,
+        focus: str = "",
     ) -> str:
+        kind_param = kind if kind else None
+        focus_param = [focus] if focus else None
         indexer = get_indexer(project, embedding_backend)
         not_indexed = _not_indexed_message(indexer)
         if not_indexed is not None:
@@ -215,10 +233,10 @@ def build_mcp(
             query,
             limit=count,
             scope=scope,  # type: ignore[arg-type]
-            focus_paths=tuple(focus or ()),
+            focus_paths=tuple(focus_param or ()),
         )
-        if kind:
-            normalized = _normalized_kind(kind)
+        if kind_param:
+            normalized = _normalized_kind(kind_param)
             filtered_groups = []
             for group in groups:
                 selected = [
@@ -268,10 +286,10 @@ def build_mcp(
             refreshes after small edits.
         embedding_backend:
             Which embedding provider to use.
-            ``"auto"`` — pick the best available (API > local GGUF > hash).
-            ``"local"`` — llama-cpp GGUF model from the models/ directory.
-            ``"api"`` — remote HTTP embedding endpoint configured via env vars.
-            ``"hash"`` — deterministic hash vectors; no model required
+            ``\"auto\"`` — pick the best available (API > local GGUF > hash).
+            ``\"local\"`` — llama-cpp GGUF model from the models/ directory.
+            ``\"api\"`` — remote HTTP embedding endpoint configured via env vars.
+            ``\"hash\"`` — deterministic hash vectors; no model required
             (degrades semantic search quality).
 
         When to use
@@ -293,37 +311,20 @@ def build_mcp(
             f"{summary.indexed_edges} edges, {summary.indexed_chunks} chunks"
         )
 
-    @server.tool()
-    def list_projects() -> str:
-        """List all projects registered with this MCP server.
-
-        Returns a comment-prefixed list of project names and their absolute
-        paths.  A project is registered automatically the first time
-        ``index_project`` is called for it.
-
-        When to use
-        -----------
-        Use to discover which project names can be passed to the ``project``
-        parameter of other tools, or to check whether a project has been
-        indexed yet.
-        """
-        projects = _load_registry(registry_dir)
-        if not projects:
-            return "// No projects found. Use index_project first."
-        lines = ["// Available projects:"]
-        for project in projects:
-            lines.append(f"//   {project['name']}  ({project['path']})")
-        return "\n".join(lines)
+    # NOTE: list_projects was removed because OpenCode 1.17.5 MCP client has a
+    # serialisation bug: it sends {}"" (trailing double-quotes) for zero-param
+    # tool calls, which no Python JSON parser can handle.  Call get_stats with
+    # project="" to list available projects instead.
 
     @server.tool()
     def search_symbols(
         query: str,
-        project: str | None = None,
+        project: str = "",
         count: int = 10,
-        kind: str | None = None,
+        kind: str = "",
         hybrid: bool = True,
         embedding_backend: str = "auto",
-        focus: list[str] | None = None,
+        focus: str = "",
     ) -> str:
         """Search both code and documentation (legacy alias for ``search_all``).
 
@@ -340,8 +341,8 @@ def build_mcp(
         count:
             Maximum number of file groups to return (default 10).
         kind:
-            Filter results to a single symbol kind, e.g. ``"Function"``,
-            ``"Class"``, ``"Interface"``.  Case-insensitive.  ``None`` returns
+            Filter results to a single symbol kind, e.g. ``\"Function"``,
+            ``\"Class\"``, ``\"Interface\"``.  Case-insensitive.  ``None`` returns
             all kinds.
         hybrid:
             ``True`` (default) — blend BM25 lexical search with dense
@@ -365,12 +366,12 @@ def build_mcp(
     @server.tool()
     def search_code(
         query: str,
-        project: str | None = None,
+        project: str = "",
         count: int = 10,
-        kind: str | None = None,
+        kind: str = "",
         hybrid: bool = True,
         embedding_backend: str = "auto",
-        focus: list[str] | None = None,
+        focus: str = "",
     ) -> str:
         """Search only code symbols and source files (excludes documentation).
 
@@ -388,8 +389,8 @@ def build_mcp(
         count:
             Maximum number of file groups to return (default 10).
         kind:
-            Restrict to one symbol kind: ``"Function"``, ``"Class"``,
-            ``"Struct"``, ``"Interface"``, ``"Method"``, ``"Enum"``, etc.
+            Restrict to one symbol kind: ``\"Function"``, ``\"Class\"``,
+            ``\"Struct\"``, ``\"Interface\"``, ``\"Method\"``, ``\"Enum\"``, etc.
             Case-insensitive.  ``None`` returns all code kinds.
         hybrid:
             ``True`` (default) — full hybrid BM25 + dense + PPR pipeline.
@@ -417,17 +418,17 @@ def build_mcp(
     @server.tool()
     def search_docs(
         query: str,
-        project: str | None = None,
+        project: str = "",
         count: int = 10,
-        kind: str | None = None,
+        kind: str = "",
         hybrid: bool = True,
         embedding_backend: str = "auto",
-        focus: list[str] | None = None,
+        focus: str = "",
     ) -> str:
         """Search only documentation sources (Markdown, OpenAPI specs).
 
         Restricts retrieval to symbols whose ``source_kind`` is
-        ``"documentation"`` or whose kind is ``"Document"`` / ``"Section"``.
+        ``\"documentation"`` or whose kind is ``\"Document"`` / ``\"Section"``.
 
         Parameters
         ----------
@@ -439,7 +440,7 @@ def build_mcp(
         count:
             Maximum number of file groups to return (default 10).
         kind:
-            Filter to a doc kind such as ``"Document"`` or ``"Section"``.
+            Filter to a doc kind such as ``\"Document"`` or ``\"Section"``.
             Usually left as ``None``.
         hybrid:
             ``True`` (default) — BM25 + dense + PPR pipeline.
@@ -466,12 +467,12 @@ def build_mcp(
     @server.tool()
     def search_all(
         query: str,
-        project: str | None = None,
+        project: str = "",
         count: int = 10,
-        kind: str | None = None,
+        kind: str = "",
         hybrid: bool = True,
         embedding_backend: str = "auto",
-        focus: list[str] | None = None,
+        focus: str = "",
     ) -> str:
         """Search code and documentation, then merge results with RRF ranking.
 
@@ -516,9 +517,9 @@ def build_mcp(
 
     @server.tool()
     def get_important_symbols(
-        project: str | None = None,
+        project: str = "",
         count: int = 20,
-        kind: str | None = None,
+        kind: str = "",
         embedding_backend: str = "auto",
     ) -> str:
         """Return the top symbols by global graph PageRank importance.
@@ -537,8 +538,8 @@ def build_mcp(
             Number of symbols to return (default 20).  All returned symbols
             have ``global_rank > 0``.
         kind:
-            Restrict to a single kind, e.g. ``"Interface"``, ``"Struct"``,
-            ``"Function"``.  Case-insensitive.  ``None`` returns all kinds.
+            Restrict to a single kind, e.g. ``\"Interface"``, ``\"Struct"``,
+            ``\"Function"``.  Case-insensitive.  ``None`` returns all kinds.
         embedding_backend:
             Embedding backend; see ``index_project`` for accepted values.
 
@@ -553,7 +554,8 @@ def build_mcp(
         not_indexed = _not_indexed_message(indexer)
         if not_indexed is not None:
             return not_indexed
-        rows = indexer.important_symbols(limit=count, kind_filter=kind)
+        kind_param = kind if kind else None
+        rows = indexer.important_symbols(limit=count, kind_filter=kind_param)
         return format_important_symbols_codegraph(
             indexer.storage,
             indexer.project_id,
@@ -563,7 +565,7 @@ def build_mcp(
 
     @server.tool()
     def get_project_overview(
-        project: str | None = None,
+        project: str = "",
         max_per_kind: int = 15,
         embedding_backend: str = "auto",
     ) -> str:
@@ -599,7 +601,7 @@ def build_mcp(
 
     @server.tool()
     def get_stats(
-        project: str | None = None,
+        project: str = "",
         embedding_backend: str = "auto",
     ) -> str:
         """Return counts and high-level statistics for an indexed project.
@@ -607,11 +609,14 @@ def build_mcp(
         Includes total files, symbols, edges, embedded chunks, symbol kind
         breakdown, and top folders by file count.
 
+        When called with an empty ``project``, lists all registered projects
+        instead (replaces the removed ``list_projects`` tool).
+
         Parameters
         ----------
         project:
             Project name or absolute path.  Optional when only one project is
-            indexed.
+            indexed.  Pass ``""`` to list available projects.
         embedding_backend:
             Embedding backend; see ``index_project`` for accepted values.
 
@@ -620,15 +625,23 @@ def build_mcp(
         Use to verify that a project has been indexed correctly, check coverage
         after adding new files, or diagnose unexpected search behaviour.
         """
+        if not project:
+            projects = _load_registry(registry_dir)
+            if not projects:
+                return "// No projects found. Use index_project first."
+            lines = ["// Available projects:"]
+            for p in projects:
+                lines.append(f"//   {p['name']}  ({p['path']})")
+            return "\n".join(lines)
         indexer = get_indexer(project, embedding_backend)
         return indexer.project_stats()
 
     @server.tool()
     def scored_project_tree(
-        project: str | None = None,
+        project: str = "",
         embedding_backend: str = "auto",
         max_tokens: int = 3_000,
-        top_k: int | None = None,
+        top_k: int = 0,
     ) -> str:
         """Render a project file tree scored by symbol usefulness.
 
@@ -660,14 +673,15 @@ def build_mcp(
         the header text; both use the same ranking algorithm.
         """
         indexer = get_indexer(project, embedding_backend)
-        return indexer.scored_tree(max_tokens=max_tokens, top_k=top_k)
+        top_k_param = top_k if top_k else None
+        return indexer.scored_tree(max_tokens=max_tokens, top_k=top_k_param)
 
     @server.tool()
     def sorted_project_tree(
-        project: str | None = None,
+        project: str = "",
         embedding_backend: str = "auto",
         max_tokens: int = 3_000,
-        top_k: int | None = None,
+        top_k: int = 0,
     ) -> str:
         """Render a project file tree sorted by accumulated descendant score.
 
@@ -695,12 +709,13 @@ def build_mcp(
         why specific directories or files rank highly.
         """
         indexer = get_indexer(project, embedding_backend)
-        return indexer.sorted_tree(max_tokens=max_tokens, top_k=top_k)
+        top_k_param = top_k if top_k else None
+        return indexer.sorted_tree(max_tokens=max_tokens, top_k=top_k_param)
 
     @server.tool()
     def visualize_project(
         query: str,
-        project: str | None = None,
+        project: str = "",
         limit: int = 10,
         embedding_backend: str = "auto",
     ) -> str:
@@ -736,7 +751,7 @@ def build_mcp(
 
     @server.tool()
     def get_context(
-        project: str | None = None,
+        project: str = "",
         symbol_tokens: int = 8192,
         doc_tokens: int = 2048,
         embedding_backend: str = "auto",
@@ -772,7 +787,7 @@ def build_mcp(
             Maximum Qwen-token budget for the documentation section (default
             2 048).  Set to 0 to omit docs entirely.
         embedding_backend:
-            Embedding backend for the indexer instance.  ``"auto"`` selects
+            Embedding backend for the indexer instance.  ``\"auto"`` selects
             the best available backend (API > local GGUF > hash fallback).
 
         When to use

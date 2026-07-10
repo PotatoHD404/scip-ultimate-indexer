@@ -1,201 +1,277 @@
 # SCIP Ultimate Indexer
 
-`scip-ultimate-indexer` is a self-contained Python/Poetry indexer that combines:
+A self-contained SCIP-first code indexer with semantic search, BM25 + dense embedding + PPR re-ranking, and an MCP server for AI agent integration.
 
-- a SCIP-first indexing pipeline
-- embedded SQLite storage instead of Neo4j/Qdrant containers
-- SocratiCode-style artifact ingestion via `.socraticodecontextartifacts.json`
-- hybrid lexical + vector retrieval
-- weighted inverse personalized PageRank over connected symbols
-- CodeGraphContext-inspired graph visuals
-- an MCP server that returns code-readable grouped context
-
-## Quick start
+## Quick Start
 
 ```bash
-poetry install
-poetry run ultimate-indexer index /path/to/project
-poetry run ultimate-indexer query /path/to/project "how is authentication handled?"
-poetry run ultimate-indexer top-symbols /path/to/project --limit 20
-poetry run ultimate-indexer tree /path/to/project
-poetry run ultimate-indexer visualize /path/to/project "auth"
-poetry run ultimate-indexer tui /path/to/project
-poetry run ultimate-indexer mcp
+# Install dependencies
+pip install -e .                            # basic (hash embeddings, no model download)
+pip install -e ".[local-embeddings]"         # with local GGUF embeddings (llama-cpp-python)
+# or via Poetry:
+# poetry install && poetry shell
+
+# Index a project
+ultimate-indexer index /path/to/project
+
+# Search
+ultimate-indexer query /path/to/project "how is authentication handled?"
+
+# Top symbols by PageRank importance
+ultimate-indexer top-symbols /path/to/project --limit 20
+
+# Scored project tree (most valuable files first)
+ultimate-indexer tree /path/to/project
+
+# Visualise query results as D3.js graph
+ultimate-indexer visualize /path/to/project "auth"
+
+# MCP server (stdio mode for AI tools like OpenCode)
+ultimate-indexer mcp
 ```
 
-The MCP server also exposes a scored project tree view that ranks files and folders by usefulness using indexed symbol ranks plus lightweight structural fallbacks.
+## Installation
 
-For value-oriented inspection, the CLI `tree` command and MCP `sorted_project_tree` tool show the same tree with folders sorted by accumulated descendant score and files annotated by direct value.
+### Prerequisites
 
-Its MCP tools now expose split retrieval scopes:
-- `search_code` for code-only retrieval
-- `search_docs` for documentation-only retrieval
-- `search_all` to combine independently ranked code+docs results
+- Python 3.12+
+- For local embeddings: a C++ compiler (to build `llama-cpp-python`)
 
-`search_symbols` remains available as a backward-compatible alias to `search_all`. Other tools include `list_projects`, `get_important_symbols`, `get_project_overview`, `get_stats`, `index_project`, `visualize_project`, `scored_project_tree`, and `sorted_project_tree`. The `mcp` command also accepts graph-indexer-style flags such as `--cache-dir`, `--embedding-model`, `--embedding-n-ctx`, `--transport`, `--host`, and `--port`.
+### Via pip
+
+```bash
+# Basic (uses hash embeddings — no model download, always works)
+pip install git+https://github.com/sourcegraph/scip-ultimate-indexer.git
+
+# With local GGUF embeddings (better results offline)
+pip install "scip-ultimate-indexer[local-embeddings] @ git+https://github.com/sourcegraph/scip-ultimate-indexer.git"
+```
+
+### Via Poetry
+
+```bash
+git clone <repo-url> && cd scip-ultimate-indexer
+poetry install
+# Optional: add GGUF local embeddings
+poetry install -E local-embeddings
+```
+
+### Via uv (fast)
+
+```bash
+uv pip install -e .
+# or with local embeddings:
+uv pip install -e ".[local-embeddings]"
+```
+
+### Configure embedding backend
+
+The indexer supports three backends, in order of preference:
+
+1. **API** — remote embedding API (requires endpoint + model)
+2. **Local GGUF** — `llama-cpp-python` with a local model file
+3. **Hash** — deterministic hash vectors, no model required (default fallback)
+
+```bash
+# API embeddings (recommended for speed)
+export ULTIMATE_INDEXER_EMBEDDING_BACKEND=api
+export ULTIMATE_INDEXER_EMBEDDING_API_ENDPOINT=https://llm-proxy.example.com/v1/embeddings
+export ULTIMATE_INDEXER_EMBEDDING_API_MODEL=text-embedding-bge-m3
+export ULTIMATE_INDEXER_EMBEDDING_API_KEY=sk-...
+
+# Local GGUF (offline)
+export ULTIMATE_INDEXER_EMBEDDING_BACKEND=local
+export ULTIMATE_INDEXER_MODEL_PATH=/path/to/coderankembed-q8_0.gguf
+
+# Hash (zero setup, works everywhere)
+export ULTIMATE_INDEXER_EMBEDDING_BACKEND=hash
+```
+
+## MCP Server (OpenCode / Claude Desktop)
+
+Run the MCP server for integration with AI coding tools:
+
+```bash
+ultimate-indexer mcp
+```
+
+### OpenCode config
+
+Add to `~/.config/opencode/opencode.json`:
+
+```json
+"ultimateIndexer": {
+  "type": "local",
+  "command": ["<venv>/bin/python", "-m", "ultimate_indexer.cli", "mcp"],
+  "environment": {
+    "ULTIMATE_INDEXER_EMBEDDING_BACKEND": "api",
+    "ULTIMATE_INDEXER_EMBEDDING_API_ENDPOINT": "https://llm-proxy.example.com/v1/embeddings",
+    "ULTIMATE_INDEXER_EMBEDDING_API_MODEL": "text-embedding-bge-m3",
+    "ULTIMATE_INDEXER_EMBEDDING_API_KEY": "sk-...",
+    "ULTIMATE_INDEXER_EMBEDDING_API_TIMEOUT_SECONDS": "120",
+    "ULTIMATE_INDEXER_EMBEDDING_API_MAX_RETRIES": "3",
+    "ULTIMATE_INDEXER_EMBEDDING_API_BATCH_SIZE": "16",
+    "ULTIMATE_INDEXER_CACHE_DIR": "/path/to/cache"
+  },
+  "enabled": true
+}
+```
+
+Optionally enable HyDE for better natural-language queries:
+
+```json
+"ULTIMATE_INDEXER_HYDE_API_ENDPOINT": "https://llm-proxy.example.com/v1/chat/completions",
+"ULTIMATE_INDEXER_HYDE_API_MODEL": "tgpt/t-pro-it-2-1-fp8",
+"ULTIMATE_INDEXER_HYDE_API_KEY": "sk-..."
+```
+
+### MCP tools
+
+| Tool | Description |
+|------|-------------|
+| `index_project` | Index or re-index a project |
+| `search_code` | Semantic search over code only |
+| `search_docs` | Semantic search over documentation only |
+| `search_all` | Combined code + docs search (RRF merged) |
+| `search_symbols` | Legacy alias for `search_all` |
+| `get_important_symbols` | Top-ranked symbols by PageRank |
+| `get_project_overview` | Categorized symbol overview |
+| `get_stats` | Index statistics (use `project=""` to list projects) |
+| `get_context` | Token-budgeted context snapshot |
+| `scored_project_tree` | File tree ranked by symbol usefulness |
+| `sorted_project_tree` | Same as scored, sorted by descendant score |
+| `visualize_project` | D3.js force-directed graph of query results |
+
+> **Note:** `list_projects` was removed due to an OpenCode 1.17.5 serialisation bug (sends `{}""` for zero-param tools). Use `get_stats` with `project=""` instead.
+
+### HyDE (Hypothetical Document Embeddings)
+
+HyDE generates a short hypothetical code snippet from your natural-language query and blends it into the query vector. This makes NL questions like "how is auth handled?" land closer to actual code.
+
+```bash
+# Enable HyDE (on by default)
+export ULTIMATE_INDEXER_ENABLE_HYDE=true
+export ULTIMATE_INDEXER_HYDE_BLEND=0.5
+
+# Optional: LLM-backed HyDE for better generation
+export ULTIMATE_INDEXER_HYDE_API_ENDPOINT=https://api.example.com/v1/chat/completions
+export ULTIMATE_INDEXER_HYDE_API_MODEL=gpt-4o-mini
+export ULTIMATE_INDEXER_HYDE_API_KEY=sk-...
+```
+
+If no HyDE API is configured, a fast deterministic template is used instead.
 
 ## Embeddings
 
-The runtime now defaults to the local GGUF model path used by `graph-indexer`.
-No Hugging Face download path is used anymore.
+The embedding backend is auto-detected:
 
-- the first choice is `ULTIMATE_INDEXER_MODEL_PATH` when set
-- otherwise the indexer looks in `models/` and `graph-indexer/models/`
-- the default committed filename is `coderankembed-q8_0.gguf`
-- `auto` falls back to the deterministic `hash` backend when no local GGUF model is available **or** the `llama-cpp-python` runtime is not installed, so indexing and querying work with zero setup
+1. If `ULTIMATE_INDEXER_EMBEDDING_API_ENDPOINT` + `_MODEL` are set → **API backend**
+2. If a local GGUF model is found → **local backend**
+3. Otherwise → **hash backend** (deterministic, no model)
 
-Ranking and query scoring exclude low-signal generated artifacts such as `.next` outputs, protobuf-generated `proto/*` code, `*.pb.go`, and `*_pb2.*` files. Those files are still stored for inspection, but they no longer dominate `top-symbols` or semantic query results.
+### Debug env vars
 
-For CI and tests, set `ULTIMATE_INDEXER_EMBEDDING_BACKEND=hash` to use a deterministic local embedding backend with no model download.
+| Env | Purpose |
+|-----|---------|
+| `ULTIMATE_INDEXER_MODEL_PATH` | Specify GGUF model path |
+| `ULTIMATE_INDEXER_LLAMA_VERBOSE` | Show llama.cpp backend logs |
+| `ULTIMATE_INDEXER_LLAMA_N_GPU_LAYERS` | GPU offload layers |
+| `ULTIMATE_INDEXER_LLAMA_N_CTX` | Context size (default 2048) |
+| `ULTIMATE_INDEXER_EMBEDDING_API_TIMEOUT_SECONDS` | API timeout (default 120) |
+| `ULTIMATE_INDEXER_EMBEDDING_API_MAX_RETRIES` | API retries (default 3) |
+| `ULTIMATE_INDEXER_EMBEDDING_API_RETRY_BASE_DELAY_MS` | Retry backoff base (default 500) |
+| `ULTIMATE_INDEXER_EMBEDDING_API_BATCH_SIZE` | Batch size (default 16) |
 
-Useful debug envs:
+## Search Quality Upgrades
 
-- `ULTIMATE_INDEXER_MODEL_PATH` to point at a specific local GGUF file
-- `ULTIMATE_INDEXER_LLAMA_VERBOSE=true` to expose backend/device logs
-- `ULTIMATE_INDEXER_LLAMA_SUPPRESS_LOGS=false` to stop silencing `llama.cpp` stderr/stdout
-- `ULTIMATE_INDEXER_LLAMA_N_GPU_LAYERS`, `ULTIMATE_INDEXER_LLAMA_N_CTX`, `ULTIMATE_INDEXER_LLAMA_N_BATCH`, and `ULTIMATE_INDEXER_LLAMA_N_UBATCH` to override runtime settings
-- `ULTIMATE_INDEXER_EMBEDDING_API_ENDPOINT`, `ULTIMATE_INDEXER_EMBEDDING_API_MODEL`, and `ULTIMATE_INDEXER_EMBEDDING_API_KEY` for OpenAI-compatible embedding APIs
-- `ULTIMATE_INDEXER_EMBEDDING_API_TIMEOUT_SECONDS`, `ULTIMATE_INDEXER_EMBEDDING_API_MAX_RETRIES`, and `ULTIMATE_INDEXER_EMBEDDING_API_RETRY_BASE_DELAY_MS` to control API resiliency
-- `ULTIMATE_INDEXER_EMBEDDING_API_BATCH_SIZE` and `ULTIMATE_INDEXER_EMBEDDING_API_MAX_TOKENS` to tune API request sizing
+All on by default, degrade gracefully (no models or git required):
 
-## SCIP support
+- **Hybrid BM25 + dense embeddings** — lexical + semantic, PPR re-ranked
+- **Vocabulary expansion** — identifier splitting, abbreviation bridging
+- **Contextual embeddings** — file/module context prepended to each chunk
+- **HyDE** — hypothetical code snippet blend for NL queries
+- **Two-stage reranker** — feature-based rerank after fusion
+- **Git history signals** — recency/churn/co-change boosts (when `.git` available)
+- **Context-focused ranking** — bias results toward files you're working in
 
-The built-in SCIP runner supports the same external toolchain family that CodeGraphContext wires up:
+Toggle with env vars:
 
-- `scip-python` for Python
-- `scip-typescript` for TypeScript and JavaScript
-- `scip-go` for Go
-- `rust-analyzer` for Rust
-- `scip-java` for Java
-- `scip-clang` for C and C++
+| Env | Default | Purpose |
+|-----|---------|---------|
+| `ULTIMATE_INDEXER_ENABLE_HYDE` | `true` | Hypothetical Document Embeddings |
+| `ULTIMATE_INDEXER_ENABLE_RERANKER` | `true` | Two-stage feature reranker |
+| `ULTIMATE_INDEXER_ENABLE_EXPANSION` | `true` | Vocabulary expansion |
+| `ULTIMATE_INDEXER_ENABLE_CONTEXTUAL` | `true` | Contextual chunk headers |
+| `ULTIMATE_INDEXER_ENABLE_GIT_SIGNALS` | `true` | Git-history boosts |
 
-`SCIP_LANGUAGES` can be used to restrict auto-detection, and accepts CodeGraphContext-style values such as `python,javascript,go,rust,java,c`.
+## SCIP Language Support
 
-### Enabling Java and C/C++
+SCIP indexers are auto-detected from `PATH`. Supported languages:
 
-Both produce real class/method symbols (not just fallback chunks) once their
-external tool is on `PATH`:
+| Language | Tool | Notes |
+|----------|------|-------|
+| Python | `scip-python` (external) + built-in emitter | Zero-config fallback always works |
+| Go | `scip-go` | |
+| TypeScript / JS | `scip-typescript` | |
+| Rust | `rust-analyzer` | |
+| Java | `scip-java` | Needs Maven/Gradle build |
+| C / C++ | `scip-clang` | Needs `compile_commands.json` |
 
-```bash
-# C/C++ — prebuilt binary (no other setup for CMake projects)
-curl -fL -o ~/.local/bin/scip-clang \
-  https://github.com/sourcegraph/scip-clang/releases/download/v0.4.0/scip-clang-arm64-darwin
-chmod +x ~/.local/bin/scip-clang
+Set `ULTIMATE_INDEXER_DISABLE_EXTERNAL_SCIP=1` to skip all external SCIP tools.
 
-# Java — via coursier
-coursier bootstrap --standalone -o ~/.local/bin/scip-java \
-  com.sourcegraph:scip-java_2.13:0.11.2 --main com.sourcegraph.scip_java.ScipJava
+## What Gets Indexed
+
+- Local source files via SCIP ingestion
+- Python gets built-in structured symbols (function/class/method) even without `scip-python`
+- Broad file discovery: Python, Go, JS/TS, Java, Kotlin, Scala, C/C++, C#, Rust, Ruby, PHP, Swift, Bash, HTML/CSS, Vue, Svelte, SQL, Dart, Lua, R, Elixir, Haskell, Perl, Dockerfile, Makefile
+- Documentation files (Markdown, OpenAPI YAML)
+- Fallback chunking for unsupported languages
+- Config artifacts (`.socraticodecontextartifacts.json`)
+
+### Ignore rules
+
+Combines built-in defaults (deps, build output, caches, lockfiles, `.ultimate_indexer`) + `.gitignore` + optional `.socraticodeignore` / `.cgcignore`.
+
+## Output Format
+
+Query results grouped by file, with function signatures and docstrings:
+
 ```
-
-- **C/C++** needs a `compile_commands.json`. For a **CMake** project the runner
-  generates one automatically (into its cache, via
-  `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`); for other build systems, drop a
-  `compile_commands.json` at the project root (e.g. with `bear -- <build>`).
-- **Java** is *compiled* by scip-java (Maven/Gradle), so the project must build.
-  The runner passes `--build-tool=maven` when both Maven and Gradle metadata are
-  present. scip-java's bundled `javac` is version-sensitive: projects using a
-  modern `<release>` build cleanly, while older Java-8 `<source>/<target>`
-  projects may need an older `JAVA_HOME` (e.g. JDK 11) for the build to succeed.
-
-Set `ULTIMATE_INDEXER_DISABLE_EXTERNAL_SCIP=1` to skip external SCIP toolchains
-entirely (offline CI, locked-down hosts, or when scip-python's full pyright pass
-is too slow) — Python still gets structured symbols from the built-in emitter,
-and other languages use generic fallback coverage. `ULTIMATE_INDEXER_SCIP_TIMEOUT`
-(seconds, default 600) bounds each external tool invocation.
-
-## What gets indexed
-
-- local source files through a SCIP ingestion path
-- built-in zero-config Python SCIP emission when no external `.scip` index is provided — this is also used automatically when `scip-python` is missing or fails at runtime, so Python projects get function/class/method symbols with no Node toolchain
-- automatic external SCIP ingestion for detected languages when `scip-<lang>` tools are available
-- broad SocratiCode-style file discovery for JavaScript, TypeScript, TSX, Python, Java, Kotlin, Scala, C, C++, C#, Go, Rust, Ruby, PHP, Swift, Bash, HTML/CSS, Vue, Svelte, config files, docs, SQL, Dart, Lua, R, Elixir, Haskell, Perl, and special files like `Dockerfile` and `Makefile`
-- line and minified-content fallback chunking for non-SCIP files so unsupported languages stay searchable
-- fallback import graph edges for path-based languages such as JS/TS, C/C++, Dart, Lua, Ruby, PHP, and shell scripts
-- SocratiCode context artifacts from `.socraticodecontextartifacts.json`
-
-## Ignore rules
-
-The indexer combines:
-
-- built-in defaults for dependency folders, build output, caches, lockfiles, editor folders, and `.ultimate_indexer`
-- root and nested `.gitignore` files when `RESPECT_GITIGNORE` is not set to `false`
-- optional `.socraticodeignore`
-- optional upward `.cgcignore`
-- `IGNORE_DIRS` for extra directory-name exclusions
-
-It does not try to infer "unused" files semantically. If a path is not covered by those ignore sources, it is still eligible for indexing.
-
-Use `EXTRA_EXTENSIONS=.tpl,.blade` to include project-specific plaintext extensions in discovery and fallback indexing.
-
-## Output shape
-
-Query results are grouped by file to reduce tokens and rendered like:
-
-```text
 // pkg/service.py
 """Greets users and prepares API payloads."""
 def build_greeting(user: User, excited: bool = False) -> str:
     # skipped 12 rows
 ```
 
-Struct/class-like results emit their interface plus direct method signatures.
+## Project Structure
 
-Query ranking and `top-symbols` now follow the graph-indexer pattern more closely:
-
-- `top-symbols` uses dependency-ordered PageRank plus symbol-kind boosts
-- `query` uses lexical and semantic seeds, then expands with query-relative dependency ordering
-- config/docs artifacts keep qualified keys, parent headings, and attribution in their indexed text
-
-## Search quality upgrades
-
-Retrieval combines several signals beyond hybrid BM25 + embeddings. All are on by
-default and degrade gracefully (no models or git required):
-
-- **Built-in zero-config Python SCIP.** Python projects get real Function/Method/Class
-  symbols and call edges even when the external `scip-python` (Node) tool is missing or
-  broken — the in-tree emitter is used as a fallback.
-- **Vocabulary expansion** (doc2query / SPLADE-lite). Identifiers are split and common
-  abbreviations bridged (e.g. a query for `authentication` matches `authnHandler`, `svc`
-  matches `GreetingService`). Indexed into the lexical FTS only — never displayed.
-  Toggle: `ULTIMATE_INDEXER_ENABLE_EXPANSION`.
-- **Contextual embeddings.** Each chunk is embedded with a small structural context
-  header (file, enclosing class/module, purpose) prepended — kept out of the BM25 text.
-  Toggle: `ULTIMATE_INDEXER_ENABLE_CONTEXTUAL`.
-- **HyDE** for natural-language queries. A hypothetical code snippet is generated from the
-  query and blended into the dense query vector so NL questions land closer to real code.
-  Toggle/tune: `ULTIMATE_INDEXER_ENABLE_HYDE`, `ULTIMATE_INDEXER_HYDE_BLEND` (default 0.5).
-- **Two-stage reranking.** The fused candidate set is re-scored against the query (exact
-  name/signature matches, term coverage) and blended with the first-stage score.
-  Toggle/tune: `ULTIMATE_INDEXER_ENABLE_RERANKER`, `ULTIMATE_INDEXER_RERANK_BLEND`,
-  `ULTIMATE_INDEXER_RERANK_TOP_K`.
-- **Git history signals.** Recency and churn lift a file's symbols' global rank, and
-  files that co-change in history couple together. Toggle/tune:
-  `ULTIMATE_INDEXER_ENABLE_GIT_SIGNALS`, `ULTIMATE_INDEXER_GIT_SIGNAL_STRENGTH`,
-  `ULTIMATE_INDEXER_GIT_HALF_LIFE_DAYS`, `ULTIMATE_INDEXER_GIT_HISTORY_LIMIT`.
-- **Context-personalized ranking.** Pass `--focus <file>` (repeatable) to `query`, or the
-  `focus` argument to the MCP `search_*` tools, to bias results toward the files you are
-  working in and the files that historically co-change with them.
-  Tune: `ULTIMATE_INDEXER_COCHANGE_WEIGHT`.
-
-HyDE and the reranker default to fast deterministic implementations, but can be
-upgraded to **model-backed variants** by pointing them at any OpenAI /
-`llama.cpp`-server-compatible HTTP endpoint (they fall back automatically on any
-error, so this is purely additive):
-
-- LLM-generated HyDE via chat completions —
-  `ULTIMATE_INDEXER_HYDE_API_ENDPOINT`, `ULTIMATE_INDEXER_HYDE_API_MODEL`,
-  optional `ULTIMATE_INDEXER_HYDE_API_KEY` / `ULTIMATE_INDEXER_HYDE_MAX_TOKENS`.
-- Cross-encoder reranker via a `/v1/rerank` endpoint (llama.cpp server, TEI,
-  infinity, Jina, Cohere) — `ULTIMATE_INDEXER_RERANK_API_ENDPOINT`,
-  `ULTIMATE_INDEXER_RERANK_API_MODEL`, optional `ULTIMATE_INDEXER_RERANK_API_KEY`.
-
-```bash
-poetry run ultimate-indexer query /path/to/project "how is auth handled?" --focus src/auth/login.py
+```
+src/ultimate_indexer/
+├── cli.py          # CLI entry point (typer)
+├── mcp_server.py   # MCP server (FastMCP)
+├── indexer.py      # Main indexing + query orchestration
+├── query.py        # Query engine (BM25 + dense + PPR)
+├── storage.py      # SQLite storage layer
+├── embeddings.py   # Embedding providers (API/local/hash)
+├── scip_runner.py  # External SCIP tool runner
+├── scip_parser.py  # SCIP binary parser
+├── pagerank.py     # Weighted PageRank
+├── hyde.py         # Hypothetical Document Embeddings
+├── reranker.py     # Feature-based reranker
+├── models.py       # Data models
+├── config.py       # Configuration
+├── formatter.py    # Output formatting
+├── python_scip.py  # Built-in Python SCIP emitter
+├── docs/           # Documentation ingestion
+└── templates/      # Jinja2 templates (D3.js visuals)
 ```
 
-Run `python scripts/smoke_test.py` for an end-to-end check of the whole pipeline
-(uses the deterministic `hash` backend; no model download).
+## Tests
 
-## Notes on coverage
+```bash
+# All tests
+pytest
 
-This project now matches the original repos much more closely on ignore handling, extension coverage, retry/backoff behavior, and non-SCIP fallback indexing. Full symbol-level parity with every CodeGraphContext language parser still depends on either a real SCIP index or the relevant external SCIP tool being available for that language.
+# Smoke test (end-to-end, uses hash backend)
+python scripts/smoke_test.py
+```
